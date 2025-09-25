@@ -197,12 +197,23 @@ static void close_output(OutputContext& out)
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s input.mp4 output.mp4\n", argv[0]);
+        fprintf(stderr, "Usage: %s input.mp4 output.mp4 [--sws-colorspace|--cpu-colorspace]\n", argv[0]);
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  --sws-colorspace, --cpu-colorspace  Bypass GPU color conversion pipeline and use libswscale instead.\n");
         return 1;
     }
 
     const char* inPath = argv[1];
     const char* outPath = argv[2];
+    bool force_sws_colorspace = false; // when true, bypass GPU color conversion and use SWS
+
+    // Parse optional flags
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--sws-colorspace" || arg == "--cpu-colorspace") {
+            force_sws_colorspace = true;
+        }
+    }
 
     av_log_set_level(AV_LOG_WARNING);
 
@@ -266,7 +277,8 @@ int main(int argc, char** argv)
         int dstW = in.vdec->width * cfg.scaleFactor;
         int dstH = in.vdec->height * cfg.scaleFactor;
         SwsContext* sws_to_p010 = nullptr; // CPU fallback
-        bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr);
+        // If force_sws_colorspace is enabled, we still allow GPU decode but bypass GPU color conversion pipeline
+        bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr) && !force_sws_colorspace;
 
         // Configure encoder now that sizes are known
         out.venc->codec_id = AV_CODEC_ID_HEVC;
@@ -287,11 +299,11 @@ int main(int argc, char** argv)
         out.venc->color_primaries = AVCOL_PRI_BT2020;
         out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
 
-        int64_t target_bitrate = (in_bitrate > 0) ? in_bitrate * 2 : (int64_t)25000000; // fallback 25Mbps
+        int64_t target_bitrate = (in_bitrate > 0) ? in_bitrate * 10 : (int64_t)25000000; // fallback 25Mbps
         av_opt_set(out.venc->priv_data, "preset", "p4", 0);
-        av_opt_set(out.venc->priv_data, "rc", "vbr", 0);
+        av_opt_set(out.venc->priv_data, "rc", "cbr", 0);
         av_opt_set_int(out.venc->priv_data, "bitrate", target_bitrate, 0);
-        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate * 12 / 10, 0);
+        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate * 2, 0);
         // Set HEVC profile via string for compatibility
         av_opt_set(out.venc->priv_data, "profile", "main10", 0);
         // Ensure parameter sets are repeated and AUDs are present for better player compatibility
@@ -321,6 +333,9 @@ int main(int argc, char** argv)
         }
 
         ff_check(avcodec_open2(out.venc, out.venc->codec, nullptr), "open encoder");
+        fprintf(stderr, "Pipeline: decode=%s, colorspace+scale+pack=%s\n",
+                (in.vdec->hw_device_ctx ? "GPU(NVDEC)" : "CPU"),
+                (use_cuda_path ? "GPU(RTX/CUDA)" : "CPU(SWS)"));
         if (enc_hw_frames) av_buffer_unref(&enc_hw_frames);
 
         // Write header
@@ -505,7 +520,7 @@ int main(int argc, char** argv)
                         ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer fallback");
                         swframe->pts = decframe->pts;
 
-                        // Convert to RGBA
+                        // Convert to ARGB
                         if (!sws_to_argb || last_src_format != swframe->format) {
                             if (sws_to_argb) sws_freeContext(sws_to_argb);
                             sws_to_argb = sws_getContext(

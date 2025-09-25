@@ -29,9 +29,9 @@ __global__ void k_abgr10_to_p010(const uint8_t* __restrict__ inABGR, int inPitch
         for (int dx = 0; dx < 2; ++dx) {
             uint32_t p = row[x + dx];
             // X2BGR10LE (FFmpeg AV_PIX_FMT_X2BGR10LE): bits 0..9 B, 10..19 G, 20..29 R, 30..31 unused
-            int b10 = (int)((p >> 0)  & 0x3FF);
-            int g10 = (int)((p >> 10) & 0x3FF);
-            int r10 = (int)((p >> 20) & 0x3FF);
+            int r10 = (int)((p >> 0)  & 0x3FF);   // Red in bits 0-9
+            int g10 = (int)((p >> 10) & 0x3FF);   // Green in bits 10-19
+            int b10 = (int)((p >> 20) & 0x3FF);   // Blue in bits 20-29
             float R = r10 / 1023.0f;
             float G = g10 / 1023.0f;
             float B = b10 / 1023.0f;
@@ -114,7 +114,7 @@ static __device__ inline void yuv_to_rgb(float Yp, float Uc, float Vc, bool bt20
     }
 }
 
-__global__ void k_nv12_to_bgra(const uint8_t* __restrict__ d_y, int pitchY,
+__global__ void k_nv12_to_rgba(const uint8_t* __restrict__ d_y, int pitchY,
                                const uint8_t* __restrict__ d_uv, int pitchUV,
                                uint8_t* __restrict__ outBGRA, int outPitch,
                                int w, int h, bool bt2020)
@@ -147,9 +147,9 @@ __global__ void k_nv12_to_bgra(const uint8_t* __restrict__ d_y, int pitchY,
     uint8_t b8 = (uint8_t)(B * 255.0f + 0.5f);
 
     uint8_t* dst = outBGRA + y * outPitch + x * 4;
-    dst[0] = b8; // B
-    dst[1] = g8; // G
-    dst[2] = r8; // R
+    dst[0] = r8;  // R
+    dst[1] = g8;  // G
+    dst[2] = b8;  // B
     dst[3] = 255; // A
 }
 
@@ -162,5 +162,5 @@ void launch_nv12_to_bgra(const uint8_t* d_y, int pitchY,
 {
     dim3 block(32, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
-    k_nv12_to_bgra<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outBGRA, outPitch, w, h, bt2020);
+    k_nv12_to_rgba<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outBGRA, outPitch, w, h, bt2020);
 }

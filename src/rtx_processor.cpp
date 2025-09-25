@@ -86,6 +86,7 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
 
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
+    // Interpret the input using its native colorspace (bt2020 indicates input colorspace)
     // 1) NV12 (device) -> BGRA8 (device pitched)
     launch_nv12_to_bgra(d_y, pitchY, d_uv, pitchUV,
                         m_devBGRA, (int)m_devBGRAPitch,
@@ -143,11 +144,12 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
         return false;
     }
 
+    // Always use BT.2020 for HDR output encoding (RGB->YUV conversion)
     launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
                           d_outY, pitchOutY,
                           d_outUV, pitchOutUV,
                           (int)m_dstW, (int)m_dstH,
-                          bt2020,
+                          m_cfg.enableTHDR,
                           m_stream);
 
     cudaStreamSynchronize(m_stream);

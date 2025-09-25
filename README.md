@@ -8,10 +8,18 @@ Pipeline:
 - Encode: NVENC HEVC Main10 VBR preset P4, target bitrate = 2x input bitrate
 - Mux: MP4 with HDR10 metadata (BT.2020 + PQ + Mastering + CLL)
 
+Notes on pipeline selection:
+- By default, if the decoder negotiates CUDA, the app runs a full GPU pipeline for color conversion, scaling, packing, and encoding to minimize copies.
+- When `--sws-colorspace` is provided, the app still uses NVDEC if available, but transfers decoded frames to system memory and performs colorspace conversion/scaling via SWS before encoding.
+
 Usage:
 ```
-RTXVideoProcessor.exe input.mp4 output.mp4
+RTXVideoProcessor.exe input.mp4 output.mp4 [--sws-colorspace|--cpu-colorspace]
 ```
+
+Options:
+- `--sws-colorspace`, `--cpu-colorspace`
+  - Keep GPU decode (NVDEC) when available, but bypass the GPU colorspace conversion pipeline and use libswscale (SWS) on CPU instead. This is useful for debugging or when you prefer SWS color handling.
 
 ## Prerequisites
 - Windows 11 x64, NVIDIA RTX 4070 (or newer recommended)
