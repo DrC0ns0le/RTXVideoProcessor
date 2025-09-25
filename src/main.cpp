@@ -8,12 +8,14 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
+#include <queue>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavcodec/packet.h>
 #include <libavutil/avutil.h>
+#include <libavutil/common.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
@@ -23,6 +25,8 @@ extern "C" {
 #include <libavutil/rational.h>
 #include <libswscale/swscale.h>
 }
+
+#include <cuda_runtime.h>
 
 #include "ffmpeg_utils.h"
 #include "rtx_processor.h"
@@ -112,8 +116,13 @@ static void add_mastering_and_cll(AVStream* st)
         mdm->display_primaries[2][1] = av_d2q(0.046, 100000); // B y
         mdm->white_point[0] = av_d2q(0.3127, 100000);
         mdm->white_point[1] = av_d2q(0.3290, 100000);
-        mdm->min_luminance = av_d2q(0.005, 10000);
-        mdm->max_luminance = av_d2q(1000.0, 1);
+        
+        // Luminance values must be encoded according to SMPTE ST 2086 standard
+        // Values are in units of 0.0001 cd/m² (candelas per square meter)
+        // For 1000 cd/m² max: 1000 * 10000 = 10000000 units
+        // For 0.005 cd/m² min: 0.005 * 10000 = 50 units
+        mdm->min_luminance = av_make_q(50, 10000);        // 0.005 cd/m² = 50/10000
+        mdm->max_luminance = av_make_q(10000000, 10000);  // 1000 cd/m² = 10000000/10000
         mdm->has_luminance = 1;
         mdm->has_primaries = 1;
     }
@@ -260,9 +269,9 @@ int main(int argc, char** argv)
         cfg.enableTHDR = true;
         cfg.vsrQuality = 4;
         cfg.scaleFactor = 2;
-        cfg.thdrContrast = 100;
-        cfg.thdrSaturation = 100;
-        cfg.thdrMiddleGray = 50;
+        cfg.thdrContrast = 110;
+        cfg.thdrSaturation = 80;
+        cfg.thdrMiddleGray = 35;
         cfg.thdrMaxLuminance = 1000;
 
         RtxProcessor rtx; // CPU-path RTX instance; initialize lazily only if CPU path is used
@@ -299,21 +308,21 @@ int main(int argc, char** argv)
         out.venc->color_primaries = AVCOL_PRI_BT2020;
         out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
 
-        int64_t target_bitrate = (in_bitrate > 0) ? in_bitrate * 10 : (int64_t)25000000; // fallback 25Mbps
+        int64_t target_bitrate = (in_bitrate > 0) ? (int64_t)(in_bitrate * 10) : (int64_t)25000000;
+        av_opt_set(out.venc->priv_data, "tune", "hq", 0);
         av_opt_set(out.venc->priv_data, "preset", "p4", 0);
-        av_opt_set(out.venc->priv_data, "rc", "cbr", 0);
+        av_opt_set(out.venc->priv_data, "rc", "vbr", 0);
         av_opt_set_int(out.venc->priv_data, "bitrate", target_bitrate, 0);
-        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate * 2, 0);
-        // Set HEVC profile via string for compatibility
+        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate*2, 0);
+        av_opt_set_int(out.venc->priv_data, "async_depth", 1, 0);
         av_opt_set(out.venc->priv_data, "profile", "main10", 0);
-        // Ensure parameter sets are repeated and AUDs are present for better player compatibility
-        av_opt_set_int(out.venc->priv_data, "repeat-headers", 1, 0);
-        av_opt_set_int(out.venc->priv_data, "aud", 1, 0);
-
         ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
-        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility
+        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
         if (out.vstream->codecpar) {
             out.vstream->codecpar->codec_tag = MKTAG('h','v','c','1');
+            out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
+            out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+            out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
         }
         add_mastering_and_cll(out.vstream);
 
@@ -327,7 +336,7 @@ int main(int argc, char** argv)
             fctx->sw_format = AV_PIX_FMT_P010LE;
             fctx->width = dstW;
             fctx->height = dstH;
-            fctx->initial_pool_size = 16;
+            fctx->initial_pool_size = 64;
             ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
             out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
         }
@@ -338,13 +347,36 @@ int main(int argc, char** argv)
                 (use_cuda_path ? "GPU(RTX/CUDA)" : "CPU(SWS)"));
         if (enc_hw_frames) av_buffer_unref(&enc_hw_frames);
 
+        // CUDA frame pool for optimized GPU processing
+        std::vector<FramePtr> cuda_frame_pool;
+        const int POOL_SIZE = 8; // Adjust based on your needs
+        int pool_index = 0;
+        
+        // Frame buffering for handling processing spikes
+        std::queue<std::pair<AVFrame*, int64_t>> frame_buffer; // frame and output_pts pairs
+        const int MAX_BUFFER_SIZE = 4;
+
+        // Pre-allocate CUDA frames if using CUDA path
+        if (use_cuda_path) {
+            cuda_frame_pool.reserve(POOL_SIZE);
+            for (int i = 0; i < POOL_SIZE; i++) {
+                FramePtr enc_hw(av_frame_alloc(), &av_frame_free_single);
+                enc_hw->format = AV_PIX_FMT_CUDA;
+                enc_hw->width = dstW;
+                enc_hw->height = dstH;
+                ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw.get(), 0), "alloc enc hw frame pool");
+                cuda_frame_pool.push_back(std::move(enc_hw));
+            }
+        }
+
         // Write header
         out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
         out.vstream->avg_frame_rate = fr;
         // Write header with MOV/MP4 muxer flags for broad compatibility
         // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
         AVDictionary* movopts = nullptr;
-        av_dict_set(&movopts, "movflags", "+faststart", 0);
+        // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
+        av_dict_set(&movopts, "movflags", "+faststart+write_colr", 0);
         ff_check(avformat_write_header(out.fmt, &movopts), "write header");
         av_dict_free(&movopts);
 
@@ -378,6 +410,10 @@ int main(int argc, char** argv)
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
+        
+        // PTS generation for consistent frame timing
+        int64_t output_frame_count = 0;
+        AVRational output_time_base = out.venc->time_base;
 
         const uint8_t* rtx_data = nullptr;
         uint32_t rtxW=0, rtxH=0; size_t rtxPitch=0;
@@ -453,24 +489,33 @@ int main(int argc, char** argv)
                         // Decoder produced CUDA but encoder path is CPU: transfer to SW
                         if (!swframe) swframe.reset(av_frame_alloc());
                         ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer");
-                        swframe->pts = decframe->pts;
                         decframe = swframe.get();
                         frame_is_cuda = false;
                     }
 
-                    // Select a stable input timestamp
-                    int64_t in_pts = (decframe->best_effort_timestamp != AV_NOPTS_VALUE)
-                        ? decframe->best_effort_timestamp
-                        : decframe->pts;
+                    // Generate consistent output PTS to prevent stuttering
+                    int64_t output_pts = output_frame_count;
+                    output_frame_count++;
+                    
+                    // Also get input PTS for reference (but use generated PTS for output)
+                    int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
+                        ? decframe->pts
+                        : decframe->best_effort_timestamp;
 
                     AVFrame* frame_to_send = nullptr;
                     if (frame_is_cuda && use_cuda_path) {
-                        // GPU path: allocate an encoder CUDA frame and fill it entirely on GPU via RTX
-                        FramePtr enc_hw(av_frame_alloc(), &av_frame_free_single);
+                        // GPU path: reuse pre-allocated frame from pool instead of allocating new one
+                        AVFrame* enc_hw = cuda_frame_pool[pool_index].get();
+                        pool_index = (pool_index + 1) % POOL_SIZE;
+                        
+                        // Clear previous frame data
+                        av_frame_unref(enc_hw);
                         enc_hw->format = AV_PIX_FMT_CUDA;
                         enc_hw->width = dstW;
                         enc_hw->height = dstH;
-                        ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw.get(), 0), "alloc enc hw frame");
+                        
+                        // Get buffer for this frame (much faster than full allocation)
+                        ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw, 0), "get enc hw frame buffer");
 
                         static bool rtx_gpu_init = false;
                         static RtxProcessor rtx_gpu;
@@ -489,17 +534,18 @@ int main(int argc, char** argv)
                         bool bt2020 = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL);
                         if (rtx_gpu.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
                                                          decframe->data[1], decframe->linesize[1],
-                                                         enc_hw.get(), bt2020)) {
-                            frame_to_send = enc_hw.get();
+                                                         enc_hw, bt2020)) {
+                            frame_to_send = enc_hw;
                             // Update progress prior to encoding
                             processed_frames++;
                             show_progress();
 
-                            // Set PTS on the frame
-                            if (in_pts != AV_NOPTS_VALUE) frame_to_send->pts = av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base);
-                            else frame_to_send->pts = AV_NOPTS_VALUE;
+                            // Set consistent PTS to prevent stuttering
+                            frame_to_send->pts = output_pts;
 
                             // Encode and then release enc_hw by letting enc_hw FramePtr go out of scope after send
+                            // Ensure all GPU work for this frame completes before encoding and moving to next frame
+                            cudaStreamSynchronize(0);
                             ff_check(avcodec_send_frame(out.venc, frame_to_send), "send frame to encoder (CUDA)");
                             while (true) {
                                 ret = avcodec_receive_packet(out.venc, opkt.get());
@@ -518,7 +564,10 @@ int main(int argc, char** argv)
                         // GPU path failed; fall back: transfer to SW, run CPU path, convert to P010, then upload into enc_hw
                         if (!swframe) swframe.reset(av_frame_alloc());
                         ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer fallback");
-                        swframe->pts = decframe->pts;
+                        
+                        // Ensure GPU-to-CPU transfer is complete
+                        cudaStreamSynchronize(0);
+                        
 
                         // Convert to ARGB
                         if (!sws_to_argb || last_src_format != swframe->format) {
@@ -561,12 +610,15 @@ int main(int argc, char** argv)
                         sws_scale(sws_to_p010, abgr_planes2, abgr_lines2, 0, dstH, p010_frame->data, p010_frame->linesize);
 
                         // Upload P010 to encoder CUDA frame
-                        ff_check(av_hwframe_transfer_data(enc_hw.get(), p010_frame.get(), 0), "upload P010 to CUDA frame");
+                        ff_check(av_hwframe_transfer_data(enc_hw, p010_frame.get(), 0), "upload P010 to CUDA frame");
+                        
+                        // Ensure GPU upload is complete before encoding
+                        cudaStreamSynchronize(0);
 
                         // Set PTS and encode
-                        frame_to_send = enc_hw.get();
-                        if (in_pts != AV_NOPTS_VALUE) frame_to_send->pts = av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base);
-                        else frame_to_send->pts = AV_NOPTS_VALUE;
+                        frame_to_send = enc_hw;
+                        // Set consistent PTS to prevent stuttering
+                        frame_to_send->pts = output_pts;
                         // progress
                         processed_frames++;
                         show_progress();
@@ -631,11 +683,9 @@ int main(int argc, char** argv)
                     const uint8_t* abgr_planes[1] = { rtx_data };
                     int abgr_lines[1] = { static_cast<int>(rtxPitch) };
                     sws_scale(sws_to_p010, abgr_planes, abgr_lines, 0, dstH, p010_frame->data, p010_frame->linesize);
-                    if (in_pts != AV_NOPTS_VALUE) {
-                        p010_frame->pts = av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base);
-                    } else {
-                        p010_frame->pts = AV_NOPTS_VALUE;
-                    }
+                    
+                    // Set consistent PTS to prevent stuttering
+                    p010_frame->pts = output_pts;
 
                     // Encode
                     ff_check(avcodec_send_frame(out.venc, p010_frame.get()), "send frame to encoder");

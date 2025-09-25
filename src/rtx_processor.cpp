@@ -94,6 +94,9 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
                         bt2020,
                         m_stream);
 
+    // Ensure GPU copy is complete before RTX evaluation
+    cudaStreamSynchronize(m_stream);
+
     // 2) Copy BGRA8 (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
     copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -104,6 +107,9 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
     copyIn.WidthInBytes  = (unsigned int)(m_srcW * 4);
     copyIn.Height        = m_srcH;
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+
+    // Ensure GPU copy is complete before RTX evaluation
+    cudaStreamSynchronize(m_stream);
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when THDR enabled)
     API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
@@ -123,6 +129,9 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
         return false;
     }
 
+    // 3.5) Wait for RTX evaluation to complete
+    cudaStreamSynchronize(m_stream);
+
     // 4) Copy m_dstArray (ABGR10) -> device pitched staging
     CUDA_MEMCPY2D copyOut{};
     copyOut.srcMemoryType = CU_MEMORYTYPE_ARRAY;
@@ -133,6 +142,9 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
     copyOut.WidthInBytes  = (unsigned int)(m_dstW * 4);
     copyOut.Height        = m_dstH;
     CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+
+    // Ensure GPU copy is complete before encoding
+    cudaStreamSynchronize(m_stream);
 
     // 5) ABGR10 -> P010 directly into FFmpeg CUDA frame planes
     uint8_t* d_outY  = encP010Frame->data[0];
@@ -152,6 +164,7 @@ bool RtxProcessor::processGpuNV12ToP010(const uint8_t* d_y, int pitchY,
                           m_cfg.enableTHDR,
                           m_stream);
 
+    // Ensure all GPU operations complete before returning
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -241,6 +254,9 @@ bool RtxProcessor::process(const uint8_t* inBGRA, size_t inPitchBytes,
     copyOut.WidthInBytes = (unsigned int)m_outPitch;
     copyOut.Height = m_dstH;
     CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+
+    // Synchronize to ensure copy is complete before returning host data
+    if (m_stream) cudaStreamSynchronize(m_stream);
 
     outData = m_hostOut.data();
     outWidth = m_dstW;
