@@ -15,6 +15,7 @@ extern "C" {
 #include <libavcodec/packet.h>
 #include <libavutil/avutil.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -253,40 +254,19 @@ int main(int argc, char** argv)
         cfg.thdrMiddleGray = 50;
         cfg.thdrMaxLuminance = 1000;
 
-        RtxProcessor rtx;
-        if (!rtx.initialize(0, cfg, in.vdec->width, in.vdec->height)) {
-            std::string detail = rtx.lastError();
-            if (detail.empty()) detail = "unknown error";
-            throw std::runtime_error(std::string("Failed to initialize RTX processor: ") + detail);
-        }
+        RtxProcessor rtx; // CPU-path RTX instance; initialize lazily only if CPU path is used
+        bool rtx_cpu_inited = false;
 
         // Prepare sws contexts (created on first decoded frame when actual format is known)
         SwsContext* sws_to_argb = nullptr;
         int last_src_format = AV_PIX_FMT_NONE;
 
         // A2R10G10B10 -> P010 for NVENC
-        // In this pipeline, the RTX output maps to A2R10G10B10; use X2RGB10LE to match channel order
+        // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
         int dstW = in.vdec->width * cfg.scaleFactor;
         int dstH = in.vdec->height * cfg.scaleFactor;
-        SwsContext* sws_to_p010 = sws_getContext(
-            dstW, dstH, AV_PIX_FMT_X2BGR10LE,
-            dstW, dstH, AV_PIX_FMT_P010LE,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws_to_p010) throw std::runtime_error("sws_to_p010 alloc failed");
-        // Ensure RGB->YUV conversion uses BT.2020 matrix with correct range mapping (RGB full -> YUV limited)
-        {
-            const int* coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
-            // srcRange=1 (full range RGB), dstRange=0 (limited range YUV per AV_PIX_FMT_P010LE)
-            int srcRange = 1;
-            int dstRange = 0;
-            int brightness = 0;
-            int contrast   = 1 << 16; // 1.0 in 16.16
-            int saturation = 1 << 16; // 1.0 in 16.16
-            sws_setColorspaceDetails(sws_to_p010,
-                                     coeffs_bt2020, srcRange,
-                                     coeffs_bt2020, dstRange,
-                                     brightness, contrast, saturation);
-        }
+        SwsContext* sws_to_p010 = nullptr; // CPU fallback
+        bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr);
 
         // Configure encoder now that sizes are known
         out.venc->codec_id = AV_CODEC_ID_HEVC;
@@ -294,7 +274,12 @@ int main(int argc, char** argv)
         out.venc->height = dstH;
         out.venc->time_base = av_inv_q(fr);
         out.venc->framerate = fr;
-        out.venc->pix_fmt = AV_PIX_FMT_P010LE; // Main10
+        // Prefer CUDA frames if decoder is CUDA-capable to avoid copies
+        if (use_cuda_path) {
+            out.venc->pix_fmt = AV_PIX_FMT_CUDA; // NVENC consumes CUDA frames via hw_frames_ctx
+        } else {
+            out.venc->pix_fmt = AV_PIX_FMT_P010LE; // CPU fallback
+        }
         out.venc->gop_size = 2 * fr.num / std::max(1, fr.den);
         out.venc->max_b_frames = 2;
         out.venc->color_range = AVCOL_RANGE_MPEG;
@@ -320,7 +305,23 @@ int main(int argc, char** argv)
         }
         add_mastering_and_cll(out.vstream);
 
+        // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
+        AVBufferRef* enc_hw_frames = nullptr;
+        if (use_cuda_path) {
+            enc_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
+            if (!enc_hw_frames) throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
+            AVHWFramesContext* fctx = (AVHWFramesContext*)enc_hw_frames->data;
+            fctx->format = AV_PIX_FMT_CUDA;
+            fctx->sw_format = AV_PIX_FMT_P010LE;
+            fctx->width = dstW;
+            fctx->height = dstH;
+            fctx->initial_pool_size = 16;
+            ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
+            out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
+        }
+
         ff_check(avcodec_open2(out.venc, out.venc->codec, nullptr), "open encoder");
+        if (enc_hw_frames) av_buffer_unref(&enc_hw_frames);
 
         // Write header
         out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
@@ -343,10 +344,22 @@ int main(int argc, char** argv)
         bgra_frame->height = in.vdec->height;
         ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
 
+        // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
         p010_frame->format = AV_PIX_FMT_P010LE;
         p010_frame->width = dstW;
         p010_frame->height = dstH;
         ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
+        // CPU path colorspace for RGB(A)->P010
+        sws_to_p010 = sws_getContext(
+            dstW, dstH, AV_PIX_FMT_X2BGR10LE,
+            dstW, dstH, AV_PIX_FMT_P010LE,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_to_p010) throw std::runtime_error("sws_to_p010 alloc failed");
+        const int* coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
+        sws_setColorspaceDetails(sws_to_p010,
+                                 coeffs_bt2020, 1,
+                                 coeffs_bt2020, 0,
+                                 0, 1 << 16, 1 << 16);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
@@ -420,12 +433,14 @@ int main(int argc, char** argv)
 
                     AVFrame* decframe = frame.get();
                     FramePtr tmp(nullptr, &av_frame_free_single);
-                    if (decframe->format == AV_PIX_FMT_CUDA) {
-                        // Transfer from hw to SW NV12
+                    bool frame_is_cuda = (decframe->format == AV_PIX_FMT_CUDA);
+                    if (frame_is_cuda && !use_cuda_path) {
+                        // Decoder produced CUDA but encoder path is CPU: transfer to SW
                         if (!swframe) swframe.reset(av_frame_alloc());
                         ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer");
                         swframe->pts = decframe->pts;
                         decframe = swframe.get();
+                        frame_is_cuda = false;
                     }
 
                     // Select a stable input timestamp
@@ -433,7 +448,130 @@ int main(int argc, char** argv)
                         ? decframe->best_effort_timestamp
                         : decframe->pts;
 
-                    // Convert to ARGB (RGBA in FFmpeg) for RTX input
+                    AVFrame* frame_to_send = nullptr;
+                    if (frame_is_cuda && use_cuda_path) {
+                        // GPU path: allocate an encoder CUDA frame and fill it entirely on GPU via RTX
+                        FramePtr enc_hw(av_frame_alloc(), &av_frame_free_single);
+                        enc_hw->format = AV_PIX_FMT_CUDA;
+                        enc_hw->width = dstW;
+                        enc_hw->height = dstH;
+                        ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw.get(), 0), "alloc enc hw frame");
+
+                        static bool rtx_gpu_init = false;
+                        static RtxProcessor rtx_gpu;
+                        if (!rtx_gpu_init) {
+                            AVHWDeviceContext* devctx = (AVHWDeviceContext*)in.hw_device_ctx->data;
+                            AVCUDADeviceContext* cudactx = (AVCUDADeviceContext*)devctx->hwctx;
+                            CUcontext cu = cudactx->cuda_ctx;
+                            if (!rtx_gpu.initializeWithContext(cu, cfg, in.vdec->width, in.vdec->height)) {
+                                std::string detail = rtx_gpu.lastError();
+                                if (detail.empty()) detail = "unknown error";
+                                throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
+                            }
+                            rtx_gpu_init = true;
+                        }
+
+                        bool bt2020 = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL);
+                        if (rtx_gpu.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
+                                                         decframe->data[1], decframe->linesize[1],
+                                                         enc_hw.get(), bt2020)) {
+                            frame_to_send = enc_hw.get();
+                            // Update progress prior to encoding
+                            processed_frames++;
+                            show_progress();
+
+                            // Set PTS on the frame
+                            if (in_pts != AV_NOPTS_VALUE) frame_to_send->pts = av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base);
+                            else frame_to_send->pts = AV_NOPTS_VALUE;
+
+                            // Encode and then release enc_hw by letting enc_hw FramePtr go out of scope after send
+                            ff_check(avcodec_send_frame(out.venc, frame_to_send), "send frame to encoder (CUDA)");
+                            while (true) {
+                                ret = avcodec_receive_packet(out.venc, opkt.get());
+                                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                                ff_check(ret, "receive encoded packet");
+                                opkt->stream_index = out.vstream->index;
+                                av_packet_rescale_ts(opkt.get(), out.venc->time_base, out.vstream->time_base);
+                                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write video packet");
+                                av_packet_unref(opkt.get());
+                            }
+                            av_frame_unref(frame.get());
+                            if (swframe) av_frame_unref(swframe.get());
+                            continue; // handled this frame on GPU
+                        }
+
+                        // GPU path failed; fall back: transfer to SW, run CPU path, convert to P010, then upload into enc_hw
+                        if (!swframe) swframe.reset(av_frame_alloc());
+                        ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer fallback");
+                        swframe->pts = decframe->pts;
+
+                        // Convert to RGBA
+                        if (!sws_to_argb || last_src_format != swframe->format) {
+                            if (sws_to_argb) sws_freeContext(sws_to_argb);
+                            sws_to_argb = sws_getContext(
+                                swframe->width, swframe->height, (AVPixelFormat)swframe->format,
+                                swframe->width, swframe->height, AV_PIX_FMT_RGBA,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (!sws_to_argb) throw std::runtime_error("sws_to_argb alloc failed");
+                            const int* coeffs = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL)
+                                ? sws_getCoefficients(SWS_CS_BT2020)
+                                : sws_getCoefficients(SWS_CS_ITU709);
+                            sws_setColorspaceDetails(sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
+                            last_src_format = swframe->format;
+                        }
+                        const uint8_t* srcData2[AV_NUM_DATA_POINTERS] = { swframe->data[0], swframe->data[1], swframe->data[2], swframe->data[3] };
+                        int srcLines2[AV_NUM_DATA_POINTERS] = { swframe->linesize[0], swframe->linesize[1], swframe->linesize[2], swframe->linesize[3] };
+                        ff_check(av_frame_make_writable(bgra_frame.get()), "argb make writable (fallback)");
+                        sws_scale(sws_to_argb, srcData2, srcLines2, 0, swframe->height, bgra_frame->data, bgra_frame->linesize);
+
+                        // Lazy-initialize CPU RTX processor when first needed (fallback)
+                        if (!rtx_cpu_inited) {
+                            if (!rtx.initialize(0, cfg, in.vdec->width, in.vdec->height)) {
+                                std::string detail = rtx.lastError();
+                                if (detail.empty()) detail = "unknown error";
+                                throw std::runtime_error(std::string("Failed to initialize RTX CPU path (fallback): ") + detail);
+                            }
+                            rtx_cpu_inited = true;
+                        }
+                        // RTX CPU process
+                        if (!rtx.process(bgra_frame->data[0], (size_t)bgra_frame->linesize[0], rtx_data, rtxW, rtxH, rtxPitch))
+                            throw std::runtime_error("RTX CPU processing failed (fallback)");
+                        if (rtxW != (uint32_t)dstW || rtxH != (uint32_t)dstH)
+                            throw std::runtime_error("Unexpected RTX output dimensions (fallback)");
+
+                        // ABGR10 -> P010 on CPU
+                        ff_check(av_frame_make_writable(p010_frame.get()), "p010 make writable (fallback)");
+                        const uint8_t* abgr_planes2[1] = { rtx_data };
+                        int abgr_lines2[1] = { static_cast<int>(rtxPitch) };
+                        sws_scale(sws_to_p010, abgr_planes2, abgr_lines2, 0, dstH, p010_frame->data, p010_frame->linesize);
+
+                        // Upload P010 to encoder CUDA frame
+                        ff_check(av_hwframe_transfer_data(enc_hw.get(), p010_frame.get(), 0), "upload P010 to CUDA frame");
+
+                        // Set PTS and encode
+                        frame_to_send = enc_hw.get();
+                        if (in_pts != AV_NOPTS_VALUE) frame_to_send->pts = av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base);
+                        else frame_to_send->pts = AV_NOPTS_VALUE;
+                        // progress
+                        processed_frames++;
+                        show_progress();
+
+                        ff_check(avcodec_send_frame(out.venc, frame_to_send), "send frame to encoder (fallback CUDA)");
+                        while (true) {
+                            ret = avcodec_receive_packet(out.venc, opkt.get());
+                            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                            ff_check(ret, "receive encoded packet");
+                            opkt->stream_index = out.vstream->index;
+                            av_packet_rescale_ts(opkt.get(), out.venc->time_base, out.vstream->time_base);
+                            ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write video packet");
+                            av_packet_unref(opkt.get());
+                        }
+                        av_frame_unref(frame.get());
+                        if (swframe) av_frame_unref(swframe.get());
+                        continue; // handled this frame via fallback
+                    }
+
+                    // CPU path: Convert to RGBA for RTX input
                     if (!sws_to_argb || last_src_format != decframe->format) {
                         if (sws_to_argb) sws_freeContext(sws_to_argb);
                         sws_to_argb = sws_getContext(
@@ -441,21 +579,12 @@ int main(int argc, char** argv)
                             decframe->width, decframe->height, AV_PIX_FMT_RGBA,  // ARGB for RTX
                             SWS_BILINEAR, nullptr, nullptr, nullptr);
                         if (!sws_to_argb) throw std::runtime_error("sws_to_argb alloc failed");
-                        
-                        // Set proper colorspace conversion
-                        const int* coeffs = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL) 
+                        const int* coeffs = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL)
                             ? sws_getCoefficients(SWS_CS_BT2020)
                             : sws_getCoefficients(SWS_CS_ITU709);
-                        
-                        // srcRange=1 (full range YUV), dstRange=1 (full range RGB)
-                        sws_setColorspaceDetails(sws_to_argb,
-                            coeffs, 0,  // src: limited range YUV
-                            coeffs, 1,  // dst: full range RGB
-                            0, 1 << 16, 1 << 16);
-                        
+                        sws_setColorspaceDetails(sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
                         last_src_format = decframe->format;
                     }
-                    
                     const uint8_t* srcData[AV_NUM_DATA_POINTERS] = { decframe->data[0], decframe->data[1], decframe->data[2], decframe->data[3] };
                     int srcLines[AV_NUM_DATA_POINTERS] = { decframe->linesize[0], decframe->linesize[1], decframe->linesize[2], decframe->linesize[3] };
                     ff_check(av_frame_make_writable(bgra_frame.get()), "argb make writable");
@@ -465,7 +594,16 @@ int main(int argc, char** argv)
                     processed_frames++;
                     show_progress();
                     
-                    // Feed RTX
+                    // Lazy-initialize CPU RTX processor when first needed
+                    if (!rtx_cpu_inited) {
+                        if (!rtx.initialize(0, cfg, in.vdec->width, in.vdec->height)) {
+                            std::string detail = rtx.lastError();
+                            if (detail.empty()) detail = "unknown error";
+                            throw std::runtime_error(std::string("Failed to initialize RTX CPU path: ") + detail);
+                        }
+                        rtx_cpu_inited = true;
+                    }
+                    // Feed RTX (CPU path)
                     if (!rtx.process(bgra_frame->data[0], (size_t)bgra_frame->linesize[0], rtx_data, rtxW, rtxH, rtxPitch))
                         throw std::runtime_error("RTX processing failed");
 
@@ -473,7 +611,7 @@ int main(int argc, char** argv)
                         throw std::runtime_error("Unexpected RTX output dimensions");
                     }
 
-                    // Convert RTX ABGR10 output directly into encoder P010 buffer
+                    // Convert RTX ABGR10 output directly into encoder P010 buffer (CPU path)
                     ff_check(av_frame_make_writable(p010_frame.get()), "p010 make writable");
                     const uint8_t* abgr_planes[1] = { rtx_data };
                     int abgr_lines[1] = { static_cast<int>(rtxPitch) };

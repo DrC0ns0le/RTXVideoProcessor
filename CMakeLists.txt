@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Target recent NVIDIA architectures (adjust if needed). 89 = Ada (RTX 40 series)
+set(CMAKE_CUDA_ARCHITECTURES 89)
+
 # Use static MSVC runtime (/MT for Release, /MTd for Debug)
 # Requires CMake >= 3.15; this project requires 3.24 at top, so it's safe.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -73,7 +76,8 @@ set(RTX_SDK_ROOT $ENV{NV_RTX_VIDEO_SDK})
 set(RTX_SDK_INCLUDE "${RTX_SDK_ROOT}/include")
 set(RTX_SDK_LIB_DIR "${RTX_SDK_ROOT}/lib")
 set(RTX_VIDEO_API_INCLUDE_DIR "${RTX_SDK_ROOT}/samples/RTX_Video_API")
-set(RTX_VIDEO_SDK_BIN "${RTX_VIDEO_SDK_ROOT}/bin/Windows/x64/rel")
+# Correct bin path for redistributable feature DLLs (TrueHDR/VSR)
+set(RTX_VIDEO_SDK_BIN "${RTX_SDK_ROOT}/bin/Windows/x64/rel")
 
 # NVIDIA Video Codec SDK via env var NV_VIDEO_CODEC_SDK
 if(NOT DEFINED ENV{NV_VIDEO_CODEC_SDK})
@@ -101,7 +105,7 @@ add_definitions(-DNOMINMAX)
 # Sources
 file(GLOB RVP_SOURCES
   src/*.cpp
-  src/*.cu
+  src/cuda_kernels.cu
   ${RTX_VIDEO_API_INCLUDE_DIR}/rtx_video_api_cuda_impl.cpp
 )
 file(GLOB RVP_HEADERS
@@ -110,6 +114,14 @@ file(GLOB RVP_HEADERS
 )
 
 add_executable(RTXVideoProcessor ${RVP_SOURCES} ${RVP_HEADERS})
+
+# Ensure CUDA source files build cleanly with NVCC on the final exe (so device link runs)
+set_target_properties(RTXVideoProcessor PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_PROPAGATE_HOST_FLAGS OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  CUDA_RUNTIME_LIBRARY Static
+)
 
 # Include directories
 target_include_directories(RTXVideoProcessor PRIVATE
@@ -164,7 +176,10 @@ endif()
 # Windows system libs
 if(MSVC)
   target_link_libraries(RTXVideoProcessor PRIVATE ws2_32.lib bcrypt.lib Secur32.lib)
-  target_compile_options(RTXVideoProcessor PRIVATE /EHsc /MP)
+  # Apply MSVC options only to C++ compilation units, not to CUDA. Passing /EHsc or /MP to NVCC causes build failures.
+  target_compile_options(RTXVideoProcessor PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/EHsc /MP>
+  )
 endif()
 
 # Copy RTX Video SDK DLLs to output directory
