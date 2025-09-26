@@ -269,9 +269,9 @@ int main(int argc, char** argv)
         cfg.enableTHDR = true;
         cfg.vsrQuality = 4;
         cfg.scaleFactor = 2;
-        cfg.thdrContrast = 110;
-        cfg.thdrSaturation = 80;
-        cfg.thdrMiddleGray = 35;
+        cfg.thdrContrast = 125;
+        cfg.thdrSaturation = 75;
+        cfg.thdrMiddleGray = 30;
         cfg.thdrMaxLuminance = 1000;
 
         RtxProcessor rtx; // CPU-path RTX instance; initialize lazily only if CPU path is used
@@ -301,7 +301,7 @@ int main(int argc, char** argv)
         } else {
             out.venc->pix_fmt = AV_PIX_FMT_P010LE; // CPU fallback
         }
-        out.venc->gop_size = 2 * fr.num / std::max(1, fr.den);
+        out.venc->gop_size = fr.num / std::max(1, fr.den);
         out.venc->max_b_frames = 2;
         out.venc->color_range = AVCOL_RANGE_MPEG;
         out.venc->color_trc = AVCOL_TRC_SMPTE2084;        // PQ
@@ -311,10 +311,9 @@ int main(int argc, char** argv)
         int64_t target_bitrate = (in_bitrate > 0) ? (int64_t)(in_bitrate * 10) : (int64_t)25000000;
         av_opt_set(out.venc->priv_data, "tune", "hq", 0);
         av_opt_set(out.venc->priv_data, "preset", "p4", 0);
-        av_opt_set(out.venc->priv_data, "rc", "vbr", 0);
-        av_opt_set_int(out.venc->priv_data, "bitrate", target_bitrate, 0);
-        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate*2, 0);
-        av_opt_set_int(out.venc->priv_data, "async_depth", 1, 0);
+        // Switch to constant QP rate control
+        av_opt_set(out.venc->priv_data, "rc", "constqp", 0);
+        av_opt_set_int(out.venc->priv_data, "qp", 20, 0);
         av_opt_set(out.venc->priv_data, "profile", "main10", 0);
         ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
         // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
@@ -411,9 +410,10 @@ int main(int argc, char** argv)
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
         
-        // PTS generation for consistent frame timing
-        int64_t output_frame_count = 0;
-        AVRational output_time_base = out.venc->time_base;
+        // PTS handling: derive video PTS from input timestamps to avoid A/V drift
+        int64_t v_start_pts = AV_NOPTS_VALUE;              // first input video pts
+        int64_t last_output_pts = AV_NOPTS_VALUE;          // last emitted video pts in encoder tb
+        AVRational output_time_base = out.venc->time_base; // encoder time base
 
         const uint8_t* rtx_data = nullptr;
         uint32_t rtxW=0, rtxH=0; size_t rtxPitch=0;
@@ -493,14 +493,25 @@ int main(int argc, char** argv)
                         frame_is_cuda = false;
                     }
 
-                    // Generate consistent output PTS to prevent stuttering
-                    int64_t output_pts = output_frame_count;
-                    output_frame_count++;
-                    
-                    // Also get input PTS for reference (but use generated PTS for output)
+                    // Compute output PTS by rescaling input timestamps to encoder time base
                     int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
                         ? decframe->pts
                         : decframe->best_effort_timestamp;
+                    // Establish a zero-based timeline from the first valid input PTS
+                    if (in_pts != AV_NOPTS_VALUE) {
+                        if (v_start_pts == AV_NOPTS_VALUE) v_start_pts = in_pts;
+                        if (v_start_pts != AV_NOPTS_VALUE) in_pts -= v_start_pts;
+                    }
+                    // Fallback to frame counter if input PTS is unavailable
+                    static int64_t synthetic_counter = 0;
+                    int64_t output_pts = (in_pts != AV_NOPTS_VALUE)
+                        ? av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base)
+                        : synthetic_counter++;
+                    // Ensure strict monotonicity to satisfy encoder/muxer
+                    // if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
+                    //     output_pts = last_output_pts + 1;
+                    // }
+                    // last_output_pts = output_pts;
 
                     AVFrame* frame_to_send = nullptr;
                     if (frame_is_cuda && use_cuda_path) {
@@ -564,10 +575,6 @@ int main(int argc, char** argv)
                         // GPU path failed; fall back: transfer to SW, run CPU path, convert to P010, then upload into enc_hw
                         if (!swframe) swframe.reset(av_frame_alloc());
                         ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer fallback");
-                        
-                        // Ensure GPU-to-CPU transfer is complete
-                        cudaStreamSynchronize(0);
-                        
 
                         // Convert to ARGB
                         if (!sws_to_argb || last_src_format != swframe->format) {
