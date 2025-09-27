@@ -159,18 +159,18 @@ static void print_help(const char *argv0)
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4\n");
     fprintf(stderr, "\nTHDR options:\n");
     fprintf(stderr, "  --no-thdr     Disable THDR\n");
-    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 110\n");
+    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115\n");
     fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75\n");
     fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30\n");
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000\n");
     fprintf(stderr, "\nNVENC options:\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq\n");
-    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p4\n");
+    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP, default 1\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
-    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 10\n");
+    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 5\n");
 }
 
 static void init_setup(int argc, char **argv, PipelineConfig *cfg)
@@ -195,13 +195,13 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
 
     // Default NVENC settings
     cfg->tune = "hq";
-    cfg->preset = "p4";
+    cfg->preset = "p7";
     cfg->rc = "constqp";
 
     cfg->gop = 1;
-    cfg->bframes = 0;
+    cfg->bframes = 2;
     cfg->qp = 21;
-    cfg->targetBitrateMultiplier = 10;
+    cfg->targetBitrateMultiplier = 5;
 
     cfg->inputPath = argv[1];
     cfg->outputPath = argv[2];
@@ -238,7 +238,11 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
 
         // THDR
         else if (arg == "--no-thdr")
+        {
+            if (cfg->rtxCfg.enableVSR)
+                LOG_WARN("Both VSR & THDR are disabled, bypassing RTX evaluate");
             cfg->rtxCfg.enableTHDR = false;
+        }
         else if (arg == "--thdr-contrast")
         {
             if (i + 1 < argc)
@@ -359,6 +363,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
             }
         }
 
+
         else
         {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -430,13 +435,23 @@ int run_pipeline(PipelineConfig cfg)
 
         // A2R10G10B10 -> P010 for NVENC
         // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
-        int dstW = in.vdec->width * cfg.rtxCfg.scaleFactor;
-        int dstH = in.vdec->height * cfg.rtxCfg.scaleFactor;
+        // Auto-disable VSR for inputs >= 1920x1080 in either orientation
+        if (cfg.rtxCfg.enableVSR) {
+            bool ge1080p = (in.vdec->width >= 1920 && in.vdec->height >= 1080) ||
+                           (in.vdec->width >= 1080 && in.vdec->height >= 1920);
+            if (ge1080p) {
+                LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
+                cfg.rtxCfg.enableVSR = false;
+            }
+        }
+        int effScale = cfg.rtxCfg.enableVSR ? cfg.rtxCfg.scaleFactor : 1;
+        int dstW = in.vdec->width * effScale;
+        int dstH = in.vdec->height * effScale;
         SwsContext *sws_to_p010 = nullptr; // CPU fallback
         bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr) && !cfg.cpuOnly;
 
         LOG_VERBOSE("Processing path: %s", use_cuda_path ? "GPU (CUDA)" : "CPU");
-        LOG_VERBOSE("Output resolution: %dx%d (scale factor: %d)", dstW, dstH, cfg.rtxCfg.scaleFactor);
+        LOG_VERBOSE("Output resolution: %dx%d (scale factor: %d)", dstW, dstH, effScale);
         std::string muxer_name = (out.fmt && out.fmt->oformat && out.fmt->oformat->name)
                                      ? out.fmt->oformat->name
                                      : "";
@@ -464,9 +479,15 @@ int run_pipeline(PipelineConfig cfg)
         out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
         out.venc->max_b_frames = 2;
         out.venc->color_range = AVCOL_RANGE_MPEG;
-        out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
-        out.venc->color_primaries = AVCOL_PRI_BT2020;
-        out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
+        if (cfg.rtxCfg.enableTHDR) {
+            out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
+            out.venc->color_primaries = AVCOL_PRI_BT2020;
+            out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
+        } else {
+            out.venc->color_trc = AVCOL_TRC_BT709;
+            out.venc->color_primaries = AVCOL_PRI_BT709;
+            out.venc->colorspace = AVCOL_SPC_BT709;
+        }
 
         // Ensure muxers that require extradata (e.g., Matroska) receive global headers
         if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff)
@@ -475,9 +496,9 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
-        LOG_VERBOSE("Input bitrate: %lld (Mbps), Target bitrate: %lld (Mbps)\n", in.fmt->bit_rate / 1000000, target_bitrate / 1000000);
-        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d",
-                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp);
+        LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
+        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
+                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
         av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
         av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
         // Switch to constant QP rate control
@@ -532,10 +553,19 @@ int run_pipeline(PipelineConfig cfg)
                 out.vstream->codecpar->codec_tag = 0;
             }
             out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
-            out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
+            if (cfg.rtxCfg.enableTHDR) {
+                out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+            } else {
+                out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
+                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
+                out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
+            }
         }
-        add_mastering_and_cll(out.vstream);
+        if (cfg.rtxCfg.enableTHDR) {
+            add_mastering_and_cll(out.vstream);
+        }
 
         // CUDA frame pool for optimized GPU processing
         CudaFramePool cuda_pool;

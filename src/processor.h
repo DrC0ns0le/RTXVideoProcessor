@@ -69,18 +69,8 @@ public:
         if (av_frame_get_buffer(m_p010.get(), 32) < 0)
             throw std::runtime_error("CpuProcessor: alloc P010 failed");
 
-        // CPU path colorspace for X2BGR10LE->P010 (ABGR10 to P010)
-        m_sws_to_p010 = sws_getContext(
-            m_dstW, m_dstH, AV_PIX_FMT_X2BGR10LE,
-            m_dstW, m_dstH, AV_PIX_FMT_P010LE,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!m_sws_to_p010)
-            throw std::runtime_error("CpuProcessor: sws_to_p010 alloc failed");
-        const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
-        sws_setColorspaceDetails(m_sws_to_p010,
-                                 coeffs_bt2020, 1,
-                                 coeffs_bt2020, 0,
-                                 0, 1 << 16, 1 << 16);
+        // Defer building m_sws_to_p010 until setConfig() (needs THDR on/off)
+        m_sws_to_p010 = nullptr;
     }
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override {
@@ -93,7 +83,10 @@ public:
                 m_srcW, m_srcH, AV_PIX_FMT_RGBA,
                 SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (!m_sws_to_argb) return false;
-            const int *coeffs = sws_getCoefficients(SWS_CS_ITU709);
+            // Select input colorspace based on decoded frame colorspace
+            const int *coeffs = (decframe->colorspace == AVCOL_SPC_BT2020_NCL)
+                                    ? sws_getCoefficients(SWS_CS_BT2020)
+                                    : sws_getCoefficients(SWS_CS_ITU709);
             sws_setColorspaceDetails(m_sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
             m_last_src_format = decframe->format;
             m_last_src_w = decframe->width; m_last_src_h = decframe->height;
@@ -109,17 +102,49 @@ public:
         if (!m_rtx.process(m_bgra->data[0], (size_t)m_bgra->linesize[0], rtx_data, rtxW, rtxH, rtxPitch)) return false;
         if (rtxW != (uint32_t)m_dstW || rtxH != (uint32_t)m_dstH) return false;
 
-        // ABGR10 -> P010
+        // Build m_sws_to_p010 if needed based on THDR config
+        if (!m_sws_to_p010) {
+            AVPixelFormat srcPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_BGRA;
+            m_sws_to_p010 = sws_getContext(
+                m_dstW, m_dstH, srcPix,
+                m_dstW, m_dstH, AV_PIX_FMT_P010LE,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!m_sws_to_p010) return false;
+            const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
+                                                     : sws_getCoefficients(SWS_CS_ITU709);
+            sws_setColorspaceDetails(m_sws_to_p010,
+                                     coeffs, 1,
+                                     coeffs, 0,
+                                     0, 1 << 16, 1 << 16);
+        }
+
+        // Convert RTX output to P010
         if (av_frame_make_writable(m_p010.get()) < 0) return false;
-        const uint8_t *abgr_planes[1] = {rtx_data};
-        int abgr_lines[1] = {static_cast<int>(rtxPitch)};
-        sws_scale(m_sws_to_p010, abgr_planes, abgr_lines, 0, m_dstH, m_p010->data, m_p010->linesize);
+        const uint8_t *in_planes[1] = {rtx_data};
+        int in_lines[1] = {static_cast<int>(rtxPitch)};
+        sws_scale(m_sws_to_p010, in_planes, in_lines, 0, m_dstH, m_p010->data, m_p010->linesize);
 
         outFrame = m_p010.get();
         return true;
     }
 
-    void setConfig(const RTXProcessConfig &cfg) { m_rtx_cfg = cfg; }
+    void setConfig(const RTXProcessConfig &cfg) {
+        m_rtx_cfg = cfg;
+        // Rebuild sws_to_p010 to match THDR on/off
+        if (m_sws_to_p010) { sws_freeContext(m_sws_to_p010); m_sws_to_p010 = nullptr; }
+        AVPixelFormat srcPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_BGRA;
+        m_sws_to_p010 = sws_getContext(
+            m_dstW, m_dstH, srcPix,
+            m_dstW, m_dstH, AV_PIX_FMT_P010LE,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!m_sws_to_p010) throw std::runtime_error("CpuProcessor: sws_to_p010 alloc failed in setConfig");
+        const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
+                                                 : sws_getCoefficients(SWS_CS_ITU709);
+        sws_setColorspaceDetails(m_sws_to_p010,
+                                 coeffs, 1,
+                                 coeffs, 0,
+                                 0, 1 << 16, 1 << 16);
+    }
 
     void shutdown() override {
         if (m_sws_to_argb) { sws_freeContext(m_sws_to_argb); m_sws_to_argb = nullptr; }

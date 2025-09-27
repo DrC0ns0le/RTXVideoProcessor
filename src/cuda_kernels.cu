@@ -104,6 +104,90 @@ void launch_abgr10_to_p010(const uint8_t *inABGR, int inPitch,
     k_abgr10_to_p010<<<grid, block, 0, stream>>>(inABGR, inPitch, outY, pitchY, outUV, pitchUV, w, h, bt2020);
 }
 
+// Convert BGRA8 (8-bit per channel) -> P010 limited range, using BT.709 or BT.2020 coefficients.
+__global__ void k_bgra8_to_p010(const uint8_t *__restrict__ inBGRA, int inPitch,
+                                uint8_t *__restrict__ outY, int pitchY,
+                                uint8_t *__restrict__ outUV, int pitchUV,
+                                int w, int h, bool bt2020)
+{
+    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2; // process 2x2 block
+    int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+    if (x + 1 >= w || y + 1 >= h)
+        return;
+
+    float sumCb = 0.f, sumCr = 0.f;
+    float Ys[2][2];
+    for (int dy = 0; dy < 2; ++dy)
+    {
+        const uint8_t *row = inBGRA + (y + dy) * inPitch;
+        for (int dx = 0; dx < 2; ++dx)
+        {
+            const uint8_t *p = row + (x + dx) * 4;
+            // Our pipeline stores R,G,B,A order in the 4 bytes per pixel
+            float R = p[0] / 255.0f;
+            float G = p[1] / 255.0f;
+            float B = p[2] / 255.0f;
+
+            float Kr = bt2020 ? 0.2627f : 0.2126f;
+            float Kb = bt2020 ? 0.0593f : 0.0722f;
+            float Kg = 1.0f - Kr - Kb;
+            float Yp = Kr * R + Kg * G + Kb * B;
+            Ys[dy][dx] = Yp;
+            float Cb = 0.5f * (B - Yp) / (1.0f - Kb);
+            float Cr = 0.5f * (R - Yp) / (1.0f - Kr);
+            sumCb += Cb;
+            sumCr += Cr;
+        }
+    }
+
+    float avgCb = sumCb * 0.25f;
+    float avgCr = sumCr * 0.25f;
+
+    auto mapY10 = [](float Y)
+    {
+        float v = 64.0f + Y * 876.0f; // [64..940]
+        int vi = (int)lrintf(v);
+        return (unsigned short)clampi(vi, 64, 940);
+    };
+    auto mapC10 = [](float C)
+    {
+        float v = 512.0f + C * 896.0f; // [64..960]
+        int vi = (int)lrintf(v);
+        return (unsigned short)clampi(vi, 64, 960);
+    };
+
+    unsigned short *yRow0 = (unsigned short *)(outY + y * pitchY);
+    unsigned short *yRow1 = (unsigned short *)(outY + (y + 1) * pitchY);
+    unsigned short y00 = (unsigned short)(mapY10(Ys[0][0]) << 6);
+    unsigned short y01 = (unsigned short)(mapY10(Ys[0][1]) << 6);
+    unsigned short y10 = (unsigned short)(mapY10(Ys[1][0]) << 6);
+    unsigned short y11 = (unsigned short)(mapY10(Ys[1][1]) << 6);
+    yRow0[x + 0] = y00;
+    yRow0[x + 1] = y01;
+    yRow1[x + 0] = y10;
+    yRow1[x + 1] = y11;
+
+    int uvy = y / 2;
+    int ux = x / 2;
+    unsigned short *uvRow = (unsigned short *)(outUV + uvy * pitchUV);
+    unsigned short U = (unsigned short)(mapC10(avgCb) << 6);
+    unsigned short V = (unsigned short)(mapC10(avgCr) << 6);
+    uvRow[ux * 2 + 0] = U;
+    uvRow[ux * 2 + 1] = V;
+}
+
+void launch_bgra8_to_p010(const uint8_t *inBGRA, int inPitch,
+                          uint8_t *outY, int pitchY,
+                          uint8_t *outUV, int pitchUV,
+                          int w, int h,
+                          bool bt2020,
+                          cudaStream_t stream)
+{
+    dim3 block(16, 16);
+    dim3 grid((w + block.x * 2 - 1) / (block.x * 2), (h + block.y * 2 - 1) / (block.y * 2));
+    k_bgra8_to_p010<<<grid, block, 0, stream>>>(inBGRA, inPitch, outY, pitchY, outUV, pitchUV, w, h, bt2020);
+}
+
 static __device__ inline void yuv_to_rgb(float Yp, float Uc, float Vc, bool bt2020, float &R, float &G, float &B)
 {
     if (bt2020)

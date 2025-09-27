@@ -15,6 +15,7 @@ extern "C"
 }
 
 #include "cuda_kernels.h"
+#include "logger.h"
 
 // Compatibility with CUDA headers for 10:10:10:2 array format like in SDK sample
 #define CUDA_VERSION_INT_101010_2_DEFINED 12080
@@ -103,6 +104,29 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                         bt2020,
                         m_stream);
 
+    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to P010
+    if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
+    {
+        uint8_t *d_outY = encP010Frame->data[0];
+        uint8_t *d_outUV = encP010Frame->data[1];
+        int pitchOutY = encP010Frame->linesize[0];
+        int pitchOutUV = encP010Frame->linesize[1];
+        if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+        {
+            setError("processGpuNV12ToP010: invalid encoder CUDA frame planes");
+            return false;
+        }
+        // Direct BGRA8 -> P010 using input colorspace
+        launch_bgra8_to_p010(m_devBGRA, (int)m_devBGRAPitch,
+                             d_outY, pitchOutY,
+                             d_outUV, pitchOutUV,
+                             (int)m_srcW, (int)m_srcH,
+                             /*bt2020=*/bt2020,
+                             m_stream);
+        cudaStreamSynchronize(m_stream);
+        return true;
+    }
+
     // 2) Copy BGRA8 (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
     copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -134,7 +158,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
         return false;
     }
 
-    // 4) Copy m_dstArray (ABGR10) -> device pitched staging
+    // 4) Copy m_dstArray (ABGR10 if THDR, BGRA8 if SDR) -> device pitched staging
     CUDA_MEMCPY2D copyOut{};
     copyOut.srcMemoryType = CU_MEMORYTYPE_ARRAY;
     copyOut.srcArray = m_dstArray;
@@ -145,7 +169,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     copyOut.Height = m_dstH;
     CUDADRV_CHECK(cuMemcpy2D(&copyOut));
 
-    // 5) ABGR10 -> P010 directly into FFmpeg CUDA frame planes
+    // 5) Convert RTX output to P010 directly into FFmpeg CUDA frame planes
     uint8_t *d_outY = encP010Frame->data[0];
     uint8_t *d_outUV = encP010Frame->data[1];
     int pitchOutY = encP010Frame->linesize[0];
@@ -156,13 +180,27 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
         return false;
     }
 
-    // Always use BT.2020 for HDR output encoding (RGB->YUV conversion)
-    launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
-                          d_outY, pitchOutY,
-                          d_outUV, pitchOutUV,
-                          (int)m_dstW, (int)m_dstH,
-                          m_cfg.enableTHDR,
-                          m_stream);
+    // Use BT.2020 for HDR output; BT.709 for SDR.
+    if (m_cfg.enableTHDR)
+    {
+        // RTX produced ABGR10
+        launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+                              d_outY, pitchOutY,
+                              d_outUV, pitchOutUV,
+                              (int)m_dstW, (int)m_dstH,
+                              /*bt2020=*/true,
+                              m_stream);
+    }
+    else
+    {
+        // RTX produced BGRA8
+        launch_bgra8_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+                             d_outY, pitchOutY,
+                             d_outUV, pitchOutUV,
+                             (int)m_dstW, (int)m_dstH,
+                             /*bt2020=*/bt2020,
+                             m_stream);
+    }
 
     // Ensure all GPU operations complete before returning
     cudaStreamSynchronize(m_stream);

@@ -38,7 +38,9 @@ bool Logger::shouldLog(LogLevel level) const
     switch (level)
     {
     case LogLevel::Error:
+        return true;
     case LogLevel::Warn:
+        return true;
     case LogLevel::Info:
         return true;
     case LogLevel::Verbose:
