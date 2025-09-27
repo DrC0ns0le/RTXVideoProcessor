@@ -31,6 +31,9 @@ extern "C"
 
 #include "ffmpeg_utils.h"
 #include "rtx_processor.h"
+#include "frame_pool.h"
+#include "ts_utils.h"
+#include "processor.h"
 
 // Global flag for logging
 static bool g_verbose = false;
@@ -102,22 +105,7 @@ static inline void av_packet_free_single(AVPacket *p)
 using FramePtr = std::unique_ptr<AVFrame, void (*)(AVFrame *)>;
 using PacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket *)>;
 
-struct InputContext
-{
-    AVFormatContext *fmt = nullptr;
-    int vstream = -1;
-    AVStream *vst = nullptr;
-    AVCodecContext *vdec = nullptr;
-    AVBufferRef *hw_device_ctx = nullptr; // CUDA device
-};
-
-struct OutputContext
-{
-    AVFormatContext *fmt = nullptr;
-    AVStream *vstream = nullptr;
-    AVCodecContext *venc = nullptr;
-    std::vector<int> map_streams; // input->output map, -1 for unmapped
-};
+// Pipeline types are provided by pipeline_types.h via ffmpeg_utils.h
 
 // Unified helper to send a frame to the encoder and interleaved-write all produced packets
 static inline void encode_and_write(AVCodecContext *enc,
@@ -211,198 +199,7 @@ struct PipelineConfig
     RTXProcessConfig rtxCfg;
 };
 
-static AVPixelFormat
-get_cuda_sw_format(AVCodecContext *ctx, const AVPixelFormat *pix_fmts)
-{
-    while (*pix_fmts != AV_PIX_FMT_NONE)
-    {
-        if (*pix_fmts == AV_PIX_FMT_CUDA)
-            return *pix_fmts;
-        pix_fmts++;
-    }
-    return AV_PIX_FMT_NONE;
-}
-
-static bool open_input(const char *inPath, InputContext &in)
-{
-    LOG_DEBUG("Opening input file %s...", inPath);
-    ff_check(avformat_open_input(&in.fmt, inPath, nullptr, nullptr), "open input");
-    LOG_DEBUG("Finding stream info...");
-    ff_check(avformat_find_stream_info(in.fmt, nullptr), "find stream info");
-    LOG_DEBUG("Found %d streams", in.fmt->nb_streams);
-
-    // Find best video stream
-    LOG_DEBUG("Looking for video stream...");
-    in.vstream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (in.vstream < 0)
-        throw std::runtime_error("no video stream");
-    in.vst = in.fmt->streams[in.vstream];
-    LOG_VERBOSE("Found video stream %d: %dx%d, codec: %s", in.vstream,
-                in.vst->codecpar->width, in.vst->codecpar->height,
-                avcodec_get_name(in.vst->codecpar->codec_id));
-
-    const AVCodec *dec = avcodec_find_decoder(in.vst->codecpar->codec_id);
-    if (!dec)
-        throw std::runtime_error("decoder not found");
-
-    in.vdec = avcodec_alloc_context3(dec);
-    if (!in.vdec)
-        throw std::runtime_error("alloc dec ctx");
-    ff_check(avcodec_parameters_to_context(in.vdec, in.vst->codecpar), "copy dec params");
-
-    // Try to enable CUDA hwaccel
-    if (av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) >= 0)
-    {
-        LOG_VERBOSE("CUDA hardware acceleration enabled for decoder");
-        in.vdec->hw_device_ctx = av_buffer_ref(in.hw_device_ctx);
-        in.vdec->get_format = [](AVCodecContext *ctx, const AVPixelFormat *pix_fmts)
-        {
-            return get_cuda_sw_format(ctx, pix_fmts);
-        };
-    }
-    else
-    {
-        LOG_WARN("WARNING: CUDA hardware acceleration not available, using CPU decoder");
-    }
-
-    ff_check(avcodec_open2(in.vdec, dec, nullptr), "open decoder");
-    return true;
-}
-
-static void close_input(InputContext &in)
-{
-    if (in.vdec)
-        avcodec_free_context(&in.vdec);
-    if (in.hw_device_ctx)
-        av_buffer_unref(&in.hw_device_ctx);
-    if (in.fmt)
-        avformat_close_input(&in.fmt);
-}
-
-static void add_mastering_and_cll(AVStream *st)
-{
-    // Attach HDR mastering metadata to codec parameters coded_side_data (FFmpeg >= 8)
-    AVPacketSideData *sd = av_packet_side_data_new(&st->codecpar->coded_side_data,
-                                                   &st->codecpar->nb_coded_side_data,
-                                                   AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
-                                                   sizeof(AVMasteringDisplayMetadata), 0);
-    if (sd && sd->data && sd->size == sizeof(AVMasteringDisplayMetadata))
-    {
-        AVMasteringDisplayMetadata *mdm = (AVMasteringDisplayMetadata *)sd->data;
-        memset(mdm, 0, sizeof(*mdm));
-        // BT.2020 primaries and D65 white point
-        mdm->display_primaries[0][0] = av_d2q(0.708, 100000); // R x
-        mdm->display_primaries[0][1] = av_d2q(0.292, 100000); // R y
-        mdm->display_primaries[1][0] = av_d2q(0.170, 100000); // G x
-        mdm->display_primaries[1][1] = av_d2q(0.797, 100000); // G y
-        mdm->display_primaries[2][0] = av_d2q(0.131, 100000); // B x
-        mdm->display_primaries[2][1] = av_d2q(0.046, 100000); // B y
-        mdm->white_point[0] = av_d2q(0.3127, 100000);
-        mdm->white_point[1] = av_d2q(0.3290, 100000);
-
-        // Luminance values must be encoded according to SMPTE ST 2086 standard
-        // Values are in units of 0.0001 cd/m² (candelas per square meter)
-        // For 1000 cd/m² max: 1000 * 10000 = 10000000 units
-        // For 0.005 cd/m² min: 0.005 * 10000 = 50 units
-        mdm->min_luminance = av_make_q(50, 10000);       // 0.005 cd/m² = 50/10000
-        mdm->max_luminance = av_make_q(10000000, 10000); // 1000 cd/m² = 10000000/10000
-        mdm->has_luminance = 1;
-        mdm->has_primaries = 1;
-    }
-
-    sd = av_packet_side_data_new(&st->codecpar->coded_side_data,
-                                 &st->codecpar->nb_coded_side_data,
-                                 AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
-                                 sizeof(AVContentLightMetadata), 0);
-    if (sd && sd->data && sd->size == sizeof(AVContentLightMetadata))
-    {
-        AVContentLightMetadata *cll = (AVContentLightMetadata *)sd->data;
-        cll->MaxCLL = 1000;
-        cll->MaxFALL = 400;
-    }
-}
-
-static bool open_output(const char *outPath, const InputContext &in, OutputContext &out)
-{
-    LOG_DEBUG("Opening output file: %s", outPath);
-    ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, nullptr, outPath), "alloc out ctx");
-    if (!out.fmt)
-        throw std::runtime_error("cannot alloc out ctx");
-    // Ensure packets are flushed promptly for progressive playback while encoding
-    out.fmt->flags |= AVFMT_FLAG_FLUSH_PACKETS;
-
-    // Map streams: copy all non-video as is (audio/subtitles). Create new video stream.
-    out.map_streams.assign(in.fmt->nb_streams, -1);
-
-    // Create video encoder stream
-    LOG_DEBUG("Looking for HEVC encoder...");
-    const AVCodec *hevc = avcodec_find_encoder_by_name("hevc_nvenc");
-    if (!hevc)
-        hevc = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-    if (!hevc)
-        throw std::runtime_error("hevc encoder not found");
-    LOG_VERBOSE("Found HEVC encoder: %s", hevc->name);
-
-    out.vstream = avformat_new_stream(out.fmt, hevc);
-    if (!out.vstream)
-        throw std::runtime_error("new video stream");
-    out.vstream->id = (int)out.fmt->nb_streams - 1;
-
-    out.venc = avcodec_alloc_context3(hevc);
-    if (!out.venc)
-        throw std::runtime_error("alloc enc ctx");
-
-    // We'll fill details later after first input frame size/fps is known.
-
-    // Copy other streams (audio/subs) with codec copy
-    for (unsigned i = 0; i < in.fmt->nb_streams; ++i)
-    {
-        if ((int)i == in.vstream)
-            continue;
-
-        AVStream *ist = in.fmt->streams[i];
-
-        // Skip unsupported subtitle formats for MP4
-        if (ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-        {
-            const AVCodecDescriptor *desc = avcodec_descriptor_get(ist->codecpar->codec_id);
-            if (desc && strcmp(desc->name, "subrip") == 0)
-            {
-                fprintf(stderr, "Note: Skipping SRT subtitles (stream %d) - not supported in MP4 container\n", i);
-                continue; // Skip this stream
-            }
-        }
-
-        AVStream *ost = avformat_new_stream(out.fmt, nullptr);
-        if (!ost)
-            throw std::runtime_error("new stream (copy)");
-        ff_check(avcodec_parameters_copy(ost->codecpar, ist->codecpar), "copy stream params");
-        ost->codecpar->codec_tag = 0;
-        ost->time_base = ist->time_base; // Preserve input stream time base to ensure correct timestamp scaling for copied streams
-        out.map_streams[i] = ost->index;
-    }
-
-    // Open IO
-    if (!(out.fmt->oformat->flags & AVFMT_NOFILE))
-    {
-        ff_check(avio_open(&out.fmt->pb, outPath, AVIO_FLAG_WRITE), "open output file");
-    }
-
-    return true;
-}
-
-static void close_output(OutputContext &out)
-{
-    if (out.venc)
-        avcodec_free_context(&out.venc);
-    if (out.fmt)
-    {
-        if (!(out.fmt->oformat->flags & AVFMT_NOFILE) && out.fmt->pb)
-            avio_closep(&out.fmt->pb);
-        avformat_free_context(out.fmt);
-        out.fmt = nullptr;
-    }
-}
+// FFmpeg setup helpers moved to ffmpeg_utils.cpp
 
 static void print_help(const char *argv0)
 {
@@ -762,27 +559,17 @@ int run_pipeline(PipelineConfig cfg)
             av_buffer_unref(&enc_hw_frames);
 
         // CUDA frame pool for optimized GPU processing
-        std::vector<FramePtr> cuda_frame_pool;
+        CudaFramePool cuda_pool;
         const int POOL_SIZE = 8; // Adjust based on your needs
-        int pool_index = 0;
 
         // Frame buffering for handling processing spikes
         std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
         const int MAX_BUFFER_SIZE = 4;
 
-        // Pre-allocate CUDA frames if using CUDA path
+        // Initialize CUDA frame pool if using CUDA path
         if (use_cuda_path)
         {
-            cuda_frame_pool.reserve(POOL_SIZE);
-            for (int i = 0; i < POOL_SIZE; i++)
-            {
-                FramePtr enc_hw(av_frame_alloc(), &av_frame_free_single);
-                enc_hw->format = AV_PIX_FMT_CUDA;
-                enc_hw->width = dstW;
-                enc_hw->height = dstH;
-                ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw.get(), 0), "alloc enc hw frame pool");
-                cuda_frame_pool.push_back(std::move(enc_hw));
-            }
+            cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
         }
 
         // Write header
@@ -922,6 +709,19 @@ int run_pipeline(PipelineConfig cfg)
             rtx_init = true;
         }
 
+        // Build a processor abstraction for the loop
+        std::unique_ptr<IProcessor> processor;
+        if (use_cuda_path)
+        {
+            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace);
+        }
+        else
+        {
+            auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width, in.vdec->height, dstW, dstH);
+            cpuProc->setConfig(cfg.rtxCfg);
+            processor = std::move(cpuProc);
+        }
+
         // Read packets
         while (true)
         {
@@ -960,104 +760,34 @@ int run_pipeline(PipelineConfig cfg)
                     int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
                                          ? decframe->pts
                                          : decframe->best_effort_timestamp;
-                    // Establish a zero-based timeline from the first valid input PTS
-                    if (in_pts != AV_NOPTS_VALUE)
-                    {
-                        if (v_start_pts == AV_NOPTS_VALUE)
-                            v_start_pts = in_pts;
-                        if (v_start_pts != AV_NOPTS_VALUE)
-                            in_pts -= v_start_pts;
-                    }
-                    // Fallback to frame counter if input PTS is unavailable
-                    static int64_t synthetic_counter = 0;
-                    int64_t output_pts = (in_pts != AV_NOPTS_VALUE)
-                                             ? av_rescale_q(in_pts, in.vst->time_base, out.venc->time_base)
-                                             : synthetic_counter++;
+                    int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base);
                     // Ensure strict monotonicity to satisfy encoder/muxer
                     // if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
                     //     output_pts = last_output_pts + 1;
                     // }
                     // last_output_pts = output_pts;
 
-                    AVFrame *frame_to_send = nullptr;
-                    if (frame_is_cuda && use_cuda_path)
+                    // Use unified processor
+                    AVFrame *outFrame = nullptr;
+                    if (!processor->process(decframe, outFrame))
                     {
-                        // GPU path: reuse pre-allocated frame from pool instead of allocating new one
-                        AVFrame *enc_hw = cuda_frame_pool[pool_index].get();
-                        pool_index = (pool_index + 1) % POOL_SIZE;
-
-                        // Clear previous frame data
-                        av_frame_unref(enc_hw);
-                        enc_hw->format = AV_PIX_FMT_CUDA;
-                        enc_hw->width = dstW;
-                        enc_hw->height = dstH;
-
-                        // Get buffer for this frame (much faster than full allocation)
-                        ff_check(av_hwframe_get_buffer(out.venc->hw_frames_ctx, enc_hw, 0), "get enc hw frame buffer");
-
-                        bool bt2020 = (in.vdec->colorspace == AVCOL_SPC_BT2020_NCL);
-                        if (rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
-                                                         decframe->data[1], decframe->linesize[1],
-                                                         enc_hw, bt2020))
-                        {
-                            frame_to_send = enc_hw;
-                            // Update progress prior to encoding
-                            processed_frames++;
-                            show_progress();
-
-                            // Set consistent PTS to prevent stuttering
-                            frame_to_send->pts = output_pts;
-
-                            // Encode and then release enc_hw by letting enc_hw FramePtr go out of scope after send
-                            // Ensure all GPU work for this frame completes before encoding and moving to next frame
-                            cudaStreamSynchronize(0);
-                            encode_and_write(out.venc, out.vstream, out.fmt, frame_to_send, opkt, "send frame to encoder (CUDA)");
-                            av_frame_unref(frame.get());
-                            if (swframe)
-                                av_frame_unref(swframe.get());
-                            continue; // handled this frame on GPU
-                        }
-
-                        // GPU path failed; CPU fallback during processing is disabled by design
-                        throw std::runtime_error("GPU processing failed; CPU fallback at runtime is disabled");
+                        // Processing failed; no runtime fallback by design
+                        throw std::runtime_error("Processor failed to produce output frame");
                     }
 
-                    // CPU path: Convert to RGBA for RTX input
-                    ensure_sws_to_argb(sws_to_argb, last_src_format,
-                                      decframe->width, decframe->height,
-                                      (AVPixelFormat)decframe->format,
-                                      in.vdec->colorspace);
-                    const uint8_t *srcData[AV_NUM_DATA_POINTERS] = {decframe->data[0], decframe->data[1], decframe->data[2], decframe->data[3]};
-                    int srcLines[AV_NUM_DATA_POINTERS] = {decframe->linesize[0], decframe->linesize[1], decframe->linesize[2], decframe->linesize[3]};
-                    ff_check(av_frame_make_writable(bgra_frame.get()), "argb make writable");
-                    sws_scale(sws_to_argb, srcData, srcLines, 0, decframe->height, bgra_frame->data, bgra_frame->linesize);
-
-                    // Update progress counter before processing
+                    // Update progress prior to encoding
                     processed_frames++;
                     show_progress();
 
-                    // Feed RTX (CPU path)
-                    ensure_rtx_cpu_and_process(rtx, rtx_init, cfg.rtxCfg,
-                                               in.vdec->width, in.vdec->height,
-                                               bgra_frame->data[0], (size_t)bgra_frame->linesize[0],
-                                               rtx_data, rtxW, rtxH, rtxPitch);
-
-                    if (rtxW != (uint32_t)dstW || rtxH != (uint32_t)dstH)
-                    {
-                        throw std::runtime_error("Unexpected RTX output dimensions");
-                    }
-
-                    // Convert RTX ABGR10 output directly into encoder P010 buffer (CPU path)
-                    ff_check(av_frame_make_writable(p010_frame.get()), "p010 make writable");
-                    const uint8_t *abgr_planes[1] = {rtx_data};
-                    int abgr_lines[1] = {static_cast<int>(rtxPitch)};
-                    sws_scale(sws_to_p010, abgr_planes, abgr_lines, 0, dstH, p010_frame->data, p010_frame->linesize);
-
                     // Set consistent PTS to prevent stuttering
-                    p010_frame->pts = output_pts;
+                    outFrame->pts = output_pts;
+
+                    // Ensure GPU work completes before encoding when on CUDA path
+                    if (use_cuda_path)
+                        cudaStreamSynchronize(0);
 
                     // Encode
-                    encode_and_write(out.venc, out.vstream, out.fmt, p010_frame.get(), opkt, "send frame to encoder");
+                    encode_and_write(out.venc, out.vstream, out.fmt, outFrame, opkt, "send frame to encoder");
                     av_frame_unref(frame.get());
                     if (swframe)
                         av_frame_unref(swframe.get());
