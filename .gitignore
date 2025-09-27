@@ -3,3 +3,4 @@ SDKs
 *.mp4
 *.mkv
 sdk.md
+.vscode/*
