@@ -34,61 +34,8 @@ extern "C"
 #include "frame_pool.h"
 #include "ts_utils.h"
 #include "processor.h"
+#include "logger.h"
 
-// Global flag for logging
-static bool g_verbose = false;
-static bool g_debug = false;
-
-// Verbose logging macro
-#define LOG_VERBOSE(...)                   \
-    do                                     \
-    {                                      \
-        if (g_verbose)                     \
-        {                                  \
-            fprintf(stderr, "[VERBOSE] "); \
-            fprintf(stderr, __VA_ARGS__);  \
-            fprintf(stderr, "\n");         \
-        }                                  \
-    } while (0)
-
-// Error logging macro
-#define LOG_ERROR(...)                \
-    do                                \
-    {                                 \
-        fprintf(stderr, "[ERROR] ");  \
-        fprintf(stderr, __VA_ARGS__); \
-        fprintf(stderr, "\n");        \
-    } while (0)
-
-// Info logging macro
-#define LOG_INFO(...)                 \
-    do                                \
-    {                                 \
-        fprintf(stderr, "[INFO] ");   \
-        fprintf(stderr, __VA_ARGS__); \
-        fprintf(stderr, "\n");        \
-    } while (0)
-
-// Debug logging macro
-#define LOG_DEBUG(...)                    \
-    do                                    \
-    {                                     \
-        if (g_debug)                      \
-        {                                 \
-            fprintf(stderr, "[DEBUG] ");  \
-            fprintf(stderr, __VA_ARGS__); \
-            fprintf(stderr, "\n");        \
-        }                                 \
-    } while (0)
-
-// Warning logging macro
-#define LOG_WARN(...)                 \
-    do                                \
-    {                                 \
-        fprintf(stderr, "[WARN] ");   \
-        fprintf(stderr, __VA_ARGS__); \
-        fprintf(stderr, "\n");        \
-    } while (0)
 
 // RAII deleters for FFmpeg types that require ** double-pointer frees
 static inline void av_frame_free_single(AVFrame *f)
@@ -203,10 +150,10 @@ struct PipelineConfig
 
 static void print_help(const char *argv0)
 {
-    fprintf(stderr, "Usage: %s input.mp4 output.mp4 [options]\\n", argv0);
-    fprintf(stderr, "\\nOptions:\\n");
-    fprintf(stderr, "  -v, --verbose Enable verbose logging\\n");
-    fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\\n");
+    fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv} [options]\n", argv0);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
+    fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
     fprintf(stderr, "\nVSR options:\n");
     fprintf(stderr, "  --no-vsr      Disable VSR\n");
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4\n");
@@ -416,14 +363,15 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
         {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             print_help(argv[0]);
+            exit(1);
         }
     }
 }
 
 int run_pipeline(PipelineConfig cfg)
 {
-    // Set global verbose flag
-    g_verbose = cfg.verbose;
+    Logger::instance().setVerbose(cfg.verbose);
+    Logger::instance().setDebug(false);
 
     LOG_VERBOSE("Starting video processing pipeline");
     LOG_DEBUG("Input: %s", cfg.inputPath);
@@ -489,6 +437,13 @@ int run_pipeline(PipelineConfig cfg)
 
         LOG_VERBOSE("Processing path: %s", use_cuda_path ? "GPU (CUDA)" : "CPU");
         LOG_VERBOSE("Output resolution: %dx%d (scale factor: %d)", dstW, dstH, cfg.rtxCfg.scaleFactor);
+        std::string muxer_name = (out.fmt && out.fmt->oformat && out.fmt->oformat->name)
+                                     ? out.fmt->oformat->name
+                                     : "";
+        bool mux_is_isobmff = muxer_name.find("mp4") != std::string::npos ||
+                              muxer_name.find("mov") != std::string::npos;
+        LOG_VERBOSE("Output container: %s",
+                    muxer_name.empty() ? "unknown" : muxer_name.c_str());
 
         // Configure encoder now that sizes are known
         LOG_DEBUG("Configuring HEVC encoder...");
@@ -513,6 +468,12 @@ int run_pipeline(PipelineConfig cfg)
         out.venc->color_primaries = AVCOL_PRI_BT2020;
         out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
 
+        // Ensure muxers that require extradata (e.g., Matroska) receive global headers
+        if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff)
+        {
+            out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
         int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
         LOG_VERBOSE("Input bitrate: %lld (Mbps), Target bitrate: %lld (Mbps)\n", in.fmt->bit_rate / 1000000, target_bitrate / 1000000);
         LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d",
@@ -523,16 +484,6 @@ int run_pipeline(PipelineConfig cfg)
         av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
         av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
         av_opt_set(out.venc->priv_data, "profile", "main10", 0);
-        ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
-        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
-        if (out.vstream->codecpar)
-        {
-            out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
-            out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
-            out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
-        }
-        add_mastering_and_cll(out.vstream);
 
         // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
         AVBufferRef *enc_hw_frames = nullptr;
@@ -558,6 +509,34 @@ int run_pipeline(PipelineConfig cfg)
         if (enc_hw_frames)
             av_buffer_unref(&enc_hw_frames);
 
+        ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
+        if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr)
+        {
+            throw std::runtime_error("HEVC encoder did not provide extradata; required for Matroska outputs");
+        }
+        LOG_DEBUG("Encoder extradata size: %d bytes", out.vstream->codecpar->extradata_size);
+        if (out.vstream->codecpar->extradata_size >= 4)
+        {
+            const uint8_t *ed = out.vstream->codecpar->extradata;
+            LOG_DEBUG("Extradata head: %02X %02X %02X %02X", ed[0], ed[1], ed[2], ed[3]);
+        }
+        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
+        if (out.vstream->codecpar)
+        {
+            if (mux_is_isobmff)
+            {
+                out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
+            }
+            else
+            {
+                out.vstream->codecpar->codec_tag = 0;
+            }
+            out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
+            out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+            out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
+        }
+        add_mastering_and_cll(out.vstream);
+
         // CUDA frame pool for optimized GPU processing
         CudaFramePool cuda_pool;
         const int POOL_SIZE = 8; // Adjust based on your needs
@@ -577,11 +556,14 @@ int run_pipeline(PipelineConfig cfg)
         out.vstream->avg_frame_rate = fr;
         // Write header with MOV/MP4 muxer flags for broad compatibility
         // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
-        AVDictionary *movopts = nullptr;
+        AVDictionary *muxopts = nullptr;
         // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
-        av_dict_set(&movopts, "movflags", "+faststart+write_colr", 0);
-        ff_check(avformat_write_header(out.fmt, &movopts), "write header");
-        av_dict_free(&movopts);
+        if (mux_is_isobmff)
+        {
+            av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
+        }
+        ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
+        av_dict_free(&muxopts);
 
         // Frame buffers
         FramePtr frame(av_frame_alloc(), &av_frame_free_single);

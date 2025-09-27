@@ -1,4 +1,5 @@
 #include "ffmpeg_utils.h"
+#include "logger.h"
 #include <cstdio>
 #include <cstring>
 
@@ -136,6 +137,16 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             continue;
 
         AVStream *ist = in.fmt->streams[i];
+        // Ensure the output container supports the codec when stream copying.
+        if (!avformat_query_codec(out.fmt->oformat, ist->codecpar->codec_id, FF_COMPLIANCE_NORMAL))
+        {
+            const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
+            LOG_WARN("Dropping stream %u (%s): not supported by output container", i,
+                     codec_name ? codec_name : "unknown");
+            out.map_streams[i] = -1;
+            continue;
+        }
+
         AVStream *ost = avformat_new_stream(out.fmt, nullptr);
         if (!ost)
             throw std::runtime_error("Failed to allocate output stream");
