@@ -1,5 +1,6 @@
 #include "ffmpeg_utils.h"
 #include "logger.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -211,9 +212,13 @@ static AVPixelFormat get_cuda_hw_format(AVCodecContext *, const AVPixelFormat *p
 }
 
 // Attach HDR mastering metadata to codecpar coded_side_data and content light level.
-void add_mastering_and_cll(AVStream *st)
+void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
 {
     if (!st || !st->codecpar) return;
+
+    constexpr int kMinNit = 1;
+    constexpr int kMaxNit = 10000; // HDR10 mastering metadata limit
+    int max_luminance = std::min(std::max(max_luminance_nits, kMinNit), kMaxNit);
 
     AVPacketSideData *sd = av_packet_side_data_new(&st->codecpar->coded_side_data,
                                                    &st->codecpar->nb_coded_side_data,
@@ -233,8 +238,8 @@ void add_mastering_and_cll(AVStream *st)
         mdm->white_point[0] = av_d2q(0.3127, 100000);
         mdm->white_point[1] = av_d2q(0.3290, 100000);
         // Luminance
-        mdm->min_luminance = av_make_q(50, 10000);       // 0.005 cd/m²
-        mdm->max_luminance = av_make_q(10000000, 10000); // 1000 cd/m²
+        mdm->min_luminance = av_make_q(50, 10000); // 0.005 cd/m²
+        mdm->max_luminance = av_make_q(max_luminance * max_luminance, 10000); // 1000 cd/m² = 1000 * 1000 = 1000000
         mdm->has_luminance = 1;
         mdm->has_primaries = 1;
     }
@@ -246,7 +251,7 @@ void add_mastering_and_cll(AVStream *st)
     if (sd && sd->data && sd->size == sizeof(AVContentLightMetadata))
     {
         AVContentLightMetadata *cll = (AVContentLightMetadata *)sd->data;
-        cll->MaxCLL = 1000;
-        cll->MaxFALL = 400;
+        cll->MaxCLL = max_luminance;
+        cll->MaxFALL = std::max(kMinNit, max_luminance / 2);
     }
 }

@@ -564,7 +564,7 @@ int run_pipeline(PipelineConfig cfg)
             }
         }
         if (cfg.rtxCfg.enableTHDR) {
-            add_mastering_and_cll(out.vstream);
+            add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
         }
 
         // CUDA frame pool for optimized GPU processing

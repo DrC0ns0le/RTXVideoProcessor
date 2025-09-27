@@ -30,7 +30,7 @@ inline std::string ff_ts(double seconds)
 }
 
 // Attach HDR mastering metadata and content light level side data to a video stream
-void add_mastering_and_cll(AVStream *st);
+void add_mastering_and_cll(AVStream *st, int max_luminance_nits);
 
 // Open input and locate video stream, prepare decoder. Tries to enable CUDA device.
 bool open_input(const char *inPath, InputContext &in);
