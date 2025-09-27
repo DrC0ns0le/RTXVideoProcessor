@@ -1,6 +1,6 @@
 # RTXVideoProcessor
 
-This CLI tool allows you to take any H.264/H.265 MP4/MKV file, and using the NVIDIA RTX Video SDK, apply Video Super Resoltion(VSR) and TrueHDR (SDR to HDR) processing to the video, and output a Main10 HEVC file with the processed video. Refer to NVIDIA RTX Video SDK documentation for more information.
+This CLI tool allows you to take any H.264/H.265 MP4/MKV file, and using the NVIDIA RTX Video SDK, apply Video Super Resoltion(VSR) and TrueHDR (SDR to HDR) processing to the video, and output a Main10 HEVC file with the processed video. Refer to NVIDIA RTX Video SDK documentation for more information. [RTX Video SDK](https://developer.nvidia.com/rtx-video-sdk)
 
 The pipeline processes the video on the GPU for zero-copy processing. All audio/subtitles are copied verbatim without transcoding. Based on my experience, at p7 preset, my RTX 4070 processes the video at around ~2x real-time speed for a 1080p input, and ~3-5x real-time speed for p4 preset. However, I noticed that at p4 preset, there seems to be occasional stutters in the output video. Any help with this would be greatly appreciated.
 
