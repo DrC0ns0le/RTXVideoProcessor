@@ -207,6 +207,107 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     return true;
 }
 
+bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
+                                        const uint8_t *d_uv, int pitchUV,
+                                        AVFrame *encNV12Frame,
+                                        bool bt2020)
+{
+    if (!m_initialized || !d_y || !d_uv || !encNV12Frame)
+    {
+        setError("processGpuNV12ToNV12: invalid state or null args");
+        return false;
+    }
+
+    CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
+
+    // NV12 -> BGRA8 (device)
+    launch_nv12_to_bgra(d_y, pitchY, d_uv, pitchUV,
+                        m_devBGRA, (int)m_devBGRAPitch,
+                        (int)m_srcW, (int)m_srcH,
+                        bt2020,
+                        m_stream);
+
+    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to NV12
+    if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
+    {
+        uint8_t *d_outY = encNV12Frame->data[0];
+        uint8_t *d_outUV = encNV12Frame->data[1];
+        int pitchOutY = encNV12Frame->linesize[0];
+        int pitchOutUV = encNV12Frame->linesize[1];
+        if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+        {
+            setError("processGpuNV12ToNV12: invalid encoder CUDA frame planes");
+            return false;
+        }
+        // Direct BGRA8 -> NV12 using input colorspace
+        launch_bgra8_to_nv12(m_devBGRA, (int)m_devBGRAPitch,
+                             d_outY, pitchOutY,
+                             d_outUV, pitchOutUV,
+                             (int)m_srcW, (int)m_srcH,
+                             /*bt2020=*/bt2020,
+                             m_stream);
+        cudaStreamSynchronize(m_stream);
+        return true;
+    }
+
+    // Copy BGRA8 -> m_srcArray for RTX input
+    CUDA_MEMCPY2D copyIn{};
+    copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyIn.srcDevice = (CUdeviceptr)m_devBGRA;
+    copyIn.srcPitch = (unsigned int)m_devBGRAPitch;
+    copyIn.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    copyIn.dstArray = m_srcArray;
+    copyIn.WidthInBytes = (unsigned int)(m_srcW * 4);
+    copyIn.Height = m_srcH;
+    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+
+    // RTX evaluate (BGRA8 in, BGRA8 or ABGR10 out depending on THDR)
+    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
+    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_VSR_Setting vsr{}; vsr.QualityLevel = m_cfg.vsrQuality;
+    API_THDR_Setting thdr{}; thdr.Contrast = m_cfg.thdrContrast; thdr.Saturation = m_cfg.thdrSaturation; thdr.MiddleGray = m_cfg.thdrMiddleGray; thdr.MaxLuminance = m_cfg.thdrMaxLuminance;
+    bool ok = rtx_video_api_cuda_evaluate(m_srcTex, m_dstSurf, srcRect, dstRect,
+                                          m_cfg.enableVSR ? &vsr : nullptr,
+                                          m_cfg.enableTHDR ? &thdr : nullptr);
+    if (!ok)
+    {
+        setError("RTX evaluate failed (NV12 path)");
+        return false;
+    }
+
+    // Copy m_dstArray -> device pitched staging (BGRA8 if SDR)
+    CUDA_MEMCPY2D copyOut{};
+    copyOut.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    copyOut.srcArray = m_dstArray;
+    copyOut.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyOut.dstDevice = (CUdeviceptr)m_devABGR10; // reused buffer (32bpp)
+    copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
+    copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
+    copyOut.Height = m_dstH;
+    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+
+    // Convert to NV12 into FFmpeg CUDA frame planes
+    uint8_t *d_outY = encNV12Frame->data[0];
+    uint8_t *d_outUV = encNV12Frame->data[1];
+    int pitchOutY = encNV12Frame->linesize[0];
+    int pitchOutUV = encNV12Frame->linesize[1];
+    if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+    {
+        setError("processGpuNV12ToNV12: invalid encoder CUDA frame planes");
+        return false;
+    }
+    // For SDR output use BT.709; if input was BT.2020 but THDR disabled, we still use the input's matrix for colorimetry conversion to SDR YUV.
+    launch_bgra8_to_nv12(m_devABGR10, (int)m_devABGR10Pitch,
+                         d_outY, pitchOutY,
+                         d_outUV, pitchOutUV,
+                         (int)m_dstW, (int)m_dstH,
+                         /*bt2020=*/bt2020,
+                         m_stream);
+
+    cudaStreamSynchronize(m_stream);
+    return true;
+}
+
 bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcessConfig &cfg, uint32_t srcW, uint32_t srcH)
 {
     if (m_initialized)

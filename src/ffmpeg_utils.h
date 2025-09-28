@@ -33,7 +33,7 @@ inline std::string ff_ts(double seconds)
 void add_mastering_and_cll(AVStream *st, int max_luminance_nits);
 
 // Open input and locate video stream, prepare decoder. Tries to enable CUDA device.
-bool open_input(const char *inPath, InputContext &in);
+bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *options = nullptr);
 void close_input(InputContext &in);
 
 // Open output, create video encoder stream and map non-video streams.

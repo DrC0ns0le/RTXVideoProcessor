@@ -24,16 +24,23 @@ public:
 
 class GpuProcessor : public IProcessor {
 public:
-    GpuProcessor(RTXProcessor &rtx, CudaFramePool &pool, AVColorSpace colorSpace)
-        : m_rtx(rtx), m_pool(pool), m_bt2020(colorSpace == AVCOL_SPC_BT2020_NCL) {}
+    GpuProcessor(RTXProcessor &rtx, CudaFramePool &pool, AVColorSpace colorSpace, bool thdrEnabled)
+        : m_rtx(rtx), m_pool(pool), m_bt2020(colorSpace == AVCOL_SPC_BT2020_NCL), m_thdrEnabled(thdrEnabled) {}
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override {
         if (!decframe || decframe->format != AV_PIX_FMT_CUDA) return false;
         AVFrame *enc_hw = m_pool.acquire();
-        if (!m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
-                                        decframe->data[1], decframe->linesize[1],
-                                        enc_hw, m_bt2020))
-            return false;
+        bool ok = false;
+        if (m_thdrEnabled) {
+            ok = m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
+                                            decframe->data[1], decframe->linesize[1],
+                                            enc_hw, m_bt2020);
+        } else {
+            ok = m_rtx.processGpuNV12ToNV12(decframe->data[0], decframe->linesize[0],
+                                            decframe->data[1], decframe->linesize[1],
+                                            enc_hw, m_bt2020);
+        }
+        if (!ok) return false;
         outFrame = enc_hw;
         return true;
     }
@@ -44,6 +51,7 @@ private:
     RTXProcessor &m_rtx;
     CudaFramePool &m_pool;
     bool m_bt2020 = false;
+    bool m_thdrEnabled = false;
 };
 
 class CpuProcessor : public IProcessor {
@@ -61,16 +69,8 @@ public:
         if (av_frame_get_buffer(m_bgra.get(), 32) < 0)
             throw std::runtime_error("CpuProcessor: alloc BGRA failed");
 
-        // Allocate P010 buffer
-        m_p010.reset(av_frame_alloc());
-        m_p010->format = AV_PIX_FMT_P010LE;
-        m_p010->width = m_dstW;
-        m_p010->height = m_dstH;
-        if (av_frame_get_buffer(m_p010.get(), 32) < 0)
-            throw std::runtime_error("CpuProcessor: alloc P010 failed");
-
-        // Defer building m_sws_to_p010 until setConfig() (needs THDR on/off)
-        m_sws_to_p010 = nullptr;
+        // Defer building output and sws until setConfig() (needs THDR on/off)
+        m_sws_to_yuv = nullptr;
     }
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override {
@@ -102,53 +102,64 @@ public:
         if (!m_rtx.process(m_bgra->data[0], (size_t)m_bgra->linesize[0], rtx_data, rtxW, rtxH, rtxPitch)) return false;
         if (rtxW != (uint32_t)m_dstW || rtxH != (uint32_t)m_dstH) return false;
 
-        // Build m_sws_to_p010 if needed based on THDR config
-        if (!m_sws_to_p010) {
+        // Build m_sws_to_yuv if needed based on THDR config and output format
+        if (!m_sws_to_yuv) {
             AVPixelFormat srcPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_BGRA;
-            m_sws_to_p010 = sws_getContext(
+            AVPixelFormat dstPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+            m_sws_to_yuv = sws_getContext(
                 m_dstW, m_dstH, srcPix,
-                m_dstW, m_dstH, AV_PIX_FMT_P010LE,
+                m_dstW, m_dstH, dstPix,
                 SWS_BILINEAR, nullptr, nullptr, nullptr);
-            if (!m_sws_to_p010) return false;
+            if (!m_sws_to_yuv) return false;
             const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                      : sws_getCoefficients(SWS_CS_ITU709);
-            sws_setColorspaceDetails(m_sws_to_p010,
-                                     coeffs, 1,
-                                     coeffs, 0,
+            sws_setColorspaceDetails(m_sws_to_yuv,
+                                     coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
+                                     coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
                                      0, 1 << 16, 1 << 16);
         }
 
-        // Convert RTX output to P010
-        if (av_frame_make_writable(m_p010.get()) < 0) return false;
+        // Ensure output buffer is allocated and writable
+        if (!m_out) return false;
+        if (av_frame_make_writable(m_out.get()) < 0) return false;
         const uint8_t *in_planes[1] = {rtx_data};
         int in_lines[1] = {static_cast<int>(rtxPitch)};
-        sws_scale(m_sws_to_p010, in_planes, in_lines, 0, m_dstH, m_p010->data, m_p010->linesize);
+        sws_scale(m_sws_to_yuv, in_planes, in_lines, 0, m_dstH, m_out->data, m_out->linesize);
 
-        outFrame = m_p010.get();
+        outFrame = m_out.get();
         return true;
     }
 
     void setConfig(const RTXProcessConfig &cfg) {
         m_rtx_cfg = cfg;
-        // Rebuild sws_to_p010 to match THDR on/off
-        if (m_sws_to_p010) { sws_freeContext(m_sws_to_p010); m_sws_to_p010 = nullptr; }
+        // Rebuild output frame and sws to match THDR on/off
+        if (m_sws_to_yuv) { sws_freeContext(m_sws_to_yuv); m_sws_to_yuv = nullptr; }
+        // Allocate output frame in requested format
+        m_out.reset(av_frame_alloc());
+        if (!m_out) throw std::runtime_error("CpuProcessor: alloc out frame failed");
+        m_out->format = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+        m_out->width = m_dstW;
+        m_out->height = m_dstH;
+        if (av_frame_get_buffer(m_out.get(), 32) < 0) throw std::runtime_error("CpuProcessor: alloc out buffer failed");
+
         AVPixelFormat srcPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_BGRA;
-        m_sws_to_p010 = sws_getContext(
+        AVPixelFormat dstPix = m_rtx_cfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+        m_sws_to_yuv = sws_getContext(
             m_dstW, m_dstH, srcPix,
-            m_dstW, m_dstH, AV_PIX_FMT_P010LE,
+            m_dstW, m_dstH, dstPix,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!m_sws_to_p010) throw std::runtime_error("CpuProcessor: sws_to_p010 alloc failed in setConfig");
+        if (!m_sws_to_yuv) throw std::runtime_error("CpuProcessor: sws_to_yuv alloc failed in setConfig");
         const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                  : sws_getCoefficients(SWS_CS_ITU709);
-        sws_setColorspaceDetails(m_sws_to_p010,
-                                 coeffs, 1,
-                                 coeffs, 0,
+        sws_setColorspaceDetails(m_sws_to_yuv,
+                                 coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
+                                 coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
                                  0, 1 << 16, 1 << 16);
     }
 
     void shutdown() override {
         if (m_sws_to_argb) { sws_freeContext(m_sws_to_argb); m_sws_to_argb = nullptr; }
-        if (m_sws_to_p010) { sws_freeContext(m_sws_to_p010); m_sws_to_p010 = nullptr; }
+        if (m_sws_to_yuv) { sws_freeContext(m_sws_to_yuv); m_sws_to_yuv = nullptr; }
     }
 
 private:
@@ -158,12 +169,12 @@ private:
     int m_dstW = 0, m_dstH = 0;
 
     SwsContext *m_sws_to_argb = nullptr;
-    SwsContext *m_sws_to_p010 = nullptr;
+    SwsContext *m_sws_to_yuv = nullptr; // to P010 (HDR) or NV12 (SDR)
     int m_last_src_format = AV_PIX_FMT_NONE;
     int m_last_src_w = 0, m_last_src_h = 0;
 
     FramePtr m_bgra{nullptr, &av_frame_free_single_fp};
-    FramePtr m_p010{nullptr, &av_frame_free_single_fp};
+    FramePtr m_out{nullptr, &av_frame_free_single_fp};
 
     bool m_rtx_initialized = false;
 };

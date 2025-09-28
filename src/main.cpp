@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -9,6 +10,21 @@
 #include <sstream>
 #include <ctime>
 #include <queue>
+#include <filesystem>
+#include <cctype>
+#include <cstring>
+#include <system_error>
+#include <cerrno>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <process.h>
+#else
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 extern "C"
 {
@@ -36,7 +52,6 @@ extern "C"
 #include "processor.h"
 #include "logger.h"
 
-
 // RAII deleters for FFmpeg types that require ** double-pointer frees
 static inline void av_frame_free_single(AVFrame *f)
 {
@@ -47,6 +62,299 @@ static inline void av_packet_free_single(AVPacket *p)
 {
     if (p)
         av_packet_free(&p);
+}
+
+bool endsWith(const std::string &str, const std::string &suffix)
+{
+    if (suffix.size() > str.size())
+        return false;
+    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+#ifdef _WIN32
+static std::string find_ffmpeg_on_path()
+{
+    const char *path_env = std::getenv("PATH");
+    if (!path_env)
+        return {};
+
+    const std::string exe_name = "ffmpeg.exe";
+    std::string path_str(path_env);
+    size_t start = 0;
+    while (start <= path_str.size())
+    {
+        size_t end = path_str.find(';', start);
+        std::string dir = path_str.substr(start, end == std::string::npos ? std::string::npos : end - start);
+
+        dir.erase(std::remove(dir.begin(), dir.end(), '"'), dir.end());
+        auto first = dir.find_first_not_of(" \t");
+        if (first == std::string::npos)
+        {
+            dir.clear();
+        }
+        else
+        {
+            auto last = dir.find_last_not_of(" \t");
+            dir = dir.substr(first, last - first + 1);
+        }
+
+        if (!dir.empty() && dir != "." && dir != ".\\" && dir != "./")
+        {
+            std::filesystem::path candidate = std::filesystem::path(dir) / exe_name;
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec) && !std::filesystem::is_directory(candidate, ec))
+            {
+                return candidate.string();
+            }
+        }
+
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+
+    return {};
+}
+
+static std::string quote_windows_arg(const std::string &arg)
+{
+    if (arg.empty())
+        return "\"\"";
+
+    bool needs_quotes = arg.find_first_of(" \t\"") != std::string::npos;
+    if (!needs_quotes)
+        return arg;
+
+    std::string result;
+    result.reserve(arg.size() + 2);
+    result.push_back('"');
+
+    size_t backslash_count = 0;
+    for (char ch : arg)
+    {
+        if (ch == '\\')
+        {
+            ++backslash_count;
+        }
+        else if (ch == '"')
+        {
+            result.append(backslash_count * 2 + 1, '\\');
+            result.push_back('"');
+            backslash_count = 0;
+        }
+        else
+        {
+            if (backslash_count > 0)
+            {
+                result.append(backslash_count, '\\');
+                backslash_count = 0;
+            }
+            result.push_back(ch);
+        }
+    }
+
+    if (backslash_count > 0)
+    {
+        result.append(backslash_count * 2, '\\');
+    }
+
+    result.push_back('"');
+    return result;
+}
+
+static std::string format_windows_error(DWORD error_code)
+{
+    if (error_code == 0)
+        return "";
+
+    LPSTR buffer = nullptr;
+    DWORD size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error_code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&buffer),
+        0,
+        nullptr);
+
+    std::string message;
+    if (size != 0 && buffer)
+    {
+        message.assign(buffer, size);
+        while (!message.empty() && (message.back() == '\r' || message.back() == '\n'))
+            message.pop_back();
+    }
+    else
+    {
+        message = "Unknown error";
+    }
+
+    if (buffer)
+        LocalFree(buffer);
+
+    return message;
+}
+#endif
+
+static bool passthrough_required(int argc, char **argv)
+{
+    if (argc <= 0)
+        return false;
+
+    bool binary_is_ffmpeg = endsWith(argv[0], "ffmpeg") || endsWith(argv[0], "ffmpeg.exe");
+
+    if (!binary_is_ffmpeg)
+        return false;
+
+    bool input_looks_supported = (argc > 1) && (endsWith(argv[1], ".mp4") || endsWith(argv[1], ".mkv"));
+    bool output_looks_supported = (argc > 2) && (endsWith(argv[2], ".mp4") || endsWith(argv[2], ".mkv") || endsWith(argv[2], ".m3u8"));
+
+    bool requests_hls_muxer = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!requests_hls_muxer && std::strcmp(argv[i], "-f") == 0 && i + 1 < argc && std::strcmp(argv[i + 1], "hls") == 0)
+        {
+            requests_hls_muxer = true;
+            break;
+        }
+    }
+
+    // Passthrough is  needed if either input and output are not supported, and if hls is not requested
+    return !input_looks_supported && !output_looks_supported && !requests_hls_muxer;
+}
+
+static int run_ffmpeg_passthrough(int argc, char **argv)
+{
+    fprintf(stderr, "Running ffmpeg passthrough\n");
+    std::string ffmpeg_binary;
+#ifdef _WIN32
+    bool use_absolute_ffmpeg = false;
+    if (auto resolved = find_ffmpeg_on_path(); !resolved.empty())
+    {
+        ffmpeg_binary = std::move(resolved);
+        use_absolute_ffmpeg = true;
+    }
+    else
+    {
+        ffmpeg_binary = "ffmpeg";
+    }
+#else
+    ffmpeg_binary = "ffmpeg";
+#endif
+
+    std::vector<std::string> forwarded_args_storage;
+    forwarded_args_storage.reserve(static_cast<size_t>(argc));
+    forwarded_args_storage.emplace_back(ffmpeg_binary);
+    for (int i = 1; i < argc; ++i)
+    {
+        forwarded_args_storage.emplace_back(argv[i] ? argv[i] : "");
+    }
+
+#ifdef _WIN32
+    std::string command_line;
+    command_line.reserve(256);
+    for (size_t i = 0; i < forwarded_args_storage.size(); ++i)
+    {
+        if (i > 0)
+            command_line.push_back(' ');
+        command_line.append(quote_windows_arg(forwarded_args_storage[i]));
+    }
+
+    std::vector<char> command_line_buffer(command_line.begin(), command_line.end());
+    command_line_buffer.push_back('\0');
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+
+    const char *application_name = use_absolute_ffmpeg ? forwarded_args_storage[0].c_str() : nullptr;
+
+    BOOL success = CreateProcessA(
+        application_name,
+        command_line_buffer.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+
+    if (!success)
+    {
+        DWORD err = GetLastError();
+        std::string err_msg = format_windows_error(err);
+        fprintf(stderr, "Failed to launch ffmpeg passthrough binary '%s': %s (0x%08lX)\n",
+                forwarded_args_storage[0].c_str(), err_msg.c_str(), static_cast<unsigned long>(err));
+        return err ? static_cast<int>(err) : 1;
+    }
+
+    DWORD wait_result = WaitForSingleObject(pi.hProcess, INFINITE);
+    if (wait_result == WAIT_FAILED)
+    {
+        DWORD err = GetLastError();
+        std::string err_msg = format_windows_error(err);
+        fprintf(stderr, "Failed waiting for ffmpeg passthrough process: %s (0x%08lX)\n",
+                err_msg.c_str(), static_cast<unsigned long>(err));
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return err ? static_cast<int>(err) : 1;
+    }
+
+    DWORD exit_code = 0;
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code))
+    {
+        DWORD err = GetLastError();
+        std::string err_msg = format_windows_error(err);
+        fprintf(stderr, "Failed to retrieve ffmpeg passthrough exit code: %s (0x%08lX)\n",
+                err_msg.c_str(), static_cast<unsigned long>(err));
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return err ? static_cast<int>(err) : 1;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    return static_cast<int>(exit_code);
+#else
+    std::vector<char *> passthrough_argv;
+    passthrough_argv.reserve(forwarded_args_storage.size() + 1);
+    for (auto &stored : forwarded_args_storage)
+    {
+        passthrough_argv.push_back(const_cast<char *>(stored.c_str()));
+    }
+    passthrough_argv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        fprintf(stderr, "Failed to fork for ffmpeg passthrough: %s\n", std::strerror(errno));
+        return errno ? errno : 1;
+    }
+    if (pid == 0)
+    {
+        execvp(ffmpeg_binary.c_str(), passthrough_argv.data());
+        fprintf(stderr, "Failed to exec ffmpeg passthrough binary '%s': %s\n", ffmpeg_binary.c_str(), std::strerror(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        fprintf(stderr, "Failed to wait for ffmpeg passthrough process: %s\n", std::strerror(errno));
+        return errno ? errno : 1;
+    }
+
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+#endif
 }
 
 using FramePtr = std::unique_ptr<AVFrame, void (*)(AVFrame *)>;
@@ -128,6 +436,7 @@ struct PipelineConfig
 {
     bool verbose = false;
     bool cpuOnly = false;
+    bool ffCompatible = false;
 
     char *inputPath = nullptr;
     char *outputPath = nullptr;
@@ -144,13 +453,338 @@ struct PipelineConfig
     int targetBitrateMultiplier;
 
     RTXProcessConfig rtxCfg;
+
+    std::string inputFormatName;
+    std::string outputFormatName;
+    std::string fflags;
+
+    bool overwrite = true;
+
+    // HLS options
+    int maxDelay = -1;
+    int hlsTime = -1;
+    std::string hlsSegmentType;
+    std::string hlsInitFilename;
+    int64_t hlsStartNumber = -1;
+    std::string hlsSegmentFilename;
+    std::string hlsPlaylistType;
+    int hlsListSize = -1;
 };
 
-// FFmpeg setup helpers moved to ffmpeg_utils.cpp
+static char *extract_ffmpeg_file_path(char *value)
+{
+    if (!value)
+        return value;
+
+    if (std::strncmp(value, "file:", 5) == 0)
+        value += 5;
+
+    size_t len = std::strlen(value);
+    if (len >= 2)
+    {
+        char first = value[0];
+        char last = value[len - 1];
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\''))
+        {
+            value[len - 1] = '\0';
+            ++value;
+        }
+    }
+
+    return value;
+}
+
+static std::string lowercase_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+                   { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+// Configures the output context for HLS muxing
+static void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
+{
+
+    HlsMuxOptions hlsOpts;
+
+    const bool format_requests_hls = !cfg->outputFormatName.empty() && lowercase_copy(cfg->outputFormatName) == "hls";
+    
+    if (cfg->outputPath && *cfg->outputPath)
+    {
+        std::filesystem::path playlistPath(cfg->outputPath);
+        const std::string extLower = lowercase_copy(playlistPath.extension().string());
+        
+        if (format_requests_hls && (extLower != ".m3u8" && extLower != ".m3u"))
+        {
+            // If the format requests HLS but the output path doesn't have a .m3u8 or .m3u extension, throw an error
+            throw std::runtime_error("Output path must have .m3u8 or .m3u extension when HLS is requested");
+        }
+        else if (!format_requests_hls && (extLower != ".m3u8" && extLower != ".m3u"))
+        {
+            // If the format doesn't request HLS and the output path doesn't have a .m3u8 or .m3u extension, return
+            return;
+        }
+    }
+
+    // Output format is HLS
+    if (cfg->outputFormatName.empty())
+        cfg->outputFormatName = "hls";
+
+    hlsOpts.enabled = true;
+    hlsOpts.overwrite = cfg->overwrite;
+
+    // Create the output directory if it doesn't exist
+    std::filesystem::path playlistPath(cfg->outputPath);
+    std::filesystem::path playlistDir = playlistPath.parent_path();
+    if (!playlistDir.empty())
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(playlistDir, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to create HLS output directory: " + playlistDir.string() + " (" + ec.message() + ")");
+        }
+    }
+    std::string playlistStem = playlistPath.stem().string();
+
+    // Set the segment type to fmp4 if it's not set
+    std::string segmentTypeLower = lowercase_copy(cfg->hlsSegmentType);
+    if (segmentTypeLower.empty())
+    {
+        cfg->hlsSegmentType = "fmp4";
+        segmentTypeLower = "fmp4";
+    }
+    bool useFmp4 = (segmentTypeLower == "fmp4");
+    if (!useFmp4 && segmentTypeLower != "mpegts")
+    {
+        cfg->hlsSegmentType = "mpegts";
+        segmentTypeLower = "mpegts";
+        useFmp4 = false;
+    }
+    hlsOpts.segmentType = segmentTypeLower;
+
+    if (!cfg->hlsSegmentFilename.empty())
+    {
+        hlsOpts.segmentFilename = cfg->hlsSegmentFilename;
+    }
+    else
+    {
+        // Use .mp4 extension for fMP4 segments for better browser compatibility
+        const std::string segmentExt = useFmp4 ? ".mp4" : ".ts";
+        const std::string pattern = playlistStem.empty() ? (std::string("segment_%05d") + segmentExt)
+                                                         : (playlistStem + "_%05d" + segmentExt);
+        std::filesystem::path segPath = playlistDir.empty() ? std::filesystem::path(pattern) : (playlistDir / pattern);
+        hlsOpts.segmentFilename = segPath.string();
+    }
+
+    if (useFmp4 && !cfg->hlsInitFilename.empty())
+    {
+        hlsOpts.initFilename = cfg->hlsInitFilename;
+    }
+    else if (useFmp4)
+    {
+        const std::string initName = playlistStem.empty() ? "init.mp4" : (playlistStem + "_init.mp4");
+        std::filesystem::path initPath = playlistDir.empty() ? std::filesystem::path(initName) : (playlistDir / initName);
+        hlsOpts.initFilename = initPath.string();
+    }
+
+    if (cfg->hlsTime <= 0)
+        hlsOpts.hlsTime = 4;
+    else
+        hlsOpts.hlsTime = cfg->hlsTime;
+
+    if (cfg->hlsListSize < 0)
+        hlsOpts.listSize = 0;
+    else
+        hlsOpts.listSize = cfg->hlsListSize;
+
+    if (cfg->hlsStartNumber < 0)
+        hlsOpts.startNumber = 0;
+    else
+        hlsOpts.startNumber = cfg->hlsStartNumber;
+
+    if (cfg->maxDelay >= 0)
+        hlsOpts.maxDelay = cfg->maxDelay;
+
+    if (cfg->hlsPlaylistType.empty())
+        hlsOpts.playlistType = "";
+    else
+        hlsOpts.playlistType = cfg->hlsPlaylistType;
+
+    // Set the HLS options
+    out->hlsOptions = hlsOpts;
+}
+
+static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
+{
+    // Enable verbose logging
+    cfg->verbose = true;
+
+    // Compatibility mode for ffmpeg, no positional arguments
+    if (!cfg)
+        return;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+
+        if (arg == "-fflags")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-fflags requires an argument\n");
+                exit(1);
+            }
+            cfg->fflags = argv[++i];
+        }
+        else if (arg == "-y")
+        {
+            cfg->overwrite = true;
+        }
+        else if (arg == "-f")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-f requires an argument\n");
+                exit(1);
+            }
+            if (cfg->inputFormatName.empty())
+            {
+                cfg->inputFormatName = argv[++i];
+            }
+            else
+            {
+                cfg->outputFormatName = argv[++i];
+            }
+        }
+        else if (arg == "-i")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-i requires an input path\n");
+                exit(1);
+            }
+            cfg->inputPath = extract_ffmpeg_file_path(argv[++i]);
+        }
+        else if (arg == "-max_delay")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-max_delay requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->maxDelay = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -max_delay: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_time")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_time requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->hlsTime = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -hls_time: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_segment_type")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_segment_type requires a value\n");
+                exit(1);
+            }
+            cfg->hlsSegmentType = extract_ffmpeg_file_path(argv[++i]);
+        }
+        else if (arg == "-hls_fmp4_init_filename")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_fmp4_init_filename requires a value\n");
+                exit(1);
+            }
+            cfg->hlsInitFilename = extract_ffmpeg_file_path(argv[++i]);
+        }
+        else if (arg == "-start_number")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-start_number requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->hlsStartNumber = std::stoll(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -start_number: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_segment_filename")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_segment_filename requires a value\n");
+                exit(1);
+            }
+            cfg->hlsSegmentFilename = extract_ffmpeg_file_path(argv[++i]);
+        }
+        else if (arg == "-hls_playlist_type")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_playlist_type requires a value\n");
+                exit(1);
+            }
+            cfg->hlsPlaylistType = argv[++i];
+        }
+        else if (arg == "-hls_list_size")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_list_size requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->hlsListSize = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -hls_list_size: %s\n", value);
+                exit(1);
+            }
+        }
+        if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv"))
+        {
+            cfg->outputPath = argv[i];
+            fprintf(stderr, "DEBUG: Set outputPath = '%s'\n", cfg->outputPath);
+        }
+    }
+}
 
 static void print_help(const char *argv0)
 {
-    fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv} [options]\n", argv0);
+    fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv|m3u8} [options]\n", argv0);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
@@ -171,6 +805,14 @@ static void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 5\n");
+    fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
+    fprintf(stderr, "  -hls_time <seconds>            Set target segment duration (default 4)\n");
+    fprintf(stderr, "  -hls_segment_type <mpegts|fmp4> Select segment container (default fmp4)\n");
+    fprintf(stderr, "  -hls_segment_filename <pattern> Segment naming pattern (auto-generated)\n");
+    fprintf(stderr, "  -hls_fmp4_init_filename <file>  Initialization segment path for fMP4\n");
+    fprintf(stderr, "  -start_number <n>               Starting segment number (default 0)\n");
+    fprintf(stderr, "  -hls_playlist_type <type>       Playlist type (event, vod, live)\n");
+    fprintf(stderr, "  -hls_list_size <count>          Playlist size (0 = keep all segments)\n");
 }
 
 static void init_setup(int argc, char **argv, PipelineConfig *cfg)
@@ -203,10 +845,21 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     cfg->qp = 21;
     cfg->targetBitrateMultiplier = 5;
 
-    cfg->inputPath = argv[1];
-    cfg->outputPath = argv[2];
+    int i = 1;
+    // if input path does not end with mp4 or mkv, use alternate arg method
+    if (std::string(argv[i]).find(".mp4") == std::string::npos && std::string(argv[i]).find(".mkv") == std::string::npos && argc > 5)
+    {
+        cfg->ffCompatible = true; // obfuscate as ffmpeg, with compatible args to vanilla ffmpeg
+        compatibility_mode(argc, argv, cfg);
+        return;
+    }
+    else
+    {
+        cfg->inputPath = argv[i++];
+        cfg->outputPath = argv[i++];
+    }
 
-    for (int i = 3; i < argc; ++i)
+    for (; i < argc; ++i)
     {
         std::string arg = argv[i];
         if (arg == "--verbose" || arg == "-v")
@@ -217,6 +870,148 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
         {
             print_help(argv[0]);
             exit(0);
+        }
+
+        // HLS / output format options
+        else if (arg == "-hls_time")
+        {
+            if (i + 1 < argc)
+            {
+                const char *value = argv[++i];
+                try
+                {
+                    cfg->hlsTime = std::stoi(value);
+                }
+                catch (...)
+                {
+                    fprintf(stderr, "Invalid value for -hls_time: %s\n", value);
+                    exit(1);
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_time\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_segment_type")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsSegmentType = extract_ffmpeg_file_path(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_segment_type\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_fmp4_init_filename")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsInitFilename = extract_ffmpeg_file_path(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_fmp4_init_filename\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-start_number")
+        {
+            if (i + 1 < argc)
+            {
+                const char *value = argv[++i];
+                try
+                {
+                    cfg->hlsStartNumber = std::stoll(value);
+                }
+                catch (...)
+                {
+                    fprintf(stderr, "Invalid value for -start_number: %s\n", value);
+                    exit(1);
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -start_number\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_segment_filename")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsSegmentFilename = extract_ffmpeg_file_path(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_segment_filename\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_playlist_type")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsPlaylistType = argv[++i];
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_playlist_type\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_list_size")
+        {
+            if (i + 1 < argc)
+            {
+                const char *value = argv[++i];
+                try
+                {
+                    cfg->hlsListSize = std::stoi(value);
+                }
+                catch (...)
+                {
+                    fprintf(stderr, "Invalid value for -hls_list_size: %s\n", value);
+                    exit(1);
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_list_size\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-max_delay")
+        {
+            if (i + 1 < argc)
+            {
+                const char *value = argv[++i];
+                try
+                {
+                    cfg->maxDelay = std::stoi(value);
+                }
+                catch (...)
+                {
+                    fprintf(stderr, "Invalid value for -max_delay: %s\n", value);
+                    exit(1);
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -max_delay\n");
+                print_help(argv[0]);
+                exit(1);
+            }
         }
 
         // VSR
@@ -363,7 +1158,6 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
             }
         }
 
-
         else
         {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -389,8 +1183,15 @@ int run_pipeline(PipelineConfig cfg)
 
     try
     {
-        open_input(cfg.inputPath, in);
+        InputOpenOptions inputOpts;
+        inputOpts.fflags = cfg.fflags;
+        open_input(cfg.inputPath, in, &inputOpts);
+
+        finalize_hls_options(&cfg, &out);
         open_output(cfg.outputPath, in, out);
+
+        const bool hls_enabled = out.hlsOptions.enabled;
+        const bool hls_segments_are_fmp4 = hls_enabled && lowercase_copy(out.hlsOptions.segmentType) == "fmp4";
 
         // Read input bitrate and fps
         AVRational fr = in.vst->avg_frame_rate.num ? in.vst->avg_frame_rate : in.vst->r_frame_rate;
@@ -436,10 +1237,12 @@ int run_pipeline(PipelineConfig cfg)
         // A2R10G10B10 -> P010 for NVENC
         // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
         // Auto-disable VSR for inputs >= 1920x1080 in either orientation
-        if (cfg.rtxCfg.enableVSR) {
-            bool ge1080p = (in.vdec->width >= 1920 && in.vdec->height >= 1080) ||
-                           (in.vdec->width >= 1080 && in.vdec->height >= 1920);
-            if (ge1080p) {
+        if (cfg.rtxCfg.enableVSR)
+        {
+            bool ge1080p = (in.vdec->width > 1920 && in.vdec->height > 1080) ||
+                           (in.vdec->width > 1080 && in.vdec->height > 1920);
+            if (ge1080p)
+            {
                 LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
                 cfg.rtxCfg.enableVSR = false;
             }
@@ -457,6 +1260,10 @@ int run_pipeline(PipelineConfig cfg)
                                      : "";
         bool mux_is_isobmff = muxer_name.find("mp4") != std::string::npos ||
                               muxer_name.find("mov") != std::string::npos;
+        if (hls_segments_are_fmp4)
+        {
+            mux_is_isobmff = true;
+        }
         LOG_VERBOSE("Output container: %s",
                     muxer_name.empty() ? "unknown" : muxer_name.c_str());
 
@@ -474,23 +1281,27 @@ int run_pipeline(PipelineConfig cfg)
         }
         else
         {
-            out.venc->pix_fmt = AV_PIX_FMT_P010LE; // CPU fallback
+            // CPU fallback: choose NV12 for SDR, P010 for HDR
+            out.venc->pix_fmt = cfg.rtxCfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         }
         out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
         out.venc->max_b_frames = 2;
         out.venc->color_range = AVCOL_RANGE_MPEG;
-        if (cfg.rtxCfg.enableTHDR) {
+        if (cfg.rtxCfg.enableTHDR)
+        {
             out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
             out.venc->color_primaries = AVCOL_PRI_BT2020;
             out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
-        } else {
+        }
+        else
+        {
             out.venc->color_trc = AVCOL_TRC_BT709;
             out.venc->color_primaries = AVCOL_PRI_BT709;
             out.venc->colorspace = AVCOL_SPC_BT709;
         }
 
         // Ensure muxers that require extradata (e.g., Matroska) receive global headers
-        if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff)
+        if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff || hls_enabled)
         {
             out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         }
@@ -504,7 +1315,12 @@ int run_pipeline(PipelineConfig cfg)
         // Switch to constant QP rate control
         av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
         av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
-        av_opt_set(out.venc->priv_data, "profile", "main10", 0);
+        // Set HEVC profile based on THDR: use Main10 for HDR, Main for SDR
+        if (cfg.rtxCfg.enableTHDR) {
+            av_opt_set(out.venc->priv_data, "profile", "main10", 0);
+        } else {
+            av_opt_set(out.venc->priv_data, "profile", "main", 0);
+        }
 
         // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
         AVBufferRef *enc_hw_frames = nullptr;
@@ -515,7 +1331,8 @@ int run_pipeline(PipelineConfig cfg)
                 throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
             AVHWFramesContext *fctx = (AVHWFramesContext *)enc_hw_frames->data;
             fctx->format = AV_PIX_FMT_CUDA;
-            fctx->sw_format = AV_PIX_FMT_P010LE;
+            // Choose NV12 for SDR (THDR disabled), P010 for HDR
+            fctx->sw_format = cfg.rtxCfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
             fctx->width = dstW;
             fctx->height = dstH;
             fctx->initial_pool_size = 64;
@@ -553,17 +1370,21 @@ int run_pipeline(PipelineConfig cfg)
                 out.vstream->codecpar->codec_tag = 0;
             }
             out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            if (cfg.rtxCfg.enableTHDR) {
+            if (cfg.rtxCfg.enableTHDR)
+            {
                 out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
                 out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
                 out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
-            } else {
+            }
+            else
+            {
                 out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
                 out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
                 out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
             }
         }
-        if (cfg.rtxCfg.enableTHDR) {
+        if (cfg.rtxCfg.enableTHDR)
+        {
             add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
         }
 
@@ -586,14 +1407,16 @@ int run_pipeline(PipelineConfig cfg)
         out.vstream->avg_frame_rate = fr;
         // Write header with MOV/MP4 muxer flags for broad compatibility
         // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
-        AVDictionary *muxopts = nullptr;
+        AVDictionary *muxopts = out.muxOptions;
         // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
-        if (mux_is_isobmff)
+        if (!hls_enabled && mux_is_isobmff)
         {
             av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
         }
         ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
-        av_dict_free(&muxopts);
+        if (muxopts)
+            av_dict_free(&muxopts);
+        out.muxOptions = nullptr;
 
         // Frame buffers
         FramePtr frame(av_frame_alloc(), &av_frame_free_single);
@@ -705,7 +1528,8 @@ int run_pipeline(PipelineConfig cfg)
             if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height))
             {
                 std::string detail = rtx.lastError();
-                if (detail.empty()) detail = "unknown error";
+                if (detail.empty())
+                    detail = "unknown error";
                 throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
             }
             rtx_init = true;
@@ -715,7 +1539,8 @@ int run_pipeline(PipelineConfig cfg)
             if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height))
             {
                 std::string detail = rtx.lastError();
-                if (detail.empty()) detail = "unknown error";
+                if (detail.empty())
+                    detail = "unknown error";
                 throw std::runtime_error(std::string("Failed to initialize RTX CPU path: ") + detail);
             }
             rtx_init = true;
@@ -725,7 +1550,7 @@ int run_pipeline(PipelineConfig cfg)
         std::unique_ptr<IProcessor> processor;
         if (use_cuda_path)
         {
-            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace);
+            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, cfg.rtxCfg.enableTHDR);
         }
         else
         {
@@ -735,12 +1560,18 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         // Read packets
+        fprintf(stderr, "DEBUG: Starting frame processing loop...\n");
+        int packet_count = 0;
         while (true)
         {
             int ret = av_read_frame(in.fmt, pkt.get());
             if (ret == AVERROR_EOF)
+            {
+                fprintf(stderr, "DEBUG: Reached end of file after %d packets\n", packet_count);
                 break;
+            }
             ff_check(ret, "read frame");
+            packet_count++;
 
             // Skip non-video packets
             if (pkt->stream_index == in.vstream)
@@ -822,6 +1653,7 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         // Flush encoder
+        fprintf(stderr, "DEBUG: Finished processing all frames, flushing encoder...\n");
         ff_check(avcodec_send_frame(out.venc, nullptr), "send flush");
         while (true)
         {
@@ -835,7 +1667,9 @@ int run_pipeline(PipelineConfig cfg)
             av_packet_unref(opkt.get());
         }
 
+        fprintf(stderr, "DEBUG: Writing format trailer...\n");
         ff_check(av_write_trailer(out.fmt), "write trailer");
+        fprintf(stderr, "DEBUG: Format trailer written successfully - HLS playlist should be generated now\n");
 
         // Print final progress
         if (total_frames > 0)
@@ -882,6 +1716,11 @@ int run_pipeline(PipelineConfig cfg)
 
 int main(int argc, char **argv)
 {
+
+    if (passthrough_required(argc, argv))
+    {
+        return run_ffmpeg_passthrough(argc, argv);
+    }
 
     PipelineConfig cfg;
 

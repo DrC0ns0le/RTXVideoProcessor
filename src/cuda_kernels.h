@@ -34,3 +34,14 @@ void launch_bgra8_to_p010(const uint8_t *inBGRA, int inPitch,
                           int w, int h,
                           bool bt2020,
                           cudaStream_t stream);
+
+// Launch BGRA8 (8-bit per channel) -> NV12 (8-bit 4:2:0) conversion on device.
+// inBGRA: device pointer with pitch inPitch, size w x h.
+// outY/outUV: device pointers for NV12 planes with pitches pitchY/pitchUV.
+// If bt2020 is true, use BT.2020 RGB->YUV matrix; otherwise BT.709. Range mapping: full RGB -> limited YUV.
+void launch_bgra8_to_nv12(const uint8_t *inBGRA, int inPitch,
+                          uint8_t *outY, int pitchY,
+                          uint8_t *outUV, int pitchUV,
+                          int w, int h,
+                          bool bt2020,
+                          cudaStream_t stream);

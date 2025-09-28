@@ -12,7 +12,7 @@ extern "C" {
 static AVPixelFormat get_cuda_hw_format(AVCodecContext *, const AVPixelFormat *pix_fmts);
 static AVPixelFormat get_cuda_sw_format(AVCodecContext *ctx, const AVPixelFormat *pix_fmts);
 
-bool open_input(const char *inPath, InputContext &in)
+bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *options)
 {
     if (!inPath)
         throw std::invalid_argument("open_input: null path");
@@ -20,7 +20,16 @@ bool open_input(const char *inPath, InputContext &in)
     if (in.fmt)
         close_input(in);
 
-    ff_check(avformat_open_input(&in.fmt, inPath, nullptr, nullptr), "open input");
+    AVDictionary *openOpts = nullptr;
+    if (options && !options->fflags.empty())
+    {
+        av_dict_set(&openOpts, "fflags", options->fflags.c_str(), 0);
+    }
+
+    int err = avformat_open_input(&in.fmt, inPath, nullptr, &openOpts);
+    if (openOpts)
+        av_dict_free(&openOpts);
+    ff_check(err, "open input");
     ff_check(avformat_find_stream_info(in.fmt, nullptr), "find stream info");
 
     int vstream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -43,7 +52,7 @@ bool open_input(const char *inPath, InputContext &in)
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
     // Try to enable CUDA hardware decoding
-    int err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+    err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
     if (err >= 0 && in.hw_device_ctx)
     {
         in.vdec->hw_device_ctx = av_buffer_ref(in.hw_device_ctx);
@@ -104,9 +113,102 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     if (out.fmt)
         close_output(out);
 
-    ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, nullptr, outPath), "alloc output context");
+
+    const char *effectiveFormat = nullptr;
+    if (out.hlsOptions.enabled)
+    {
+        effectiveFormat = "hls";
+    }
+
+    ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, effectiveFormat, outPath), "alloc output context");
     if (!out.fmt)
         throw std::runtime_error("Failed to allocate output format context");
+    
+    fprintf(stderr, "DEBUG: Output format context allocated successfully, muxer='%s'\n", 
+            out.fmt->oformat ? out.fmt->oformat->name : "unknown");
+
+    if (out.hlsOptions.enabled)
+    {
+        fprintf(stderr, "DEBUG: HLS muxer enabled, setting up options\n");
+        AVDictionary *muxOpts = nullptr;
+        if (out.hlsOptions.hlsTime > 0)
+        {
+            std::string value = std::to_string(out.hlsOptions.hlsTime);
+            av_dict_set(&muxOpts, "hls_time", value.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_time = %s\n", value.c_str());
+        }
+        if (!out.hlsOptions.segmentFilename.empty())
+        {
+            av_dict_set(&muxOpts, "hls_segment_filename", out.hlsOptions.segmentFilename.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_segment_filename = %s\n", out.hlsOptions.segmentFilename.c_str());
+        }
+        if (!out.hlsOptions.segmentType.empty())
+        {
+            av_dict_set(&muxOpts, "hls_segment_type", out.hlsOptions.segmentType.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_segment_type = %s\n", out.hlsOptions.segmentType.c_str());
+        }
+        if (!out.hlsOptions.initFilename.empty())
+        {
+            av_dict_set(&muxOpts, "hls_fmp4_init_filename", out.hlsOptions.initFilename.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_fmp4_init_filename = %s\n", out.hlsOptions.initFilename.c_str());
+        }
+        if (out.hlsOptions.startNumber >= 0)
+        {
+            std::string value = std::to_string(out.hlsOptions.startNumber);
+            av_dict_set(&muxOpts, "start_number", value.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set start_number = %s\n", value.c_str());
+        }
+        if (!out.hlsOptions.playlistType.empty())
+        {
+            av_dict_set(&muxOpts, "hls_playlist_type", out.hlsOptions.playlistType.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_playlist_type = %s\n", out.hlsOptions.playlistType.c_str());
+        }
+        if (out.hlsOptions.listSize >= 0)
+        {
+            std::string value = std::to_string(out.hlsOptions.listSize);
+            av_dict_set(&muxOpts, "hls_list_size", value.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_list_size = %s\n", value.c_str());
+        }
+        if (out.hlsOptions.maxDelay >= 0)
+        {
+            std::string value = std::to_string(out.hlsOptions.maxDelay);
+            av_dict_set(&muxOpts, "max_delay", value.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set max_delay = %s\n", value.c_str());
+        }
+
+        std::string hlsFlags;
+        if (out.hlsOptions.segmentType == "fmp4")
+        {
+            // Enhanced flags for better browser compatibility with fMP4 segments
+            // append_list: Create playlist immediately after header
+            hlsFlags = "+append_list";
+        }
+        else
+        {
+            hlsFlags = "split_by_time+append_list";
+        }
+        if (out.hlsOptions.listSize > 0)
+            hlsFlags += "+delete_segments";
+        if (!hlsFlags.empty())
+        {
+            av_dict_set(&muxOpts, "hls_flags", hlsFlags.c_str(), 0);
+            fprintf(stderr, "DEBUG: Set hls_flags = %s\n", hlsFlags.c_str());
+        }
+
+        // Debug: Print all HLS options that will be passed to the muxer
+        fprintf(stderr, "DEBUG: Final HLS muxer options:\n");
+        AVDictionaryEntry *entry = nullptr;
+        while ((entry = av_dict_get(muxOpts, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+            fprintf(stderr, "DEBUG:   %s = %s\n", entry->key, entry->value);
+        }
+
+        out.muxOptions = muxOpts;
+    }
+    else
+    {
+        out.hlsOptions = HlsMuxOptions{};
+        out.muxOptions = nullptr;
+    }
 
     const AVCodec *encoder = avcodec_find_encoder_by_name("hevc_nvenc");
     if (!encoder)
@@ -138,6 +240,17 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             continue;
 
         AVStream *ist = in.fmt->streams[i];
+        // Drop unsupported subtitle codecs for HLS outputs (only WebVTT is supported).
+        if (out.hlsOptions.enabled && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+            ist->codecpar->codec_id != AV_CODEC_ID_WEBVTT)
+        {
+            const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
+            LOG_WARN("Dropping subtitle stream %u (%s): HLS output requires WebVTT subtitles", i,
+                     codec_name ? codec_name : "unknown");
+            out.map_streams[i] = -1;
+            continue;
+        }
+
         // Ensure the output container supports the codec when stream copying.
         if (!avformat_query_codec(out.fmt->oformat, ist->codecpar->codec_id, FF_COMPLIANCE_NORMAL))
         {
@@ -158,7 +271,16 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     }
 
     if (!(out.fmt->oformat->flags & AVFMT_NOFILE))
-        ff_check(avio_open(&out.fmt->pb, outPath, AVIO_FLAG_WRITE), "open output file");
+    {
+        int avioFlags = AVIO_FLAG_WRITE;
+        AVDictionary *avioOpts = nullptr;
+        if (out.hlsOptions.enabled && out.hlsOptions.overwrite)
+            av_dict_set(&avioOpts, "truncate", "1", 0);
+        int openErr = avio_open2(&out.fmt->pb, outPath, avioFlags, nullptr, &avioOpts);
+        if (avioOpts)
+            av_dict_free(&avioOpts);
+        ff_check(openErr, "open output file");
+    }
 
     return true;
 }

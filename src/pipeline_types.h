@@ -6,7 +6,28 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 }
 
+#include <cstdint>
+#include <string>
 #include <vector>
+
+struct InputOpenOptions
+{
+    std::string fflags;
+};
+
+struct HlsMuxOptions
+{
+    bool enabled = false;
+    bool overwrite = true; // by default, overwrite the output file
+    int maxDelay = -1;
+    int hlsTime = -1;
+    std::string segmentType;
+    std::string initFilename;
+    int64_t startNumber = -1;
+    std::string segmentFilename;
+    std::string playlistType;
+    int listSize = -1;
+};
 
 struct InputContext
 {
@@ -23,4 +44,6 @@ struct OutputContext
     AVStream *vstream = nullptr;
     AVCodecContext *venc = nullptr;
     std::vector<int> map_streams; // input->output map, -1 for unmapped
+    HlsMuxOptions hlsOptions;
+    AVDictionary *muxOptions = nullptr;
 };

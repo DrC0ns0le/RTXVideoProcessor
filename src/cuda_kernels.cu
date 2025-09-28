@@ -188,6 +188,83 @@ void launch_bgra8_to_p010(const uint8_t *inBGRA, int inPitch,
     k_bgra8_to_p010<<<grid, block, 0, stream>>>(inBGRA, inPitch, outY, pitchY, outUV, pitchUV, w, h, bt2020);
 }
 
+// Convert BGRA8 -> NV12 (8-bit limited range)
+__global__ void k_bgra8_to_nv12(const uint8_t *__restrict__ inBGRA, int inPitch,
+                                uint8_t *__restrict__ outY, int pitchY,
+                                uint8_t *__restrict__ outUV, int pitchUV,
+                                int w, int h, bool bt2020)
+{
+    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2; // process 2x2 block
+    int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+    if (x + 1 >= w || y + 1 >= h)
+        return;
+
+    float sumCb = 0.f, sumCr = 0.f;
+    float Ys[2][2];
+    for (int dy = 0; dy < 2; ++dy)
+    {
+        const uint8_t *row = inBGRA + (y + dy) * inPitch;
+        for (int dx = 0; dx < 2; ++dx)
+        {
+            const uint8_t *p = row + (x + dx) * 4;
+            float R = p[0] / 255.0f;
+            float G = p[1] / 255.0f;
+            float B = p[2] / 255.0f;
+
+            float Kr = bt2020 ? 0.2627f : 0.2126f;
+            float Kb = bt2020 ? 0.0593f : 0.0722f;
+            float Kg = 1.0f - Kr - Kb;
+            float Yp = Kr * R + Kg * G + Kb * B;
+            Ys[dy][dx] = Yp;
+            float Cb = 0.5f * (B - Yp) / (1.0f - Kb);
+            float Cr = 0.5f * (R - Yp) / (1.0f - Kr);
+            sumCb += Cb;
+            sumCr += Cr;
+        }
+    }
+
+    float avgCb = sumCb * 0.25f;
+    float avgCr = sumCr * 0.25f;
+
+    auto mapY8 = [](float Y)
+    {
+        float v = 16.0f + Y * 219.0f; // [16..235]
+        int vi = (int)lrintf(v);
+        return (uint8_t)clampi(vi, 16, 235);
+    };
+    auto mapC8 = [](float C)
+    {
+        float v = 128.0f + C * 224.0f; // [16..240]
+        int vi = (int)lrintf(v);
+        return (uint8_t)clampi(vi, 16, 240);
+    };
+
+    uint8_t *yRow0 = outY + y * pitchY;
+    uint8_t *yRow1 = outY + (y + 1) * pitchY;
+    yRow0[x + 0] = mapY8(Ys[0][0]);
+    yRow0[x + 1] = mapY8(Ys[0][1]);
+    yRow1[x + 0] = mapY8(Ys[1][0]);
+    yRow1[x + 1] = mapY8(Ys[1][1]);
+
+    int uvy = y / 2;
+    int ux = x / 2;
+    uint8_t *uvRow = outUV + uvy * pitchUV;
+    uvRow[ux * 2 + 0] = mapC8(avgCb);
+    uvRow[ux * 2 + 1] = mapC8(avgCr);
+}
+
+void launch_bgra8_to_nv12(const uint8_t *inBGRA, int inPitch,
+                          uint8_t *outY, int pitchY,
+                          uint8_t *outUV, int pitchUV,
+                          int w, int h,
+                          bool bt2020,
+                          cudaStream_t stream)
+{
+    dim3 block(16, 16);
+    dim3 grid((w + block.x * 2 - 1) / (block.x * 2), (h + block.y * 2 - 1) / (block.y * 2));
+    k_bgra8_to_nv12<<<grid, block, 0, stream>>>(inBGRA, inPitch, outY, pitchY, outUV, pitchUV, w, h, bt2020);
+}
+
 static __device__ inline void yuv_to_rgb(float Yp, float Uc, float Vc, bool bt2020, float &R, float &G, float &B)
 {
     if (bt2020)
