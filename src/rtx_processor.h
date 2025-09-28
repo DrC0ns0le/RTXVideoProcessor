@@ -65,6 +65,16 @@ public:
                               AVFrame *encP010Frame,
                               bool bt2020);
 
+    // Fully GPU path: consume a P010 frame resident on the device (NVDEC output) and fill a P010 CUDA frame
+    // for HDR input content with full 10-bit pipeline preservation.
+    // d_y, d_uv: device pointers to P010 input planes.
+    // encP010Frame: AVFrame with format AV_PIX_FMT_CUDA and sw_format P010; planes will be written on device.
+    // bt2020: input colorspace flag.
+    bool processGpuP010ToP010(const uint8_t *d_y, int pitchY,
+                              const uint8_t *d_uv, int pitchUV,
+                              AVFrame *encP010Frame,
+                              bool bt2020);
+
     // Fully GPU path producing NV12 (8-bit) into an FFmpeg CUDA frame whose sw_format is NV12.
     // Used for SDR output when THDR is disabled.
     bool processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,

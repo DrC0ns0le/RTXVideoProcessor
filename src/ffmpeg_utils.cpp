@@ -55,6 +55,27 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
     if (err >= 0 && in.hw_device_ctx)
     {
+        // Configure decoder hardware frames context for P010 output if requested
+        if (options && options->preferP010ForHDR)
+        {
+            AVBufferRef *dec_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
+            if (dec_hw_frames)
+            {
+                AVHWFramesContext *dec_fctx = (AVHWFramesContext *)dec_hw_frames->data;
+                dec_fctx->format = AV_PIX_FMT_CUDA;
+                dec_fctx->sw_format = AV_PIX_FMT_P010LE; // Request P010 for HDR content
+                dec_fctx->width = in.vst->codecpar->width;
+                dec_fctx->height = in.vst->codecpar->height;
+                dec_fctx->initial_pool_size = 64;
+
+                if (av_hwframe_ctx_init(dec_hw_frames) >= 0)
+                {
+                    in.vdec->hw_frames_ctx = av_buffer_ref(dec_hw_frames);
+                }
+                av_buffer_unref(&dec_hw_frames);
+            }
+        }
+
         in.vdec->hw_device_ctx = av_buffer_ref(in.hw_device_ctx);
         in.vdec->get_format = get_cuda_hw_format;
     }

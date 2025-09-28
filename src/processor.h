@@ -29,16 +29,33 @@ public:
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override {
         if (!decframe || decframe->format != AV_PIX_FMT_CUDA) return false;
+
+        // Determine the actual pixel format of the CUDA frame
+        AVPixelFormat sw_format = AV_PIX_FMT_NONE;
+        if (decframe->hw_frames_ctx) {
+            AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext *)decframe->hw_frames_ctx->data;
+            sw_format = hw_frames_ctx->sw_format;
+        }
+
         AVFrame *enc_hw = m_pool.acquire();
         bool ok = false;
-        if (m_thdrEnabled) {
-            ok = m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
-                                            decframe->data[1], decframe->linesize[1],
-                                            enc_hw, m_bt2020);
+
+        if (sw_format == AV_PIX_FMT_P010LE) {
+            // HDR content: P010 input -> P010 output (full 10-bit pipeline)
+            ok = m_rtx.processGpuP010ToP010(decframe->data[0], decframe->linesize[0],
+                                           decframe->data[1], decframe->linesize[1],
+                                           enc_hw, m_bt2020);
         } else {
-            ok = m_rtx.processGpuNV12ToNV12(decframe->data[0], decframe->linesize[0],
-                                            decframe->data[1], decframe->linesize[1],
-                                            enc_hw, m_bt2020);
+            // SDR content: NV12 input
+            if (m_thdrEnabled) {
+                ok = m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
+                                                decframe->data[1], decframe->linesize[1],
+                                                enc_hw, m_bt2020);
+            } else {
+                ok = m_rtx.processGpuNV12ToNV12(decframe->data[0], decframe->linesize[0],
+                                                decframe->data[1], decframe->linesize[1],
+                                                enc_hw, m_bt2020);
+            }
         }
         if (!ok) return false;
         outFrame = enc_hw;

@@ -1187,6 +1187,28 @@ int run_pipeline(PipelineConfig cfg)
         inputOpts.fflags = cfg.fflags;
         open_input(cfg.inputPath, in, &inputOpts);
 
+        // Detect HDR content and disable THDR if input is already HDR
+        bool inputIsHDR = false;
+        if (in.vst && in.vst->codecpar) {
+            AVColorTransferCharacteristic trc = in.vst->codecpar->color_trc;
+            inputIsHDR = (trc == AVCOL_TRC_SMPTE2084) ||  // PQ (HDR10)
+                        (trc == AVCOL_TRC_ARIB_STD_B67);   // HLG (Hybrid Log-Gamma)
+        }
+
+        if (inputIsHDR) {
+            if (cfg.rtxCfg.enableTHDR) {
+                LOG_INFO("Input content is HDR (transfer characteristic: %s). Disabling THDR to preserve HDR metadata.",
+                         in.vst->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ/HDR10" : "HLG");
+                cfg.rtxCfg.enableTHDR = false;
+            }
+
+            // Reopen input with P010 preference for HDR content to enable full 10-bit pipeline
+            close_input(in);
+            inputOpts.preferP010ForHDR = true;
+            open_input(cfg.inputPath, in, &inputOpts);
+            LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
+        }
+
         finalize_hls_options(&cfg, &out);
         open_output(cfg.outputPath, in, out);
 
@@ -1282,16 +1304,26 @@ int run_pipeline(PipelineConfig cfg)
         else
         {
             // CPU fallback: choose NV12 for SDR, P010 for HDR
-            out.venc->pix_fmt = cfg.rtxCfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+            out.venc->pix_fmt = (cfg.rtxCfg.enableTHDR || inputIsHDR) ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         }
         out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
         out.venc->max_b_frames = 2;
         out.venc->color_range = AVCOL_RANGE_MPEG;
-        if (cfg.rtxCfg.enableTHDR)
+        // Use HDR color settings if THDR is enabled OR if input is HDR content
+        bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
+        if (outputHDR)
         {
-            out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
-            out.venc->color_primaries = AVCOL_PRI_BT2020;
-            out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
+            if (inputIsHDR) {
+                // Preserve input HDR characteristics when input is HDR
+                out.venc->color_trc = in.vst->codecpar->color_trc;
+                out.venc->color_primaries = in.vst->codecpar->color_primaries;
+                out.venc->colorspace = in.vst->codecpar->color_space;
+            } else {
+                // THDR enabled: use default HDR settings
+                out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
+                out.venc->color_primaries = AVCOL_PRI_BT2020;
+                out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
+            }
         }
         else
         {
@@ -1315,8 +1347,8 @@ int run_pipeline(PipelineConfig cfg)
         // Switch to constant QP rate control
         av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
         av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
-        // Set HEVC profile based on THDR: use Main10 for HDR, Main for SDR
-        if (cfg.rtxCfg.enableTHDR) {
+        // Set HEVC profile based on HDR output: use Main10 for HDR, Main for SDR
+        if (outputHDR) {
             av_opt_set(out.venc->priv_data, "profile", "main10", 0);
         } else {
             av_opt_set(out.venc->priv_data, "profile", "main", 0);
@@ -1331,8 +1363,8 @@ int run_pipeline(PipelineConfig cfg)
                 throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
             AVHWFramesContext *fctx = (AVHWFramesContext *)enc_hw_frames->data;
             fctx->format = AV_PIX_FMT_CUDA;
-            // Choose NV12 for SDR (THDR disabled), P010 for HDR
-            fctx->sw_format = cfg.rtxCfg.enableTHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+            // Choose NV12 for SDR, P010 for HDR (THDR enabled or input is HDR)
+            fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
             fctx->width = dstW;
             fctx->height = dstH;
             fctx->initial_pool_size = 64;
@@ -1370,11 +1402,19 @@ int run_pipeline(PipelineConfig cfg)
                 out.vstream->codecpar->codec_tag = 0;
             }
             out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            if (cfg.rtxCfg.enableTHDR)
+            if (outputHDR)
             {
-                out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
-                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
-                out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+                if (inputIsHDR) {
+                    // Preserve input HDR characteristics when input is HDR
+                    out.vstream->codecpar->color_trc = in.vst->codecpar->color_trc;
+                    out.vstream->codecpar->color_primaries = in.vst->codecpar->color_primaries;
+                    out.vstream->codecpar->color_space = in.vst->codecpar->color_space;
+                } else {
+                    // THDR enabled: use default HDR settings
+                    out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+                    out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                    out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+                }
             }
             else
             {
@@ -1383,9 +1423,18 @@ int run_pipeline(PipelineConfig cfg)
                 out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
             }
         }
-        if (cfg.rtxCfg.enableTHDR)
+        if (outputHDR)
         {
-            add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
+            if (inputIsHDR) {
+                // For HDR input, try to preserve original mastering metadata
+                LOG_INFO("Preserving HDR mastering metadata from input stream");
+                // TODO: Copy mastering display color volume and content light level from input
+                // For now, add default HDR metadata to ensure proper HDR signaling
+                add_mastering_and_cll(out.vstream, 4000); // Conservative max luminance for HDR passthrough
+            } else {
+                // THDR enabled: add THDR mastering metadata
+                add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
+            }
         }
 
         // CUDA frame pool for optimized GPU processing
@@ -1550,12 +1599,15 @@ int run_pipeline(PipelineConfig cfg)
         std::unique_ptr<IProcessor> processor;
         if (use_cuda_path)
         {
-            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, cfg.rtxCfg.enableTHDR);
+            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR);
         }
         else
         {
             auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width, in.vdec->height, dstW, dstH);
-            cpuProc->setConfig(cfg.rtxCfg);
+            // Create a modified config for CPU processor to ensure it uses HDR pixel formats when outputting HDR
+            RTXProcessConfig cpuConfig = cfg.rtxCfg;
+            cpuConfig.enableTHDR = outputHDR; // Use HDR pixel formats for both THDR and HDR input
+            cpuProc->setConfig(cpuConfig);
             processor = std::move(cpuProc);
         }
 

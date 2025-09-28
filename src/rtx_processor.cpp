@@ -207,6 +207,115 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     return true;
 }
 
+bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
+                                        const uint8_t *d_uv, int pitchUV,
+                                        AVFrame *encP010Frame,
+                                        bool bt2020)
+{
+    if (!m_initialized || !d_y || !d_uv || !encP010Frame)
+    {
+        setError("processGpuP010ToP010: invalid state or null args");
+        return false;
+    }
+
+    CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
+
+    // 1) P010 (device) -> X2BGR10LE (10-bit RGB, device pitched) - preserving full 10-bit precision
+    launch_p010_to_x2bgr10(d_y, pitchY, d_uv, pitchUV,
+                           m_devABGR10, (int)m_devABGR10Pitch,  // Reuse ABGR10 buffer for X2BGR10LE
+                           (int)m_srcW, (int)m_srcH,
+                           bt2020,
+                           m_stream);
+
+    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to P010
+    if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
+    {
+        uint8_t *d_outY = encP010Frame->data[0];
+        uint8_t *d_outUV = encP010Frame->data[1];
+        int pitchOutY = encP010Frame->linesize[0];
+        int pitchOutUV = encP010Frame->linesize[1];
+        if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+        {
+            setError("processGpuP010ToP010: invalid encoder CUDA frame planes");
+            return false;
+        }
+        // Direct X2BGR10LE -> P010 preserving 10-bit precision with BT.2020 colorspace
+        launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+                              d_outY, pitchOutY,
+                              d_outUV, pitchOutUV,
+                              (int)m_srcW, (int)m_srcH,
+                              /*bt2020=*/true,  // Always use BT.2020 for HDR content
+                              m_stream);
+        cudaStreamSynchronize(m_stream);
+        return true;
+    }
+
+    // 2) Copy X2BGR10LE (device pitched) -> m_srcArray (CUDA array) for RTX input
+    CUDA_MEMCPY2D copyIn{};
+    copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyIn.srcDevice = (CUdeviceptr)m_devABGR10;  // Source is now X2BGR10LE
+    copyIn.srcPitch = (unsigned int)m_devABGR10Pitch;
+    copyIn.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    copyIn.dstArray = m_srcArray;
+    copyIn.WidthInBytes = (unsigned int)(m_srcW * 4);  // 4 bytes per pixel for X2BGR10LE
+    copyIn.Height = m_srcH;
+    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+
+    // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when processing HDR content)
+    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
+    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_VSR_Setting vsr{};
+    vsr.QualityLevel = m_cfg.vsrQuality;
+    API_THDR_Setting thdr{};
+    thdr.Contrast = m_cfg.thdrContrast;
+    thdr.Saturation = m_cfg.thdrSaturation;
+    thdr.MiddleGray = m_cfg.thdrMiddleGray;
+    thdr.MaxLuminance = m_cfg.thdrMaxLuminance;
+
+    bool rtx_ok = rtx_video_api_cuda_evaluate(m_srcTex, m_dstSurf, srcRect, dstRect,
+                                              m_cfg.enableVSR ? &vsr : nullptr,
+                                              m_cfg.enableTHDR ? &thdr : nullptr);
+    if (!rtx_ok)
+    {
+        setError("processGpuP010ToP010: RTX evaluate failed");
+        return false;
+    }
+
+    // 4) Copy m_dstArray (ABGR10) -> device pitched staging
+    CUDA_MEMCPY2D copyOut{};
+    copyOut.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    copyOut.srcArray = m_dstArray;
+    copyOut.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copyOut.dstDevice = (CUdeviceptr)m_devABGR10;
+    copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
+    copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
+    copyOut.Height = m_dstH;
+    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+
+    // 5) ABGR10 (device pitched) -> P010 (encoder frame planes)
+    uint8_t *d_outY = encP010Frame->data[0];
+    uint8_t *d_outUV = encP010Frame->data[1];
+    int pitchOutY = encP010Frame->linesize[0];
+    int pitchOutUV = encP010Frame->linesize[1];
+    if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+    {
+        setError("processGpuP010ToP010: invalid encoder CUDA frame planes");
+        return false;
+    }
+
+    // RTX processed data is always in ABGR10 format, convert to P010 with BT.2020 for HDR
+    launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+                          d_outY, pitchOutY,
+                          d_outUV, pitchOutUV,
+                          (int)m_dstW, (int)m_dstH,
+                          /*bt2020=*/true,  // Always use BT.2020 for HDR content
+                          m_stream);
+
+    // Ensure all GPU operations complete before returning
+    cudaStreamSynchronize(m_stream);
+    return true;
+}
+
 bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                                         const uint8_t *d_uv, int pitchUV,
                                         AVFrame *encNV12Frame,

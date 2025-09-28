@@ -323,6 +323,55 @@ __global__ void k_nv12_to_rgba(const uint8_t *__restrict__ d_y, int pitchY,
     dst[3] = 255; // A
 }
 
+__global__ void k_p010_to_x2bgr10(const uint8_t *__restrict__ d_y, int pitchY,
+                                  const uint8_t *__restrict__ d_uv, int pitchUV,
+                                  uint8_t *__restrict__ outX2BGR10, int outPitch,
+                                  int w, int h, bool bt2020)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+
+    // P010: Y plane full res (16-bit), UV interleaved at half res (16-bit pairs)
+    // 10-bit data is in upper 10 bits of each 16-bit value
+    int uvy = y / 2;
+
+    const uint16_t *y_plane = (const uint16_t *)d_y;
+    const uint16_t *uv_plane = (const uint16_t *)d_uv;
+
+    uint16_t Y16 = y_plane[y * (pitchY / 2) + x];
+    uint16_t U16 = uv_plane[uvy * (pitchUV / 2) + (x / 2) * 2 + 0];
+    uint16_t V16 = uv_plane[uvy * (pitchUV / 2) + (x / 2) * 2 + 1];
+
+    // Extract 10-bit values from upper 10 bits of 16-bit data
+    float Y = (float)(Y16 >> 6); // P010: 10 bits in upper bits, so shift right 6
+    float U = (float)(U16 >> 6);
+    float V = (float)(V16 >> 6);
+
+    // Limited range mapping for 10-bit (0-1023 range)
+    float Yp = (Y - 64.0f) / 876.0f;   // 10-bit: Y range 64-940 (876 levels)
+    float Uc = (U - 512.0f) / 896.0f;  // 10-bit: UV range 64-960 (896 levels), centered at 512
+    float Vc = (V - 512.0f) / 896.0f;
+
+    float R, G, B;
+    yuv_to_rgb(Yp, Uc, Vc, bt2020, R, G, B);
+    R = clampf(R, 0.0f, 1.0f);
+    G = clampf(G, 0.0f, 1.0f);
+    B = clampf(B, 0.0f, 1.0f);
+
+    // Convert to 10-bit values (0-1023 range)
+    uint32_t r10 = (uint32_t)(R * 1023.0f + 0.5f);
+    uint32_t g10 = (uint32_t)(G * 1023.0f + 0.5f);
+    uint32_t b10 = (uint32_t)(B * 1023.0f + 0.5f);
+
+    // Pack into X2BGR10LE format: bits 0-9 R, 10-19 G, 20-29 B, 30-31 unused
+    uint32_t packed = (r10 & 0x3FF) | ((g10 & 0x3FF) << 10) | ((b10 & 0x3FF) << 20);
+
+    uint32_t *dst = (uint32_t *)(outX2BGR10 + y * outPitch + x * 4);
+    *dst = packed;
+}
+
 void launch_nv12_to_bgra(const uint8_t *d_y, int pitchY,
                          const uint8_t *d_uv, int pitchUV,
                          uint8_t *outBGRA, int outPitch,
@@ -333,4 +382,16 @@ void launch_nv12_to_bgra(const uint8_t *d_y, int pitchY,
     dim3 block(32, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
     k_nv12_to_rgba<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outBGRA, outPitch, w, h, bt2020);
+}
+
+void launch_p010_to_x2bgr10(const uint8_t *d_y, int pitchY,
+                            const uint8_t *d_uv, int pitchUV,
+                            uint8_t *outX2BGR10, int outPitch,
+                            int w, int h,
+                            bool bt2020,
+                            cudaStream_t stream)
+{
+    dim3 block(32, 16);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    k_p010_to_x2bgr10<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outX2BGR10, outPitch, w, h, bt2020);
 }

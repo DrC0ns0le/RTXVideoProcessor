@@ -13,6 +13,7 @@ extern "C" {
 struct InputOpenOptions
 {
     std::string fflags;
+    bool preferP010ForHDR = false; // Request P010 output for HDR content
 };
 
 struct HlsMuxOptions
