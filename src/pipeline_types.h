@@ -17,6 +17,7 @@ struct InputOpenOptions
 {
     std::string fflags;
     bool preferP010ForHDR = false; // Request P010 output for HDR content
+    std::string seekTime; // Seek time in FFmpeg format (e.g., "00:09:06.671")
 };
 
 struct HlsMuxOptions
@@ -46,6 +47,9 @@ struct InputContext
     AVCodecContext *adec = nullptr;
 
     AVBufferRef *hw_device_ctx = nullptr; // CUDA device
+
+    // Seek offset tracking for A/V sync
+    int64_t seek_offset_us = 0; // Seek offset in microseconds
 };
 
 struct AudioConfig
@@ -80,6 +84,7 @@ struct OutputContext
     AVAudioFifo *audio_fifo = nullptr;
     int64_t next_audio_pts = 0;
     int64_t last_audio_dts = AV_NOPTS_VALUE;
+    int64_t a_start_pts = AV_NOPTS_VALUE; // First audio PTS for baseline
 
     std::vector<int> map_streams; // input->output map, -1 for unmapped
     std::vector<std::string> streamMappings; // parsed -map arguments

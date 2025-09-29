@@ -1,0 +1,3 @@
+[VERBOSE] Starting video processing pipeline
+[VERBOSE] CPU-only mode: disabled
+[INFO] Audio processing enabled with codec=aac, channels=2, bitrate=256000, filter=

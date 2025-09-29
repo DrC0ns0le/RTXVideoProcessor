@@ -43,7 +43,11 @@ void close_output(OutputContext &out);
 
 // Audio configuration functions
 void configure_audio_from_params(const AudioParameters &params, OutputContext &out);
+void resolve_stream_conflicts(const InputContext &in, OutputContext &out);
 bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
 bool setup_audio_encoder(const InputContext &in, OutputContext &out);
 bool setup_audio_filter(const InputContext &in, OutputContext &out);
 bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet);
+
+// Initialize audio PTS tracking after seeking
+void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us = AV_NOPTS_VALUE);

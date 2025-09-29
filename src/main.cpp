@@ -439,6 +439,7 @@ static inline void ensure_rtx_cpu_and_process(RTXProcessor &rtx_cpu,
 struct PipelineConfig
 {
     bool verbose = false;
+    bool debug = false;
     bool cpuOnly = false;
     bool ffCompatible = false;
 
@@ -482,6 +483,9 @@ struct PipelineConfig
     int audioChannels = -1;
     int audioBitrate = -1;
     std::string audioFilter;
+
+    // Seek options
+    std::string seekTime;
 };
 
 static char *extract_ffmpeg_file_path(char *value)
@@ -853,10 +857,19 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->audioFilter = argv[++i];
         }
+        else if (arg == "-ss")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-ss requires a time value\n");
+                exit(1);
+            }
+            cfg->seekTime = argv[++i];
+        }
         if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv"))
         {
             cfg->outputPath = argv[i];
-            fprintf(stderr, "DEBUG: Set outputPath = '%s'\n", cfg->outputPath);
+            LOG_DEBUG("Set outputPath = '%s'\n", cfg->outputPath);
         }
     }
 }
@@ -866,6 +879,7 @@ static void print_help(const char *argv0)
     fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv|m3u8} [options]\n", argv0);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
+    fprintf(stderr, "  -d, --debug Enable debug logging\n");
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
     fprintf(stderr, "\nVSR options:\n");
     fprintf(stderr, "  --no-vsr      Disable VSR\n");
@@ -908,7 +922,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     cfg->rtxCfg.vsrQuality = 4;
 
     // Default THDR settings
-    cfg->rtxCfg.enableTHDR = false;
+    cfg->rtxCfg.enableTHDR = true;
     cfg->rtxCfg.thdrContrast = 115;
     cfg->rtxCfg.thdrSaturation = 75;
     cfg->rtxCfg.thdrMiddleGray = 30;
@@ -921,7 +935,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
 
     cfg->gop = 1;
     cfg->bframes = 2;
-    cfg->qp = 21;
+    cfg->qp = 24;
     cfg->targetBitrateMultiplier = 2;
 
     int i = 1;
@@ -943,6 +957,8 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
         std::string arg = argv[i];
         if (arg == "--verbose" || arg == "-v")
             cfg->verbose = true;
+        else if (arg == "--debug" || arg == "-d")
+            cfg->debug = true;
         else if (arg == "--cpu" || arg == "-cpu")
             cfg->cpuOnly = true;
         else if (arg == "--help" || arg == "-h")
@@ -1246,10 +1262,347 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     }
 }
 
+// Helper function for input HDR detection and configuration
+static bool configure_input_hdr_detection(PipelineConfig& cfg, InputContext& in) {
+    // Detect HDR content and disable THDR if input is already HDR
+    bool inputIsHDR = false;
+    if (in.vst && in.vst->codecpar) {
+        AVColorTransferCharacteristic trc = in.vst->codecpar->color_trc;
+        inputIsHDR = (trc == AVCOL_TRC_SMPTE2084) ||  // PQ (HDR10)
+                    (trc == AVCOL_TRC_ARIB_STD_B67);   // HLG (Hybrid Log-Gamma)
+    }
+
+    if (inputIsHDR) {
+        if (cfg.rtxCfg.enableTHDR) {
+            LOG_INFO("Input content is HDR (transfer characteristic: %s). Disabling THDR to preserve HDR metadata.",
+                     in.vst->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ/HDR10" : "HLG");
+            cfg.rtxCfg.enableTHDR = false;
+            cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier * 0.8; // 10bits -> 8bits, 20% less bitrate
+        }
+
+        // Reopen input with P010 preference for HDR content to enable full 10-bit pipeline
+        close_input(in);
+        InputOpenOptions inputOpts;
+        inputOpts.fflags = cfg.fflags;
+        inputOpts.preferP010ForHDR = true;
+        inputOpts.seekTime = cfg.seekTime;
+        open_input(cfg.inputPath, in, &inputOpts);
+        LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
+    }
+
+    return inputIsHDR;
+}
+
+// Helper function for VSR auto-disable logic
+static void configure_vsr_auto_disable(PipelineConfig& cfg, const InputContext& in) {
+    // Auto-disable VSR for inputs >= 1920x1080 in either orientation
+    if (cfg.rtxCfg.enableVSR) {
+        bool ge1080p = (in.vdec->width > 2560 && in.vdec->height > 1440) ||
+                       (in.vdec->width > 1440 && in.vdec->height > 2560);
+        if (ge1080p) {
+            LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
+            cfg.rtxCfg.enableVSR = false;
+            cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier / 2.0; // approx. 2x less bitrate
+        }
+    }
+}
+
+// Helper function for audio processing configuration
+static void configure_audio_processing(PipelineConfig& cfg, InputContext& in, OutputContext& out) {
+    // Configure audio processing if compatibility mode is enabled
+    if (cfg.ffCompatible) {
+        LOG_DEBUG("Compatibility mode enabled, configuring audio...\n");
+
+        // Create AudioParameters from PipelineConfig to avoid struct duplication issues
+        AudioParameters audioParams;
+        audioParams.codec = cfg.audioCodec;
+        audioParams.channels = cfg.audioChannels;
+        audioParams.bitrate = cfg.audioBitrate;
+        audioParams.filter = cfg.audioFilter;
+        audioParams.streamMaps = cfg.streamMaps;
+
+        configure_audio_from_params(audioParams, out);
+        LOG_DEBUG("Audio config completed, enabled=%s\n", out.audioConfig.enabled ? "true" : "false");
+
+        if (out.audioConfig.enabled) {
+            LOG_DEBUG("Applying stream mappings...\n");
+            apply_stream_mappings(cfg.streamMaps, in, out);
+
+            LOG_DEBUG("Setting up audio encoder...\n");
+            if (!setup_audio_encoder(in, out)) {
+                LOG_WARN("Failed to setup audio encoder, disabling audio processing");
+                out.audioConfig.enabled = false;
+            } else {
+                LOG_DEBUG("Audio encoder setup complete\n");
+                LOG_DEBUG("Setting up audio filter...\n");
+                if (!setup_audio_filter(in, out)) {
+                    LOG_WARN("Failed to setup audio filter, continuing without filtering");
+                    // Don't disable audio processing, just filtering
+                } else {
+                    LOG_DEBUG("Audio filter setup complete\n");
+                }
+            }
+        }
+    }
+    LOG_DEBUG("Audio configuration complete, proceeding...\n");
+}
+
+// Helper function for progress tracking setup
+static int64_t setup_progress_tracking(const InputContext& in, const AVRational& fr) {
+    // Get total duration and frames for progress tracking
+    int64_t total_frames = 0;
+    if (in.vst->nb_frames > 0) {
+        total_frames = in.vst->nb_frames;
+    } else {
+        // Estimate total frames from duration if frame count is not available
+        double duration_sec = 0.0;
+        if (in.vst->duration > 0 && in.vst->duration != AV_NOPTS_VALUE) {
+            duration_sec = in.vst->duration * av_q2d(in.vst->time_base);
+        } else if (in.fmt->duration != AV_NOPTS_VALUE) {
+            duration_sec = static_cast<double>(in.fmt->duration) / AV_TIME_BASE;
+        }
+
+        if (duration_sec > 0.0 && fr.num > 0 && fr.den > 0) {
+            total_frames = static_cast<int64_t>(duration_sec * av_q2d(fr) + 0.5);
+        }
+    }
+    return total_frames;
+}
+
+// Helper function for video encoder configuration
+static AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, OutputContext& out,
+                                           bool inputIsHDR, bool use_cuda_path, int dstW, int dstH,
+                                           const AVRational& fr, bool hls_enabled, bool mux_is_isobmff) {
+    // Configure encoder now that sizes are known
+    LOG_DEBUG("Configuring HEVC encoder...");
+    out.venc->codec_id = AV_CODEC_ID_HEVC;
+    out.venc->width = dstW;
+    out.venc->height = dstH;
+    out.venc->time_base = av_inv_q(fr);
+    out.venc->framerate = fr;
+
+    // Prefer CUDA frames if decoder is CUDA-capable to avoid copies
+    bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
+    if (use_cuda_path) {
+        out.venc->pix_fmt = AV_PIX_FMT_CUDA; // NVENC consumes CUDA frames via hw_frames_ctx
+    } else {
+        // CPU fallback: choose NV12 for SDR, P010 for HDR
+        out.venc->pix_fmt = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+    }
+
+    out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
+    out.venc->max_b_frames = 2;
+    out.venc->color_range = AVCOL_RANGE_MPEG;
+
+    // Use HDR color settings if THDR is enabled OR if input is HDR content
+    if (outputHDR) {
+        if (inputIsHDR) {
+            // Preserve input HDR characteristics when input is HDR
+            out.venc->color_trc = in.vst->codecpar->color_trc;
+            out.venc->color_primaries = in.vst->codecpar->color_primaries;
+            out.venc->colorspace = in.vst->codecpar->color_space;
+        } else {
+            // THDR enabled: use default HDR settings
+            out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
+            out.venc->color_primaries = AVCOL_PRI_BT2020;
+            out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
+        }
+    } else {
+        out.venc->color_trc = AVCOL_TRC_BT709;
+        out.venc->color_primaries = AVCOL_PRI_BT709;
+        out.venc->colorspace = AVCOL_SPC_BT709;
+    }
+
+    // Ensure muxers that require extradata (e.g., Matroska) receive global headers
+    if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff || hls_enabled) {
+        out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
+    LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
+    LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
+                cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
+    av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
+    av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
+    av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
+    av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
+    av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+
+    // Set HEVC profile based on HDR output: use Main10 for HDR, Main for SDR
+    if (outputHDR) {
+        av_opt_set(out.venc->priv_data, "profile", "main10", 0);
+    } else {
+        av_opt_set(out.venc->priv_data, "profile", "main", 0);
+    }
+
+    // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
+    AVBufferRef *enc_hw_frames = nullptr;
+    if (use_cuda_path) {
+        enc_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
+        if (!enc_hw_frames)
+            throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
+        AVHWFramesContext *fctx = (AVHWFramesContext *)enc_hw_frames->data;
+        fctx->format = AV_PIX_FMT_CUDA;
+        // Choose NV12 for SDR, P010 for HDR (THDR enabled or input is HDR)
+        fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+        fctx->width = dstW;
+        fctx->height = dstH;
+        fctx->initial_pool_size = 64;
+        ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
+        out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
+    }
+
+    ff_check(avcodec_open2(out.venc, out.venc->codec, nullptr), "open encoder");
+    LOG_VERBOSE("Pipeline: decode=%s, colorspace+scale+pack=%s\n",
+                (in.vdec->hw_device_ctx ? "GPU(NVDEC)" : "CPU"),
+                (use_cuda_path ? "GPU(RTX/CUDA)" : "CPU(SWS)"));
+
+    return enc_hw_frames;
+}
+
+// Helper function for stream metadata and codec parameters
+static void configure_stream_metadata(InputContext& in, OutputContext& out, PipelineConfig& cfg,
+                                    bool inputIsHDR, bool mux_is_isobmff, bool hls_enabled) {
+    bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
+
+    ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
+    if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr) {
+        throw std::runtime_error("HEVC encoder did not provide extradata; required for Matroska outputs");
+    }
+    LOG_DEBUG("Encoder extradata size: %d bytes", out.vstream->codecpar->extradata_size);
+    if (out.vstream->codecpar->extradata_size >= 4) {
+        const uint8_t *ed = out.vstream->codecpar->extradata;
+        LOG_DEBUG("Extradata head: %02X %02X %02X %02X", ed[0], ed[1], ed[2], ed[3]);
+    }
+
+    // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
+    if (out.vstream->codecpar) {
+        if (mux_is_isobmff) {
+            out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
+        } else {
+            out.vstream->codecpar->codec_tag = 0;
+        }
+        out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
+        if (outputHDR) {
+            if (inputIsHDR) {
+                // Preserve input HDR characteristics when input is HDR
+                out.vstream->codecpar->color_trc = in.vst->codecpar->color_trc;
+                out.vstream->codecpar->color_primaries = in.vst->codecpar->color_primaries;
+                out.vstream->codecpar->color_space = in.vst->codecpar->color_space;
+            } else {
+                // THDR enabled: use default HDR settings
+                out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+            }
+        } else {
+            out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
+            out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
+            out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
+        }
+    }
+
+    if (outputHDR && !hls_enabled) {
+        if (inputIsHDR) {
+            // For HDR input, try to preserve original mastering metadata
+            LOG_INFO("Preserving HDR mastering metadata from input stream");
+            // TODO: Copy mastering display color volume and content light level from input
+            // For now, add default HDR metadata to ensure proper HDR signaling
+            add_mastering_and_cll(out.vstream, 4000); // Conservative max luminance for HDR passthrough
+        } else {
+            // THDR enabled: add THDR mastering metadata
+            add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
+        }
+    }
+}
+
+// Helper function for frame buffer and context initialization
+static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, int dstH,
+                                                 CudaFramePool& cuda_pool, SwsContext*& sws_to_p010,
+                                                 FramePtr& bgra_frame, FramePtr& p010_frame,
+                                                 const InputContext& in, const OutputContext& out) {
+    // Initialize CUDA frame pool if using CUDA path
+    if (use_cuda_path) {
+        const int POOL_SIZE = 8; // Adjust based on your needs
+        cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
+    }
+
+    // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
+    p010_frame->format = AV_PIX_FMT_P010LE;
+    p010_frame->width = dstW;
+    p010_frame->height = dstH;
+    ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
+
+    // CPU path colorspace for RGB(A)->P010
+    sws_to_p010 = sws_getContext(
+        dstW, dstH, AV_PIX_FMT_X2BGR10LE,
+        dstW, dstH, AV_PIX_FMT_P010LE,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_to_p010)
+        throw std::runtime_error("sws_to_p010 alloc failed");
+    const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
+    sws_setColorspaceDetails(sws_to_p010,
+                             coeffs_bt2020, 1,
+                             coeffs_bt2020, 0,
+                             0, 1 << 16, 1 << 16);
+
+    bgra_frame->format = AV_PIX_FMT_RGBA;
+    bgra_frame->width = in.vdec->width;
+    bgra_frame->height = in.vdec->height;
+    ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
+}
+
+// Helper function for RTX processor initialization
+static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use_cuda_path,
+                                   const PipelineConfig& cfg, const InputContext& in) {
+    if (use_cuda_path) {
+        AVHWDeviceContext *devctx = (AVHWDeviceContext *)in.hw_device_ctx->data;
+        AVCUDADeviceContext *cudactx = (AVCUDADeviceContext *)devctx->hwctx;
+        CUcontext cu = cudactx->cuda_ctx;
+        if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+            std::string detail = rtx.lastError();
+            if (detail.empty())
+                detail = "unknown error";
+            throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
+        }
+        rtx_init = true;
+    } else {
+        if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+            std::string detail = rtx.lastError();
+            if (detail.empty())
+                detail = "unknown error";
+            throw std::runtime_error(std::string("Failed to init RTX CPU path: ") + detail);
+        }
+        rtx_init = true;
+    }
+}
+
+// Helper function for writing muxer header
+static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff, const AVRational& fr) {
+    // Write header
+    out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
+    out.vstream->avg_frame_rate = fr;
+    // Write header with MOV/MP4 muxer flags for broad compatibility
+    // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
+    AVDictionary *muxopts = out.muxOptions;
+    // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
+    if (!hls_enabled && mux_is_isobmff) {
+        av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
+        printf("MUXER DEBUG: Set movflags for regular MP4: +faststart+write_colr\n");
+    } else {
+        av_dict_set(&muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
+        printf("MUXER DEBUG: Set movflags for HLS/fragmented: +frag_keyframe+delay_moov+faststart+write_colr\n");
+    }
+    ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
+    if (muxopts)
+        av_dict_free(&muxopts);
+    out.muxOptions = nullptr;
+}
+
 int run_pipeline(PipelineConfig cfg)
 {
-    Logger::instance().setVerbose(cfg.verbose);
-    Logger::instance().setDebug(false);
+    Logger::instance().setVerbose(cfg.verbose || cfg.debug);
+    Logger::instance().setDebug(cfg.debug);
 
     LOG_VERBOSE("Starting video processing pipeline");
     LOG_DEBUG("Input: %s", cfg.inputPath);
@@ -1262,92 +1615,37 @@ int run_pipeline(PipelineConfig cfg)
 
     try
     {
+        // Stage 1: Open input and configure HDR detection
         InputOpenOptions inputOpts;
         inputOpts.fflags = cfg.fflags;
+        inputOpts.seekTime = cfg.seekTime;
         open_input(cfg.inputPath, in, &inputOpts);
+        bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
-        // Detect HDR content and disable THDR if input is already HDR
-        bool inputIsHDR = false;
-        if (in.vst && in.vst->codecpar) {
-            AVColorTransferCharacteristic trc = in.vst->codecpar->color_trc;
-            inputIsHDR = (trc == AVCOL_TRC_SMPTE2084) ||  // PQ (HDR10)
-                        (trc == AVCOL_TRC_ARIB_STD_B67);   // HLG (Hybrid Log-Gamma)
-        }
+        // Stage 2: Configure VSR auto-disable
+        configure_vsr_auto_disable(cfg, in);
 
-        if (inputIsHDR) {
-            if (cfg.rtxCfg.enableTHDR) {
-                LOG_INFO("Input content is HDR (transfer characteristic: %s). Disabling THDR to preserve HDR metadata.",
-                         in.vst->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ/HDR10" : "HLG");
-                cfg.rtxCfg.enableTHDR = false;
-                cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier * 0.8; // 10bits -> 8bits, 20% less bitrate
-            }
-
-            // Reopen input with P010 preference for HDR content to enable full 10-bit pipeline
-            close_input(in);
-            inputOpts.preferP010ForHDR = true;
-            open_input(cfg.inputPath, in, &inputOpts);
-            LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
-        }
-
-        // Auto-disable VSR for inputs >= 1920x1080 in either orientation
-        if (cfg.rtxCfg.enableVSR)
-        {
-            bool ge1080p = (in.vdec->width > 1920 && in.vdec->height > 1080) ||
-                           (in.vdec->width > 1080 && in.vdec->height > 1920);
-            if (ge1080p)
-            {
-                LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
-                cfg.rtxCfg.enableVSR = false;
-                cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier / 2.0; // approx. 2x less bitrate
-            }
-        }
-
-        fprintf(stderr, "DEBUG: Finalizing HLS options...\n");
+        // Stage 3: Setup output and HLS options
+        LOG_DEBUG("Finalizing HLS options...");
         finalize_hls_options(&cfg, &out);
 
-        fprintf(stderr, "DEBUG: Opening output...\n");
-        open_output(cfg.outputPath, in, out);
-
-        fprintf(stderr, "DEBUG: Output opened successfully\n");
-
-        // Configure audio processing if compatibility mode is enabled
-        if (cfg.ffCompatible) {
-            fprintf(stderr, "DEBUG: Compatibility mode enabled, configuring audio...\n");
-
-            // Create AudioParameters from PipelineConfig to avoid struct duplication issues
-            AudioParameters audioParams;
-            audioParams.codec = cfg.audioCodec;
-            audioParams.channels = cfg.audioChannels;
-            audioParams.bitrate = cfg.audioBitrate;
-            audioParams.filter = cfg.audioFilter;
-            audioParams.streamMaps = cfg.streamMaps;
-
-            configure_audio_from_params(audioParams, out);
-            fprintf(stderr, "DEBUG: Audio config completed, enabled=%s\n", out.audioConfig.enabled ? "true" : "false");
-
-            if (out.audioConfig.enabled) {
-                fprintf(stderr, "DEBUG: Applying stream mappings...\n");
-                apply_stream_mappings(cfg.streamMaps, in, out);
-
-                fprintf(stderr, "DEBUG: Setting up audio encoder...\n");
-                if (!setup_audio_encoder(in, out)) {
-                    LOG_WARN("Failed to setup audio encoder, disabling audio processing");
-                    out.audioConfig.enabled = false;
-                } else {
-                    fprintf(stderr, "DEBUG: Audio encoder setup complete\n");
-                    fprintf(stderr, "DEBUG: Setting up audio filter...\n");
-                    if (!setup_audio_filter(in, out)) {
-                        LOG_WARN("Failed to setup audio filter, continuing without filtering");
-                        // Don't disable audio processing, just filtering
-                    } else {
-                        fprintf(stderr, "DEBUG: Audio filter setup complete\n");
-                    }
-                }
-            }
+        // Stage 3b: Pre-configure audio intent to guide stream creation
+        bool willReencodeAudio = cfg.ffCompatible &&
+                                ((!cfg.audioCodec.empty() && cfg.audioCodec != "copy") ||
+                                 cfg.audioChannels > 0 || cfg.audioBitrate > 0 || !cfg.audioFilter.empty());
+        if (willReencodeAudio) {
+            out.audioConfig.enabled = true;
+            out.audioConfig.codec = cfg.audioCodec.empty() ? "aac" : cfg.audioCodec;
         }
 
-        fprintf(stderr, "DEBUG: Audio configuration complete, proceeding...\n");
+        LOG_DEBUG("Opening output...");
+        open_output(cfg.outputPath, in, out);
+        LOG_DEBUG("Output opened successfully");
 
+        // Stage 4: Configure audio processing (complete the audio setup)
+        configure_audio_processing(cfg, in, out);
+
+        // Stage 5: Calculate frame rate and setup progress tracking
         const bool hls_enabled = out.hlsOptions.enabled;
         const bool hls_segments_are_fmp4 = hls_enabled && lowercase_copy(out.hlsOptions.segmentType) == "fmp4";
 
@@ -1356,30 +1654,7 @@ int run_pipeline(PipelineConfig cfg)
         if (fr.num == 0 || fr.den == 0)
             fr = {in.vst->time_base.den, in.vst->time_base.num};
 
-        // Get total duration and frames for progress tracking
-        int64_t total_frames = 0;
-        if (in.vst->nb_frames > 0)
-        {
-            total_frames = in.vst->nb_frames;
-        }
-        else
-        {
-            // Estimate total frames from duration if frame count is not available
-            double duration_sec = 0.0;
-            if (in.vst->duration > 0 && in.vst->duration != AV_NOPTS_VALUE)
-            {
-                duration_sec = in.vst->duration * av_q2d(in.vst->time_base);
-            }
-            else if (in.fmt->duration != AV_NOPTS_VALUE)
-            {
-                duration_sec = static_cast<double>(in.fmt->duration) / AV_TIME_BASE;
-            }
-
-            if (duration_sec > 0.0 && fr.num > 0 && fr.den > 0)
-            {
-                total_frames = static_cast<int64_t>(duration_sec * av_q2d(fr) + 0.5);
-            }
-        }
+        int64_t total_frames = setup_progress_tracking(in, fr);
 
         // Progress tracking variables
         int64_t processed_frames = 0;
@@ -1400,6 +1675,7 @@ int run_pipeline(PipelineConfig cfg)
         SwsContext *sws_to_p010 = nullptr; // CPU fallback
         bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr) && !cfg.cpuOnly;
 
+        // Stage 6: Calculate output dimensions and setup muxer format
         LOG_VERBOSE("Processing path: %s", use_cuda_path ? "GPU (CUDA)" : "CPU");
         LOG_VERBOSE("Output resolution: %dx%d (scale factor: %d)", dstW, dstH, effScale);
         std::string muxer_name = (out.fmt && out.fmt->oformat && out.fmt->oformat->name)
@@ -1407,224 +1683,37 @@ int run_pipeline(PipelineConfig cfg)
                                      : "";
         bool mux_is_isobmff = muxer_name.find("mp4") != std::string::npos ||
                               muxer_name.find("mov") != std::string::npos;
-        if (hls_segments_are_fmp4)
-        {
+        if (hls_segments_are_fmp4) {
             mux_is_isobmff = true;
         }
         LOG_VERBOSE("Output container: %s",
                     muxer_name.empty() ? "unknown" : muxer_name.c_str());
 
-        // Configure encoder now that sizes are known
-        LOG_DEBUG("Configuring HEVC encoder...");
-        fprintf(stderr, "DEBUG: Setting codec_id...\n");
-        out.venc->codec_id = AV_CODEC_ID_HEVC;
-        out.venc->width = dstW;
-        out.venc->height = dstH;
-        out.venc->time_base = av_inv_q(fr);
-        out.venc->framerate = fr;
-        // Prefer CUDA frames if decoder is CUDA-capable to avoid copies
-        if (use_cuda_path)
-        {
-            out.venc->pix_fmt = AV_PIX_FMT_CUDA; // NVENC consumes CUDA frames via hw_frames_ctx
-        }
-        else
-        {
-            // CPU fallback: choose NV12 for SDR, P010 for HDR
-            out.venc->pix_fmt = (cfg.rtxCfg.enableTHDR || inputIsHDR) ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
-        }
-        out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
-        out.venc->max_b_frames = 2;
-        out.venc->color_range = AVCOL_RANGE_MPEG;
-        // Use HDR color settings if THDR is enabled OR if input is HDR content
-        bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
-        if (outputHDR)
-        {
-            if (inputIsHDR) {
-                // Preserve input HDR characteristics when input is HDR
-                out.venc->color_trc = in.vst->codecpar->color_trc;
-                out.venc->color_primaries = in.vst->codecpar->color_primaries;
-                out.venc->colorspace = in.vst->codecpar->color_space;
-            } else {
-                // THDR enabled: use default HDR settings
-                out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
-                out.venc->color_primaries = AVCOL_PRI_BT2020;
-                out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
-            }
-        }
-        else
-        {
-            out.venc->color_trc = AVCOL_TRC_BT709;
-            out.venc->color_primaries = AVCOL_PRI_BT709;
-            out.venc->colorspace = AVCOL_SPC_BT709;
-        }
+        // Stage 7: Configure video encoder
+        AVBufferRef *enc_hw_frames = configure_video_encoder(cfg, in, out, inputIsHDR, use_cuda_path,
+                                                            dstW, dstH, fr, hls_enabled, mux_is_isobmff);
 
-        // Ensure muxers that require extradata (e.g., Matroska) receive global headers
-        if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff || hls_enabled)
-        {
-            out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        }
-
-        int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
-        LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
-        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
-                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
-        av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
-        av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
-        av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
-        av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
-        av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
-        // Set HEVC profile based on HDR output: use Main10 for HDR, Main for SDR
-        if (outputHDR) {
-            av_opt_set(out.venc->priv_data, "profile", "main10", 0);
-        } else {
-            av_opt_set(out.venc->priv_data, "profile", "main", 0);
-        }
-
-        // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
-        AVBufferRef *enc_hw_frames = nullptr;
-        if (use_cuda_path)
-        {
-            enc_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
-            if (!enc_hw_frames)
-                throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
-            AVHWFramesContext *fctx = (AVHWFramesContext *)enc_hw_frames->data;
-            fctx->format = AV_PIX_FMT_CUDA;
-            // Choose NV12 for SDR, P010 for HDR (THDR enabled or input is HDR)
-            fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
-            fctx->width = dstW;
-            fctx->height = dstH;
-            fctx->initial_pool_size = 64;
-            ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
-            out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
-        }
-
-        ff_check(avcodec_open2(out.venc, out.venc->codec, nullptr), "open encoder");
-        LOG_VERBOSE("Pipeline: decode=%s, colorspace+scale+pack=%s\n",
-                    (in.vdec->hw_device_ctx ? "GPU(NVDEC)" : "CPU"),
-                    (use_cuda_path ? "GPU(RTX/CUDA)" : "CPU(SWS)"));
+        // Stage 8: Configure stream metadata and codec parameters
+        configure_stream_metadata(in, out, cfg, inputIsHDR, mux_is_isobmff, hls_enabled);
         if (enc_hw_frames)
             av_buffer_unref(&enc_hw_frames);
 
-        ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
-        if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr)
-        {
-            throw std::runtime_error("HEVC encoder did not provide extradata; required for Matroska outputs");
-        }
-        LOG_DEBUG("Encoder extradata size: %d bytes", out.vstream->codecpar->extradata_size);
-        if (out.vstream->codecpar->extradata_size >= 4)
-        {
-            const uint8_t *ed = out.vstream->codecpar->extradata;
-            LOG_DEBUG("Extradata head: %02X %02X %02X %02X", ed[0], ed[1], ed[2], ed[3]);
-        }
-        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
-        if (out.vstream->codecpar)
-        {
-            if (mux_is_isobmff)
-            {
-                out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
-            }
-            else
-            {
-                out.vstream->codecpar->codec_tag = 0;
-            }
-            out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            if (outputHDR)
-            {
-                if (inputIsHDR) {
-                    // Preserve input HDR characteristics when input is HDR
-                    out.vstream->codecpar->color_trc = in.vst->codecpar->color_trc;
-                    out.vstream->codecpar->color_primaries = in.vst->codecpar->color_primaries;
-                    out.vstream->codecpar->color_space = in.vst->codecpar->color_space;
-                } else {
-                    // THDR enabled: use default HDR settings
-                    out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
-                    out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
-                    out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
-                }
-            }
-            else
-            {
-                out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
-                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
-                out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
-            }
-        }
-        if (outputHDR)
-        {
-            if (inputIsHDR) {
-                // For HDR input, try to preserve original mastering metadata
-                LOG_INFO("Preserving HDR mastering metadata from input stream");
-                // TODO: Copy mastering display color volume and content light level from input
-                // For now, add default HDR metadata to ensure proper HDR signaling
-                add_mastering_and_cll(out.vstream, 4000); // Conservative max luminance for HDR passthrough
-            } else {
-                // THDR enabled: add THDR mastering metadata
-                add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
-            }
-        }
-
-        // CUDA frame pool for optimized GPU processing
+        // Stage 9: Initialize frame buffers and processing contexts
         CudaFramePool cuda_pool;
-        const int POOL_SIZE = 8; // Adjust based on your needs
-
-        // Frame buffering for handling processing spikes
-        std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
-        const int MAX_BUFFER_SIZE = 4;
-
-        // Initialize CUDA frame pool if using CUDA path
-        if (use_cuda_path)
-        {
-            cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
-        }
-
-        // Write header
-        out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
-        out.vstream->avg_frame_rate = fr;
-        // Write header with MOV/MP4 muxer flags for broad compatibility
-        // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
-        AVDictionary *muxopts = out.muxOptions;
-        // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
-        if (!hls_enabled && mux_is_isobmff)
-        {
-            av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
-        }
-        else
-        {
-            av_dict_set(&muxopts, "movflags", "+frag_keyframe+faststart+write_colr", 0);
-        }
-        ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
-        if (muxopts)
-            av_dict_free(&muxopts);
-        out.muxOptions = nullptr;
-
-        // Frame buffers
         FramePtr frame(av_frame_alloc(), &av_frame_free_single);
         FramePtr swframe(av_frame_alloc(), &av_frame_free_single);
         FramePtr bgra_frame(av_frame_alloc(), &av_frame_free_single);
         FramePtr p010_frame(av_frame_alloc(), &av_frame_free_single);
 
-        bgra_frame->format = AV_PIX_FMT_RGBA;
-        bgra_frame->width = in.vdec->width;
-        bgra_frame->height = in.vdec->height;
-        ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
+        initialize_frame_buffers_and_contexts(use_cuda_path, dstW, dstH, cuda_pool, sws_to_p010,
+                                            bgra_frame, p010_frame, in, out);
 
-        // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
-        p010_frame->format = AV_PIX_FMT_P010LE;
-        p010_frame->width = dstW;
-        p010_frame->height = dstH;
-        ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
-        // CPU path colorspace for RGB(A)->P010
-        sws_to_p010 = sws_getContext(
-            dstW, dstH, AV_PIX_FMT_X2BGR10LE,
-            dstW, dstH, AV_PIX_FMT_P010LE,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws_to_p010)
-            throw std::runtime_error("sws_to_p010 alloc failed");
-        const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
-        sws_setColorspaceDetails(sws_to_p010,
-                                 coeffs_bt2020, 1,
-                                 coeffs_bt2020, 0,
-                                 0, 1 << 16, 1 << 16);
+        // Frame buffering for handling processing spikes
+        std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
+        const int MAX_BUFFER_SIZE = 4;
+
+        // Stage 10: Write muxer header
+        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
@@ -1633,6 +1722,13 @@ int run_pipeline(PipelineConfig cfg)
         int64_t v_start_pts = AV_NOPTS_VALUE;              // first input video pts
         int64_t last_output_pts = AV_NOPTS_VALUE;          // last emitted video pts in encoder tb
         AVRational output_time_base = out.venc->time_base; // encoder time base
+
+        // Baseline tracking for copied streams
+        int64_t a_start_pts_copied = AV_NOPTS_VALUE;       // first audio pts for copied streams
+        std::vector<int64_t> stream_start_pts(in.fmt->nb_streams, AV_NOPTS_VALUE); // per-stream baselines
+
+        // Global baseline approach: use the very first packet timestamp as baseline
+        int64_t global_baseline_pts_us = AV_NOPTS_VALUE;  // first packet timestamp in microseconds
 
         const uint8_t *rtx_data = nullptr;
         uint32_t rtxW = 0, rtxH = 0;
@@ -1694,36 +1790,19 @@ int run_pipeline(PipelineConfig cfg)
             fflush(stderr);
         };
 
-        // Single processor instance; choose CPU or GPU at initialization and stick with it
+        // Stage 11: Initialize RTX processor
         RTXProcessor rtx;
         bool rtx_init = false;
+        initialize_rtx_processor(rtx, rtx_init, use_cuda_path, cfg, in);
 
-        // Initialize the chosen processing path (GPU or CPU) once
-        if (use_cuda_path)
-        {
-            AVHWDeviceContext *devctx = (AVHWDeviceContext *)in.hw_device_ctx->data;
-            AVCUDADeviceContext *cudactx = (AVCUDADeviceContext *)devctx->hwctx;
-            CUcontext cu = cudactx->cuda_ctx;
-            if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height))
-            {
-                std::string detail = rtx.lastError();
-                if (detail.empty())
-                    detail = "unknown error";
-                throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
-            }
-            rtx_init = true;
+        // Update audio PTS alignment after we've established the baseline approach
+        if (out.audioConfig.enabled && in.seek_offset_us > 0) {
+            // Re-initialize audio PTS to align with video baseline once we know the strategy
+            init_audio_pts_after_seek(in, out, global_baseline_pts_us);
         }
-        else
-        {
-            if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height))
-            {
-                std::string detail = rtx.lastError();
-                if (detail.empty())
-                    detail = "unknown error";
-                throw std::runtime_error(std::string("Failed to initialize RTX CPU path: ") + detail);
-            }
-            rtx_init = true;
-        }
+
+        // Calculate whether output should be HDR
+        bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
 
         // Build a processor abstraction for the loop
         std::unique_ptr<IProcessor> processor;
@@ -1742,20 +1821,36 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         // Read packets
-        fprintf(stderr, "DEBUG: Starting frame processing loop...\n");
-        fprintf(stderr, "DEBUG: Video stream index: %d, Audio stream index: %d\n", in.vstream, in.astream);
-        fprintf(stderr, "DEBUG: Audio config enabled: %s\n", out.audioConfig.enabled ? "true" : "false");
+        LOG_DEBUG("Starting frame processing loop...");
+        LOG_DEBUG("Video stream index: %d, Audio stream index: %d", in.vstream, in.astream);
+        LOG_DEBUG("Audio config enabled: %s", out.audioConfig.enabled ? "true" : "false");
+        printf("SEEK DEBUG: Starting processing with seek_offset_us = %lld (%.3fs)\n", in.seek_offset_us, in.seek_offset_us / 1000000.0);
         int packet_count = 0;
+        bool audio_pts_aligned = false;  // Track if we've aligned audio PTS with video baseline
         while (true)
         {
             int ret = av_read_frame(in.fmt, pkt.get());
             if (ret == AVERROR_EOF)
             {
-                fprintf(stderr, "DEBUG: Reached end of file after %d packets\n", packet_count);
                 break;
             }
             ff_check(ret, "read frame");
             packet_count++;
+
+            // Establish global baseline from the first VIDEO packet when seeking to ensure A/V sync
+            if (in.seek_offset_us > 0 && global_baseline_pts_us == AV_NOPTS_VALUE &&
+                pkt->stream_index == in.vstream && pkt->pts != AV_NOPTS_VALUE) {
+                AVStream *stream = in.fmt->streams[pkt->stream_index];
+                global_baseline_pts_us = av_rescale_q(pkt->pts, stream->time_base, {1, AV_TIME_BASE});
+                printf("SEEK DEBUG: Established global baseline from VIDEO stream %d: %lld (%.3fs)\n",
+                       pkt->stream_index, pkt->pts, global_baseline_pts_us / 1000000.0);
+
+                // Align audio PTS with the newly established video baseline
+                if (out.audioConfig.enabled && !audio_pts_aligned) {
+                    init_audio_pts_after_seek(in, out, global_baseline_pts_us);
+                    audio_pts_aligned = true;
+                }
+            }
 
             // Process packets by type
             if (pkt->stream_index == in.vstream)
@@ -1786,7 +1881,19 @@ int run_pipeline(PipelineConfig cfg)
                     int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
                                          ? decframe->pts
                                          : decframe->best_effort_timestamp;
-                    int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base);
+                    // Use global baseline approach for video PTS if seeking
+                    int64_t output_pts;
+                    if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
+                        // Use global baseline for consistent A/V sync
+                        int64_t video_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
+                        int64_t adjusted_video_pts = derive_global_baseline_pts(video_pts, global_baseline_pts_us, in.vst->time_base);
+                        output_pts = av_rescale_q(adjusted_video_pts, in.vst->time_base, out.venc->time_base);
+                        printf("SEEK DEBUG: Video frame original PTS: %lld, adjusted: %lld, output: %lld\n",
+                               video_pts, adjusted_video_pts, output_pts);
+                    } else {
+                        // Use existing logic for non-seeking case
+                        output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base, in.seek_offset_us);
+                    }
                     // Ensure strict monotonicity to satisfy encoder/muxer
                     if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
                         output_pts = last_output_pts + 1;
@@ -1853,10 +1960,23 @@ int run_pipeline(PipelineConfig cfg)
                 {
                     // Fallback: copy audio packet without re-encoding
                     int out_index = out.map_streams[pkt->stream_index];
+
+
                     if (out_index >= 0)
                     {
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
+
+                        // Use global baseline for audio copy
+                        if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
+                            int64_t adjusted_pts = derive_global_baseline_pts(pkt->pts, global_baseline_pts_us, ist->time_base);
+                            pkt->pts = adjusted_pts;
+                            if (pkt->dts != AV_NOPTS_VALUE) {
+                                int64_t adjusted_dts = derive_global_baseline_pts(pkt->dts, global_baseline_pts_us, ist->time_base);
+                                pkt->dts = adjusted_dts;
+                            }
+                        }
+
                         av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
                         pkt->stream_index = out_index;
                         ff_check(av_interleaved_write_frame(out.fmt, pkt.get()), "write copied audio packet");
@@ -1868,10 +1988,23 @@ int run_pipeline(PipelineConfig cfg)
             {
                 // Copy other streams
                 int out_index = out.map_streams[pkt->stream_index];
+
+
                 if (out_index >= 0)
                 {
                     AVStream *ist = in.fmt->streams[pkt->stream_index];
                     AVStream *ost = out.fmt->streams[out_index];
+
+                    // Use unified PTS derivation for other streams
+                    int64_t adjusted_pts = derive_copied_stream_pts(stream_start_pts[pkt->stream_index], pkt->pts, in.seek_offset_us, ist->time_base);
+                    if (adjusted_pts != AV_NOPTS_VALUE) {
+                        pkt->pts = adjusted_pts;
+                        if (pkt->dts != AV_NOPTS_VALUE) {
+                            int64_t adjusted_dts = derive_copied_stream_pts(stream_start_pts[pkt->stream_index], pkt->dts, in.seek_offset_us, ist->time_base);
+                            pkt->dts = adjusted_dts;
+                        }
+                    }
+
                     av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
                     pkt->stream_index = out_index;
                     ff_check(av_interleaved_write_frame(out.fmt, pkt.get()), "write copied packet");
@@ -1881,7 +2014,7 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         // Flush encoder
-        fprintf(stderr, "DEBUG: Finished processing all frames, flushing encoder...\n");
+        LOG_DEBUG("Finished processing all frames, flushing encoder...");
         ff_check(avcodec_send_frame(out.venc, nullptr), "send flush");
         while (true)
         {
@@ -1898,7 +2031,7 @@ int run_pipeline(PipelineConfig cfg)
         // Flush audio encoder if enabled
         if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)
         {
-            fprintf(stderr, "DEBUG: Flushing audio encoder...\n");
+            LOG_DEBUG("Flushing audio encoder...");
             ff_check(avcodec_send_frame(out.aenc, nullptr), "send audio flush");
             while (true)
             {
@@ -1913,9 +2046,7 @@ int run_pipeline(PipelineConfig cfg)
             }
         }
 
-        fprintf(stderr, "DEBUG: Writing format trailer...\n");
         ff_check(av_write_trailer(out.fmt), "write trailer");
-        fprintf(stderr, "DEBUG: Format trailer written successfully - HLS playlist should be generated now\n");
 
         // Print final progress
         if (total_frames > 0)
