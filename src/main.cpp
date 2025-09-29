@@ -28,10 +28,13 @@
 
 extern "C"
 {
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-#include <libavcodec/packet.h>
 #include <libavutil/avutil.h>
+#include <libavutil/error.h>
+#include <libavcodec/packet.h>
 #include <libavutil/common.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
@@ -51,6 +54,7 @@ extern "C"
 #include "ts_utils.h"
 #include "processor.h"
 #include "logger.h"
+#include "audio_config.h"
 
 // RAII deleters for FFmpeg types that require ** double-pointer frees
 static inline void av_frame_free_single(AVFrame *f)
@@ -469,6 +473,15 @@ struct PipelineConfig
     std::string hlsSegmentFilename;
     std::string hlsPlaylistType;
     int hlsListSize = -1;
+
+    // Stream mapping options
+    std::vector<std::string> streamMaps;
+
+    // Audio codec options
+    std::string audioCodec;
+    int audioChannels = -1;
+    int audioBitrate = -1;
+    std::string audioFilter;
 };
 
 static char *extract_ffmpeg_file_path(char *value)
@@ -774,6 +787,72 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "-map")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-map requires an argument\n");
+                exit(1);
+            }
+            cfg->streamMaps.push_back(argv[++i]);
+        }
+        else if (arg.substr(0, 7) == "-codec:")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "%s requires an argument\n", arg.c_str());
+                exit(1);
+            }
+            if (arg == "-codec:a:0" || arg == "-c:a:0")
+            {
+                cfg->audioCodec = argv[++i];
+            }
+        }
+        else if (arg == "-ac")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-ac requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->audioChannels = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -ac: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-ab")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-ab requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->audioBitrate = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -ab: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-af")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-af requires an argument\n");
+                exit(1);
+            }
+            cfg->audioFilter = argv[++i];
+        }
         if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv"))
         {
             cfg->outputPath = argv[i];
@@ -804,7 +883,7 @@ static void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP, default 1\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
-    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 5\n");
+    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
     fprintf(stderr, "  -hls_time <seconds>            Set target segment duration (default 4)\n");
     fprintf(stderr, "  -hls_segment_type <mpegts|fmp4> Select segment container (default fmp4)\n");
@@ -829,7 +908,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     cfg->rtxCfg.vsrQuality = 4;
 
     // Default THDR settings
-    cfg->rtxCfg.enableTHDR = true;
+    cfg->rtxCfg.enableTHDR = false;
     cfg->rtxCfg.thdrContrast = 115;
     cfg->rtxCfg.thdrSaturation = 75;
     cfg->rtxCfg.thdrMiddleGray = 30;
@@ -837,13 +916,13 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
 
     // Default NVENC settings
     cfg->tune = "hq";
-    cfg->preset = "p7";
+    cfg->preset = "p4";
     cfg->rc = "constqp";
 
     cfg->gop = 1;
     cfg->bframes = 2;
     cfg->qp = 21;
-    cfg->targetBitrateMultiplier = 5;
+    cfg->targetBitrateMultiplier = 2;
 
     int i = 1;
     // if input path does not end with mp4 or mkv, use alternate arg method
@@ -1200,6 +1279,7 @@ int run_pipeline(PipelineConfig cfg)
                 LOG_INFO("Input content is HDR (transfer characteristic: %s). Disabling THDR to preserve HDR metadata.",
                          in.vst->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ/HDR10" : "HLG");
                 cfg.rtxCfg.enableTHDR = false;
+                cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier * 0.8; // 10bits -> 8bits, 20% less bitrate
             }
 
             // Reopen input with P010 preference for HDR content to enable full 10-bit pipeline
@@ -1209,8 +1289,64 @@ int run_pipeline(PipelineConfig cfg)
             LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
         }
 
+        // Auto-disable VSR for inputs >= 1920x1080 in either orientation
+        if (cfg.rtxCfg.enableVSR)
+        {
+            bool ge1080p = (in.vdec->width > 1920 && in.vdec->height > 1080) ||
+                           (in.vdec->width > 1080 && in.vdec->height > 1920);
+            if (ge1080p)
+            {
+                LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
+                cfg.rtxCfg.enableVSR = false;
+                cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier / 2.0; // approx. 2x less bitrate
+            }
+        }
+
+        fprintf(stderr, "DEBUG: Finalizing HLS options...\n");
         finalize_hls_options(&cfg, &out);
+
+        fprintf(stderr, "DEBUG: Opening output...\n");
         open_output(cfg.outputPath, in, out);
+
+        fprintf(stderr, "DEBUG: Output opened successfully\n");
+
+        // Configure audio processing if compatibility mode is enabled
+        if (cfg.ffCompatible) {
+            fprintf(stderr, "DEBUG: Compatibility mode enabled, configuring audio...\n");
+
+            // Create AudioParameters from PipelineConfig to avoid struct duplication issues
+            AudioParameters audioParams;
+            audioParams.codec = cfg.audioCodec;
+            audioParams.channels = cfg.audioChannels;
+            audioParams.bitrate = cfg.audioBitrate;
+            audioParams.filter = cfg.audioFilter;
+            audioParams.streamMaps = cfg.streamMaps;
+
+            configure_audio_from_params(audioParams, out);
+            fprintf(stderr, "DEBUG: Audio config completed, enabled=%s\n", out.audioConfig.enabled ? "true" : "false");
+
+            if (out.audioConfig.enabled) {
+                fprintf(stderr, "DEBUG: Applying stream mappings...\n");
+                apply_stream_mappings(cfg.streamMaps, in, out);
+
+                fprintf(stderr, "DEBUG: Setting up audio encoder...\n");
+                if (!setup_audio_encoder(in, out)) {
+                    LOG_WARN("Failed to setup audio encoder, disabling audio processing");
+                    out.audioConfig.enabled = false;
+                } else {
+                    fprintf(stderr, "DEBUG: Audio encoder setup complete\n");
+                    fprintf(stderr, "DEBUG: Setting up audio filter...\n");
+                    if (!setup_audio_filter(in, out)) {
+                        LOG_WARN("Failed to setup audio filter, continuing without filtering");
+                        // Don't disable audio processing, just filtering
+                    } else {
+                        fprintf(stderr, "DEBUG: Audio filter setup complete\n");
+                    }
+                }
+            }
+        }
+
+        fprintf(stderr, "DEBUG: Audio configuration complete, proceeding...\n");
 
         const bool hls_enabled = out.hlsOptions.enabled;
         const bool hls_segments_are_fmp4 = hls_enabled && lowercase_copy(out.hlsOptions.segmentType) == "fmp4";
@@ -1258,17 +1394,6 @@ int run_pipeline(PipelineConfig cfg)
 
         // A2R10G10B10 -> P010 for NVENC
         // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
-        // Auto-disable VSR for inputs >= 1920x1080 in either orientation
-        if (cfg.rtxCfg.enableVSR)
-        {
-            bool ge1080p = (in.vdec->width > 1920 && in.vdec->height > 1080) ||
-                           (in.vdec->width > 1080 && in.vdec->height > 1920);
-            if (ge1080p)
-            {
-                LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
-                cfg.rtxCfg.enableVSR = false;
-            }
-        }
         int effScale = cfg.rtxCfg.enableVSR ? cfg.rtxCfg.scaleFactor : 1;
         int dstW = in.vdec->width * effScale;
         int dstH = in.vdec->height * effScale;
@@ -1291,6 +1416,7 @@ int run_pipeline(PipelineConfig cfg)
 
         // Configure encoder now that sizes are known
         LOG_DEBUG("Configuring HEVC encoder...");
+        fprintf(stderr, "DEBUG: Setting codec_id...\n");
         out.venc->codec_id = AV_CODEC_ID_HEVC;
         out.venc->width = dstW;
         out.venc->height = dstH;
@@ -1344,9 +1470,9 @@ int run_pipeline(PipelineConfig cfg)
                     cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
         av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
         av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
-        // Switch to constant QP rate control
         av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
         av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
+        av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
         // Set HEVC profile based on HDR output: use Main10 for HDR, Main for SDR
         if (outputHDR) {
             av_opt_set(out.venc->priv_data, "profile", "main10", 0);
@@ -1461,6 +1587,10 @@ int run_pipeline(PipelineConfig cfg)
         if (!hls_enabled && mux_is_isobmff)
         {
             av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
+        }
+        else
+        {
+            av_dict_set(&muxopts, "movflags", "+frag_keyframe+faststart+write_colr", 0);
         }
         ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
         if (muxopts)
@@ -1613,6 +1743,8 @@ int run_pipeline(PipelineConfig cfg)
 
         // Read packets
         fprintf(stderr, "DEBUG: Starting frame processing loop...\n");
+        fprintf(stderr, "DEBUG: Video stream index: %d, Audio stream index: %d\n", in.vstream, in.astream);
+        fprintf(stderr, "DEBUG: Audio config enabled: %s\n", out.audioConfig.enabled ? "true" : "false");
         int packet_count = 0;
         while (true)
         {
@@ -1625,7 +1757,7 @@ int run_pipeline(PipelineConfig cfg)
             ff_check(ret, "read frame");
             packet_count++;
 
-            // Skip non-video packets
+            // Process packets by type
             if (pkt->stream_index == in.vstream)
             {
                 ff_check(avcodec_send_packet(in.vdec, pkt.get()), "send packet");
@@ -1650,17 +1782,16 @@ int run_pipeline(PipelineConfig cfg)
                         decframe = swframe.get();
                         frame_is_cuda = false;
                     }
-
                     // Compute output PTS by rescaling input timestamps to encoder time base
                     int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
                                          ? decframe->pts
                                          : decframe->best_effort_timestamp;
                     int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base);
                     // Ensure strict monotonicity to satisfy encoder/muxer
-                    // if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
-                    //     output_pts = last_output_pts + 1;
-                    // }
-                    // last_output_pts = output_pts;
+                    if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
+                        output_pts = last_output_pts + 1;
+                    }
+                    last_output_pts = output_pts;
 
                     // Use unified processor
                     AVFrame *outFrame = nullptr;
@@ -1686,6 +1817,51 @@ int run_pipeline(PipelineConfig cfg)
                     av_frame_unref(frame.get());
                     if (swframe)
                         av_frame_unref(swframe.get());
+                }
+            }
+            else if (cfg.ffCompatible && out.audioConfig.enabled && in.astream >= 0 && pkt->stream_index == in.astream)
+            {
+                // Process audio packets when audio encoding is enabled
+                if (in.adec && out.aenc)
+                {
+                    ff_check(avcodec_send_packet(in.adec, pkt.get()), "send audio packet");
+                    av_packet_unref(pkt.get());
+
+                    FramePtr audio_frame(av_frame_alloc(), &av_frame_free_single);
+                    while (true)
+                    {
+                        int ret = avcodec_receive_frame(in.adec, audio_frame.get());
+                        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                            break;
+                        ff_check(ret, "receive audio frame");
+
+                        // Use the new helper function to process audio
+                        if (process_audio_frame(audio_frame.get(), out, opkt.get()))
+                        {
+                            // If we got a packet, write it
+                            if (opkt->data)
+                            {
+                                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet");
+                                av_packet_unref(opkt.get());
+                            }
+                        }
+
+                        av_frame_unref(audio_frame.get());
+                    }
+                }
+                else
+                {
+                    // Fallback: copy audio packet without re-encoding
+                    int out_index = out.map_streams[pkt->stream_index];
+                    if (out_index >= 0)
+                    {
+                        AVStream *ist = in.fmt->streams[pkt->stream_index];
+                        AVStream *ost = out.fmt->streams[out_index];
+                        av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
+                        pkt->stream_index = out_index;
+                        ff_check(av_interleaved_write_frame(out.fmt, pkt.get()), "write copied audio packet");
+                    }
+                    av_packet_unref(pkt.get());
                 }
             }
             else
@@ -1717,6 +1893,24 @@ int run_pipeline(PipelineConfig cfg)
             av_packet_rescale_ts(opkt.get(), out.venc->time_base, out.vstream->time_base);
             ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write packet flush");
             av_packet_unref(opkt.get());
+        }
+
+        // Flush audio encoder if enabled
+        if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)
+        {
+            fprintf(stderr, "DEBUG: Flushing audio encoder...\n");
+            ff_check(avcodec_send_frame(out.aenc, nullptr), "send audio flush");
+            while (true)
+            {
+                int ret = avcodec_receive_packet(out.aenc, opkt.get());
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                    break;
+                ff_check(ret, "receive audio packet flush");
+                opkt->stream_index = out.astream->index;
+                av_packet_rescale_ts(opkt.get(), out.aenc->time_base, out.astream->time_base);
+                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet flush");
+                av_packet_unref(opkt.get());
+            }
         }
 
         fprintf(stderr, "DEBUG: Writing format trailer...\n");

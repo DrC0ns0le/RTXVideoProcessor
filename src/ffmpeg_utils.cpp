@@ -1,5 +1,6 @@
 #include "ffmpeg_utils.h"
 #include "logger.h"
+#include "audio_config.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -7,7 +8,12 @@
 extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 }
+
+// Use AudioParameters from audio_config.h to avoid struct duplication issues
 
 static AVPixelFormat get_cuda_hw_format(AVCodecContext *, const AVPixelFormat *pix_fmts);
 static AVPixelFormat get_cuda_sw_format(AVCodecContext *ctx, const AVPixelFormat *pix_fmts);
@@ -97,6 +103,33 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         ff_check(avcodec_open2(in.vdec, decoder, nullptr), "open decoder");
     }
 
+    // Find and set up audio stream if available
+    int astream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (astream >= 0)
+    {
+        in.astream = astream;
+        in.ast = in.fmt->streams[astream];
+
+        const AVCodec *audio_decoder = avcodec_find_decoder(in.ast->codecpar->codec_id);
+        if (audio_decoder)
+        {
+            in.adec = avcodec_alloc_context3(audio_decoder);
+            if (in.adec)
+            {
+                ff_check(avcodec_parameters_to_context(in.adec, in.ast->codecpar), "copy audio decoder parameters");
+                in.adec->pkt_timebase = in.ast->time_base;
+
+                err = avcodec_open2(in.adec, audio_decoder, nullptr);
+                if (err < 0)
+                {
+                    LOG_WARN("Failed to open audio decoder, audio will be copied without re-encoding");
+                    avcodec_free_context(&in.adec);
+                    in.adec = nullptr;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -106,6 +139,12 @@ void close_input(InputContext &in)
     {
         avcodec_free_context(&in.vdec);
         in.vdec = nullptr;
+    }
+
+    if (in.adec)
+    {
+        avcodec_free_context(&in.adec);
+        in.adec = nullptr;
     }
 
     if (in.hw_device_ctx)
@@ -122,6 +161,8 @@ void close_input(InputContext &in)
 
     in.vstream = -1;
     in.vst = nullptr;
+    in.astream = -1;
+    in.ast = nullptr;
 }
 
 bool open_output(const char *outPath, const InputContext &in, OutputContext &out)
@@ -314,6 +355,32 @@ void close_output(OutputContext &out)
         out.venc = nullptr;
     }
 
+    if (out.aenc)
+    {
+        avcodec_free_context(&out.aenc);
+        out.aenc = nullptr;
+    }
+
+    if (out.filter_graph)
+    {
+        avfilter_graph_free(&out.filter_graph);
+        out.filter_graph = nullptr;
+        out.buffersrc_ctx = nullptr;
+        out.buffersink_ctx = nullptr;
+    }
+
+    if (out.swr_ctx)
+    {
+        swr_free(&out.swr_ctx);
+        out.swr_ctx = nullptr;
+    }
+
+    if (out.audio_fifo)
+    {
+        av_audio_fifo_free(out.audio_fifo);
+        out.audio_fifo = nullptr;
+    }
+
     if (out.fmt)
     {
         if (!(out.fmt->oformat->flags & AVFMT_NOFILE) && out.fmt->pb)
@@ -323,7 +390,9 @@ void close_output(OutputContext &out)
     }
 
     out.vstream = nullptr;
+    out.astream = nullptr;
     out.map_streams.clear();
+    out.streamMappings.clear();
 }
 
 static AVPixelFormat get_cuda_sw_format(AVCodecContext *ctx, const AVPixelFormat *pix_fmts)
@@ -397,4 +466,516 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
         cll->MaxCLL = max_luminance;
         cll->MaxFALL = std::max(kMinNit, max_luminance / 2);
     }
+}
+
+void configure_audio_from_params(const AudioParameters &params, OutputContext &out)
+{
+    // Configure audio settings from parsed parameters
+    out.audioConfig.codec = params.codec;
+    out.audioConfig.channels = params.channels;
+    out.audioConfig.bitrate = params.bitrate;
+    out.audioConfig.filter = params.filter;
+
+    // Only enable audio processing if there are actual audio parameters specified
+    bool hasAudioParams = !params.codec.empty() || params.channels > 0 || params.bitrate > 0 || !params.filter.empty();
+
+    // Check if stream mappings include audio (0:1) or explicitly request audio processing
+    bool hasAudioMapping = false;
+    for (const auto& mapping : params.streamMaps) {
+        if (mapping == "0:1" || mapping.find(":a") != std::string::npos) {
+            hasAudioMapping = true;
+            break;
+        }
+    }
+
+    out.audioConfig.enabled = hasAudioParams || hasAudioMapping;
+
+    // Temporary override: disable audio processing entirely
+    out.audioConfig.enabled = false;
+
+    out.streamMappings = params.streamMaps;
+
+    if (out.audioConfig.enabled) {
+        LOG_INFO("Audio processing enabled with codec=%s, channels=%d, bitrate=%d, filter=%s",
+                 params.codec.c_str(), params.channels, params.bitrate, params.filter.c_str());
+    }
+}
+
+bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out)
+{
+    if (mappings.empty()) {
+        return true; // No custom mappings, use default behavior
+    }
+
+    // Parse stream mappings like "0:0", "0:1", "-0:s"
+    for (const std::string &mapping : mappings) {
+        if (mapping.empty()) continue;
+
+        bool exclude = (mapping[0] == '-');
+        std::string cleanMapping = exclude ? mapping.substr(1) : mapping;
+
+        // Parse format: stream_index:stream_type or just stream_index
+        size_t colonPos = cleanMapping.find(':');
+        if (colonPos == std::string::npos) {
+            LOG_WARN("Invalid stream mapping format: %s", mapping.c_str());
+            continue;
+        }
+
+        std::string streamIdx = cleanMapping.substr(0, colonPos);
+        std::string streamType = cleanMapping.substr(colonPos + 1);
+
+        // For now, handle basic cases: 0:0 (first video), 0:1 (first audio), 0:s (subtitles)
+        if (streamIdx != "0") {
+            LOG_WARN("Only input 0 is supported in stream mappings, got: %s", streamIdx.c_str());
+            continue;
+        }
+
+        if (exclude) {
+            if (streamType == "s") {
+                // Exclude subtitles - this is handled in the main loop
+                LOG_INFO("Excluding subtitle streams as requested");
+            }
+        } else {
+            // Include specific streams - mark them for processing
+            if (streamType == "0") {
+                // First stream (usually video) - already handled
+            } else if (streamType == "1") {
+                // Second stream (usually audio) - ensure it's included
+                out.audioConfig.enabled = true;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool setup_audio_encoder(const InputContext &in, OutputContext &out)
+{
+    if (!out.audioConfig.enabled) {
+        return true; // No audio processing needed
+    }
+
+    // Check if we have a valid input context
+    if (!in.fmt) {
+        LOG_WARN("Invalid input format context for audio setup");
+        return false;
+    }
+
+    // Find audio stream in input
+    int audio_stream_idx = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audio_stream_idx < 0) {
+        LOG_WARN("No audio stream found in input for audio encoding");
+        return false;
+    }
+
+    // Validate that we have a valid audio stream
+    if (audio_stream_idx >= (int)in.fmt->nb_streams || !in.fmt->streams[audio_stream_idx]) {
+        LOG_WARN("Invalid audio stream index: %d", audio_stream_idx);
+        return false;
+    }
+
+    // Set up audio codec
+    std::string codec = out.audioConfig.codec.empty() ? "aac" : out.audioConfig.codec;
+    const AVCodec *audio_encoder = avcodec_find_encoder_by_name(codec.c_str());
+    if (!audio_encoder) {
+        audio_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    }
+    if (!audio_encoder) {
+        LOG_WARN("Failed to find audio encoder: %s", codec.c_str());
+        return false;
+    }
+
+    out.aenc = avcodec_alloc_context3(audio_encoder);
+    if (!out.aenc) {
+        LOG_WARN("Failed to allocate audio encoder context");
+        return false;
+    }
+
+    // Configure audio encoder with new channel layout API
+    AVStream *input_audio = in.fmt->streams[audio_stream_idx];
+    out.aenc->codec_id = audio_encoder->id;
+    out.aenc->codec_type = AVMEDIA_TYPE_AUDIO;
+    out.aenc->sample_rate = input_audio->codecpar->sample_rate;
+    
+    // Use new AVChannelLayout API instead of deprecated channels/channel_layout
+    if (out.audioConfig.channels > 0) {
+        av_channel_layout_default(&out.aenc->ch_layout, out.audioConfig.channels);
+    } else {
+        // Copy the channel layout from input
+        int ret = av_channel_layout_copy(&out.aenc->ch_layout, &input_audio->codecpar->ch_layout);
+        if (ret < 0) {
+            LOG_WARN("Failed to copy channel layout from input");
+            return false;
+        }
+    }
+    
+    out.aenc->bit_rate = (out.audioConfig.bitrate > 0) ? out.audioConfig.bitrate : 128000;
+    out.aenc->time_base = {1, out.aenc->sample_rate};
+
+    // Set sample format
+    if (audio_encoder->sample_fmts) {
+        out.aenc->sample_fmt = audio_encoder->sample_fmts[0];
+    } else {
+        out.aenc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    }
+
+    // Set frame size if encoder requires it
+    if (audio_encoder->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) {
+        out.aenc->frame_size = 0; // Variable frame size
+    } else {
+        // For AAC, frame size is typically 1024 samples
+        out.aenc->frame_size = 1024;
+    }
+
+    // Create output audio stream
+    out.astream = avformat_new_stream(out.fmt, nullptr);
+    if (!out.astream) {
+        LOG_WARN("Failed to create output audio stream");
+        return false;
+    }
+
+    // Open encoder
+    int ret = avcodec_open2(out.aenc, audio_encoder, nullptr);
+    if (ret < 0) {
+        LOG_WARN("Failed to open audio encoder");
+        return false;
+    }
+
+    // Copy encoder parameters to stream
+    ret = avcodec_parameters_from_context(out.astream->codecpar, out.aenc);
+    if (ret < 0) {
+        LOG_WARN("Failed to copy audio encoder parameters to stream");
+        return false;
+    }
+
+    out.astream->time_base = out.aenc->time_base;
+
+    // Set up audio resampler for format conversion
+    out.swr_ctx = swr_alloc();
+    if (!out.swr_ctx) {
+        LOG_WARN("Failed to allocate resampler context");
+        return false;
+    }
+
+    // Configure resampler from input to encoder format
+    av_opt_set_chlayout(out.swr_ctx, "in_chlayout", &input_audio->codecpar->ch_layout, 0);
+    av_opt_set_int(out.swr_ctx, "in_sample_rate", input_audio->codecpar->sample_rate, 0);
+    av_opt_set_sample_fmt(out.swr_ctx, "in_sample_fmt", (AVSampleFormat)input_audio->codecpar->format, 0);
+
+    av_opt_set_chlayout(out.swr_ctx, "out_chlayout", &out.aenc->ch_layout, 0);
+    av_opt_set_int(out.swr_ctx, "out_sample_rate", out.aenc->sample_rate, 0);
+    av_opt_set_sample_fmt(out.swr_ctx, "out_sample_fmt", out.aenc->sample_fmt, 0);
+
+    ret = swr_init(out.swr_ctx);
+    if (ret < 0) {
+        LOG_WARN("Failed to initialize resampler");
+        swr_free(&out.swr_ctx);
+        return false;
+    }
+
+    // Create audio FIFO for buffering samples to create fixed-size frames
+    out.audio_fifo = av_audio_fifo_alloc(out.aenc->sample_fmt, out.aenc->ch_layout.nb_channels, out.aenc->frame_size * 2);
+    if (!out.audio_fifo) {
+        LOG_WARN("Failed to allocate audio FIFO");
+        swr_free(&out.swr_ctx);
+        return false;
+    }
+
+    return true;
+}
+
+bool setup_audio_filter(const InputContext &in, OutputContext &out)
+{
+    if (!out.audioConfig.enabled || out.audioConfig.filter.empty() || !out.aenc || in.astream < 0) {
+        return true; // No filtering needed
+    }
+
+    // Additional validation
+    if (!in.fmt || in.astream >= (int)in.fmt->nb_streams || !in.fmt->streams[in.astream]) {
+        LOG_WARN("Invalid audio stream for filter setup");
+        return false;
+    }
+
+    int ret;
+    char args[512];
+    char ch_layout_str[128];
+    const AVFilter *abuffersrc = avfilter_get_by_name("abuffer");
+    const AVFilter *abuffersink = avfilter_get_by_name("abuffersink");
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+
+    if (!outputs || !inputs || !abuffersrc || !abuffersink) {
+        LOG_WARN("Failed to allocate audio filter components");
+        return false;
+    }
+
+    out.filter_graph = avfilter_graph_alloc();
+    if (!out.filter_graph) {
+        LOG_WARN("Failed to allocate audio filter graph");
+        avfilter_inout_free(&inputs);
+        avfilter_inout_free(&outputs);
+        return false;
+    }
+
+    // Create buffer source with new channel layout API
+    AVStream *input_audio = in.fmt->streams[in.astream];
+    
+    // Get channel layout description for the input
+    av_channel_layout_describe(&input_audio->codecpar->ch_layout, ch_layout_str, sizeof(ch_layout_str));
+    
+    snprintf(args, sizeof(args),
+             "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
+             input_audio->time_base.num, input_audio->time_base.den,
+             input_audio->codecpar->sample_rate,
+             av_get_sample_fmt_name((AVSampleFormat)input_audio->codecpar->format),
+             ch_layout_str);
+
+    ret = avfilter_graph_create_filter(&out.buffersrc_ctx, abuffersrc, "in",
+                                       args, nullptr, out.filter_graph);
+    if (ret < 0) {
+        LOG_WARN("Failed to create audio buffer source");
+        goto cleanup;
+    }
+
+    // Create buffer sink
+    ret = avfilter_graph_create_filter(&out.buffersink_ctx, abuffersink, "out",
+                                       nullptr, nullptr, out.filter_graph);
+    if (ret < 0) {
+        LOG_WARN("Failed to create audio buffer sink");
+        goto cleanup;
+    }
+
+    // Note: Setting format constraints on buffersink is optional for most cases
+    // The encoder will handle format conversion if needed
+
+    // Set up the filter chain
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = out.buffersrc_ctx;
+    outputs->pad_idx = 0;
+    outputs->next = nullptr;
+
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = out.buffersink_ctx;
+    inputs->pad_idx = 0;
+    inputs->next = nullptr;
+
+    // Parse and configure the filter graph
+    ret = avfilter_graph_parse_ptr(out.filter_graph, out.audioConfig.filter.c_str(),
+                                   &inputs, &outputs, nullptr);
+    if (ret < 0) {
+        LOG_WARN("Failed to parse audio filter graph: %s", out.audioConfig.filter.c_str());
+        goto cleanup;
+    }
+
+    ret = avfilter_graph_config(out.filter_graph, nullptr);
+    if (ret < 0) {
+        LOG_WARN("Failed to configure audio filter graph");
+        goto cleanup;
+    }
+
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    return true;
+
+cleanup:
+    if (out.filter_graph) {
+        avfilter_graph_free(&out.filter_graph);
+        out.filter_graph = nullptr;
+    }
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    return false;
+}
+
+bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet)
+{
+    if (!input_frame || !out.aenc || !output_packet) {
+        return false;
+    }
+
+    int ret;
+    AVFrame *processed_frame = input_frame;
+
+    // Apply audio filter if configured
+    if (out.filter_graph && out.buffersrc_ctx && out.buffersink_ctx)
+    {
+        // Send frame to filter
+        ret = av_buffersrc_add_frame_flags(out.buffersrc_ctx, input_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, sizeof(errbuf), ret);
+            LOG_WARN("Failed to send frame to audio filter: %s", errbuf);
+            return false;
+        }
+
+        // Get filtered frame
+        AVFrame *filtered_frame = av_frame_alloc();
+        if (!filtered_frame) {
+            LOG_WARN("Failed to allocate filtered frame");
+            return false;
+        }
+
+        ret = av_buffersink_get_frame_flags(out.buffersink_ctx, filtered_frame, 0);
+        if (ret >= 0) {
+            processed_frame = filtered_frame;
+        } else if (ret == AVERROR(EAGAIN)) {
+            // No frame available yet, this is normal for filters that buffer frames
+            av_frame_free(&filtered_frame);
+            return true;
+        } else if (ret == AVERROR_EOF) {
+            // End of stream reached
+            av_frame_free(&filtered_frame);
+            return false;
+        } else {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, sizeof(errbuf), ret);
+            LOG_WARN("Failed to get frame from audio filter: %s", errbuf);
+            av_frame_free(&filtered_frame);
+            return false;
+        }
+    }
+
+    // Resample frame to encoder format if resampler is available
+    AVFrame *resampled_frame = nullptr;
+    if (out.swr_ctx)
+    {
+        resampled_frame = av_frame_alloc();
+        if (!resampled_frame) {
+            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            return false;
+        }
+    
+
+        // Set up output frame properties
+        resampled_frame->format = out.aenc->sample_fmt;
+        av_channel_layout_copy(&resampled_frame->ch_layout, &out.aenc->ch_layout);
+        resampled_frame->sample_rate = out.aenc->sample_rate;
+
+        // Calculate output samples
+        int max_out_samples = swr_get_out_samples(out.swr_ctx, processed_frame->nb_samples);
+        resampled_frame->nb_samples = max_out_samples;
+
+        ret = av_frame_get_buffer(resampled_frame, 0);
+        if (ret < 0) {
+            LOG_WARN("Failed to allocate resampled frame buffer");
+            av_frame_free(&resampled_frame);
+            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            return false;
+        }
+
+        // Resample
+        int samples_out = swr_convert(out.swr_ctx,
+                                    resampled_frame->data, resampled_frame->nb_samples,
+                                    (const uint8_t**)processed_frame->data, processed_frame->nb_samples);
+        if (samples_out < 0) {
+            LOG_WARN("Failed to resample audio frame");
+            av_frame_free(&resampled_frame);
+            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            return false;
+        }
+
+        resampled_frame->nb_samples = samples_out;
+        resampled_frame->pts = processed_frame->pts;
+
+        // Clean up intermediate frame
+        if (processed_frame != input_frame) av_frame_free(&processed_frame);
+        processed_frame = resampled_frame;
+    }
+
+    // Add samples to FIFO
+    if (out.audio_fifo) {
+        ret = av_audio_fifo_write(out.audio_fifo, (void**)processed_frame->data, processed_frame->nb_samples);
+        if (ret < 0) {
+            LOG_WARN("Failed to write samples to audio FIFO");
+            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            return false;
+        }
+    }
+
+    // Clean up processed frame
+    if (processed_frame != input_frame) av_frame_free(&processed_frame);
+
+    // Try to encode frames while we have enough samples
+    while (out.audio_fifo && av_audio_fifo_size(out.audio_fifo) >= out.aenc->frame_size) {
+        AVFrame *encoder_frame = av_frame_alloc();
+        if (!encoder_frame) {
+            return false;
+        }
+
+        encoder_frame->format = out.aenc->sample_fmt;
+        av_channel_layout_copy(&encoder_frame->ch_layout, &out.aenc->ch_layout);
+        encoder_frame->sample_rate = out.aenc->sample_rate;
+        encoder_frame->nb_samples = out.aenc->frame_size;
+
+        ret = av_frame_get_buffer(encoder_frame, 0);
+        if (ret < 0) {
+            av_frame_free(&encoder_frame);
+            return false;
+        }
+
+        // Read samples from FIFO
+        ret = av_audio_fifo_read(out.audio_fifo, (void**)encoder_frame->data, out.aenc->frame_size);
+        if (ret < out.aenc->frame_size) {
+            av_frame_free(&encoder_frame);
+            break;
+        }
+
+        // Set proper timestamp for the encoder frame
+        encoder_frame->pts = out.next_audio_pts;
+
+        // Encode frame
+        ret = avcodec_send_frame(out.aenc, encoder_frame);
+        av_frame_free(&encoder_frame);
+
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, sizeof(errbuf), ret);
+            LOG_WARN("Failed to send frame to audio encoder: %s", errbuf);
+            return false;
+        }
+
+        // Get encoded packets
+        while (true) {
+            ret = avcodec_receive_packet(out.aenc, output_packet);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret < 0) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                av_make_error_string(errbuf, sizeof(errbuf), ret);
+                LOG_WARN("Failed to receive encoded audio packet: %s", errbuf);
+                return false;
+            }
+
+            // Packet is ready for writing
+            output_packet->stream_index = out.astream->index;
+
+            // Ensure timestamps are set properly
+            if (output_packet->pts == AV_NOPTS_VALUE) {
+                // Generate timestamps if encoder didn't set them
+                output_packet->pts = out.next_audio_pts;
+                output_packet->dts = out.next_audio_pts;
+            }
+
+            // Advance timestamp counter
+            out.next_audio_pts += out.aenc->frame_size;
+
+            av_packet_rescale_ts(output_packet, out.aenc->time_base, out.astream->time_base);
+            
+            // Ensure DTS monotonicity after rescaling
+            if (out.last_audio_dts != AV_NOPTS_VALUE && output_packet->dts <= out.last_audio_dts) {
+                output_packet->dts = out.last_audio_dts + 1;
+            }
+            
+            // Ensure PTS >= DTS (required by muxers)
+            if (output_packet->pts < output_packet->dts) {
+                output_packet->pts = output_packet->dts;
+            }
+            
+            out.last_audio_dts = output_packet->dts;
+            return true; // Packet ready
+        }
+    }
+
+    return true; // Successfully processed, but no packet ready yet
 }

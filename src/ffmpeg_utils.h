@@ -11,6 +11,7 @@ extern "C"
 #include <string>
 
 #include "pipeline_types.h"
+#include "audio_config.h"
 
 inline void ff_check(int err, const char *what)
 {
@@ -39,3 +40,10 @@ void close_input(InputContext &in);
 // Open output, create video encoder stream and map non-video streams.
 bool open_output(const char *outPath, const InputContext &in, OutputContext &out);
 void close_output(OutputContext &out);
+
+// Audio configuration functions
+void configure_audio_from_params(const AudioParameters &params, OutputContext &out);
+bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
+bool setup_audio_encoder(const InputContext &in, OutputContext &out);
+bool setup_audio_filter(const InputContext &in, OutputContext &out);
+bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet);
