@@ -57,9 +57,21 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         // Store the seek offset for A/V sync correction
         in.seek_offset_us = seek_target;
 
-        // Use AVSEEK_FLAG_ANY for fast seeking (equivalent to noaccurate_seek)
-        // This allows seeking to any frame, not just keyframes
-        ret = avformat_seek_file(in.fmt, -1, INT64_MIN, seek_target, INT64_MAX, AVSEEK_FLAG_ANY);
+        // Choose seeking strategy based on output format
+        int seek_flags;
+        if (options && options->keyframeSeekForHLS)
+        {
+            // For HLS output, use keyframe-precise seeking to ensure clean segment boundaries
+            seek_flags = AVSEEK_FLAG_BACKWARD;
+            LOG_DEBUG("Using keyframe-precise seeking for HLS output\n");
+        }
+        else
+        {
+            // Use AVSEEK_FLAG_ANY for fast seeking (equivalent to noaccurate_seek)
+            seek_flags = AVSEEK_FLAG_ANY;
+            LOG_DEBUG("Using fast seeking (any frame)\n");
+        }
+        ret = avformat_seek_file(in.fmt, -1, INT64_MIN, seek_target, INT64_MAX, seek_flags);
         if (ret < 0)
         {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -309,23 +321,15 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             LOG_DEBUG("Set hls_flags = %s\n", hlsFlags.c_str());
         }
 
-        // Fix for seek (-ss) timing issues: ensure proper segment timing when seeking
+        // Minimal HLS fix for seek issues - only add essential discontinuity marker
         if (in.seek_offset_us > 0)
         {
-            // Set start number source to segment to ensure proper timing continuity
-            av_dict_set(&muxOpts, "hls_start_number_source", "segment", 0);
-            LOG_DEBUG("Set hls_start_number_source = segment (seek offset detected)\n");
+            LOG_DEBUG("Seek offset detected (%lld us), marking HLS discontinuity\n", in.seek_offset_us);
 
-            // Calculate start number based on seek offset and segment duration
-            // This helps HLS players understand the proper segment sequence
-            double segment_duration = out.hlsOptions.segmentDuration > 0 ? out.hlsOptions.segmentDuration : 4.0;
-            int start_number = static_cast<int>(in.seek_offset_us / 1000000.0 / segment_duration);
-            if (start_number > 0)
-            {
-                std::string start_num_str = std::to_string(start_number);
-                av_dict_set(&muxOpts, "start_number", start_num_str.c_str(), 0);
-                LOG_DEBUG("Set start_number = %s (calculated from seek offset)\n", start_num_str.c_str());
-            }
+            // Add discont_start flag to mark the beginning as a discontinuity
+            // This tells HLS players that this is a new starting point
+            av_dict_set(&muxOpts, "hls_flags", "+discont_start", AV_DICT_APPEND);
+            LOG_DEBUG("Added discont_start to hls_flags for seek\n");
         }
 
         // Debug: Print all HLS options that will be passed to the muxer

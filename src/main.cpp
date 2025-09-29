@@ -518,6 +518,21 @@ static std::string lowercase_copy(std::string s)
     return s;
 }
 
+// Helper to check if HLS output will be used
+static bool will_use_hls_output(const PipelineConfig& cfg)
+{
+    const bool format_requests_hls = !cfg.outputFormatName.empty() && lowercase_copy(cfg.outputFormatName) == "hls";
+
+    if (cfg.outputPath && *cfg.outputPath)
+    {
+        std::filesystem::path playlistPath(cfg.outputPath);
+        const std::string extLower = lowercase_copy(playlistPath.extension().string());
+        return format_requests_hls || (extLower == ".m3u8" || extLower == ".m3u");
+    }
+
+    return format_requests_hls;
+}
+
 // Configures the output context for HLS muxing
 static void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
 {
@@ -1286,6 +1301,7 @@ static bool configure_input_hdr_detection(PipelineConfig& cfg, InputContext& in)
         inputOpts.fflags = cfg.fflags;
         inputOpts.preferP010ForHDR = true;
         inputOpts.seekTime = cfg.seekTime;
+        inputOpts.keyframeSeekForHLS = will_use_hls_output(cfg); // Use keyframe seeking for HLS
         open_input(cfg.inputPath, in, &inputOpts);
         LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
     }
@@ -1619,6 +1635,7 @@ int run_pipeline(PipelineConfig cfg)
         InputOpenOptions inputOpts;
         inputOpts.fflags = cfg.fflags;
         inputOpts.seekTime = cfg.seekTime;
+        inputOpts.keyframeSeekForHLS = will_use_hls_output(cfg); // Use keyframe seeking for HLS
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
@@ -1795,11 +1812,8 @@ int run_pipeline(PipelineConfig cfg)
         bool rtx_init = false;
         initialize_rtx_processor(rtx, rtx_init, use_cuda_path, cfg, in);
 
-        // Update audio PTS alignment after we've established the baseline approach
-        if (out.audioConfig.enabled && in.seek_offset_us > 0) {
-            // Re-initialize audio PTS to align with video baseline once we know the strategy
-            init_audio_pts_after_seek(in, out, global_baseline_pts_us);
-        }
+        // Note: Audio PTS will be aligned with video baseline after first video packet
+        // This ensures proper A/V sync during seek operations
 
         // Calculate whether output should be HDR
         bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
@@ -1849,6 +1863,8 @@ int run_pipeline(PipelineConfig cfg)
                 if (out.audioConfig.enabled && !audio_pts_aligned) {
                     init_audio_pts_after_seek(in, out, global_baseline_pts_us);
                     audio_pts_aligned = true;
+                    printf("SEEK DEBUG: Audio PTS aligned with video baseline at %.3fs\n",
+                           global_baseline_pts_us / 1000000.0);
                 }
             }
 
@@ -1881,18 +1897,14 @@ int run_pipeline(PipelineConfig cfg)
                     int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
                                          ? decframe->pts
                                          : decframe->best_effort_timestamp;
-                    // Use global baseline approach for video PTS if seeking
-                    int64_t output_pts;
-                    if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
-                        // Use global baseline for consistent A/V sync
-                        int64_t video_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
-                        int64_t adjusted_video_pts = derive_global_baseline_pts(video_pts, global_baseline_pts_us, in.vst->time_base);
-                        output_pts = av_rescale_q(adjusted_video_pts, in.vst->time_base, out.venc->time_base);
-                        printf("SEEK DEBUG: Video frame original PTS: %lld, adjusted: %lld, output: %lld\n",
-                               video_pts, adjusted_video_pts, output_pts);
-                    } else {
-                        // Use existing logic for non-seeking case
-                        output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base, in.seek_offset_us);
+                    // Prioritize HLS segment continuity over perfect A/V sync
+                    // Use the simpler derive_output_pts method which was working previously
+                    int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base, in.seek_offset_us);
+
+                    if (in.seek_offset_us > 0) {
+                        printf("SEEK DEBUG: Video frame PTS: %lld, output: %lld\n",
+                               (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp,
+                               output_pts);
                     }
                     // Ensure strict monotonicity to satisfy encoder/muxer
                     if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
@@ -1928,6 +1940,14 @@ int run_pipeline(PipelineConfig cfg)
             }
             else if (cfg.ffCompatible && out.audioConfig.enabled && in.astream >= 0 && pkt->stream_index == in.astream)
             {
+                // When seeking, wait for video baseline to be established before processing audio
+                // This ensures better A/V sync by aligning audio timeline with video
+                if (in.seek_offset_us > 0 && global_baseline_pts_us == AV_NOPTS_VALUE) {
+                    printf("SEEK DEBUG: Skipping audio packet - waiting for video baseline\n");
+                    av_packet_unref(pkt.get());
+                    continue;
+                }
+
                 // Process audio packets when audio encoding is enabled
                 if (in.adec && out.aenc)
                 {
@@ -1967,8 +1987,14 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
 
-                        // Use global baseline for audio copy
-                        if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
+                        // When seeking, ensure we have video baseline before processing audio copy
+                        if (in.seek_offset_us > 0) {
+                            if (global_baseline_pts_us == AV_NOPTS_VALUE) {
+                                printf("SEEK DEBUG: Skipping audio copy packet - waiting for video baseline\n");
+                                av_packet_unref(pkt.get());
+                                continue;
+                            }
+                            // Use global baseline for audio copy
                             int64_t adjusted_pts = derive_global_baseline_pts(pkt->pts, global_baseline_pts_us, ist->time_base);
                             pkt->pts = adjusted_pts;
                             if (pkt->dts != AV_NOPTS_VALUE) {

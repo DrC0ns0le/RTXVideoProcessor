@@ -18,6 +18,7 @@ struct InputOpenOptions
     std::string fflags;
     bool preferP010ForHDR = false; // Request P010 output for HDR content
     std::string seekTime; // Seek time in FFmpeg format (e.g., "00:09:06.671")
+    bool keyframeSeekForHLS = false; // Use keyframe-precise seeking for HLS output
 };
 
 struct HlsMuxOptions
