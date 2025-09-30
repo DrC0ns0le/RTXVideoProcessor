@@ -372,6 +372,41 @@ __global__ void k_p010_to_x2bgr10(const uint8_t *__restrict__ d_y, int pitchY,
     *dst = packed;
 }
 
+// Kernel: P010 (10-bit YUV420) -> NV12 (8-bit YUV420)
+// Simple downsampling: take upper 8 bits of 10-bit data
+__global__ void k_p010_to_nv12(const uint8_t *__restrict__ d_yIn, int pitchYIn,
+                                const uint8_t *__restrict__ d_uvIn, int pitchUVIn,
+                                uint8_t *__restrict__ d_yOut, int pitchYOut,
+                                uint8_t *__restrict__ d_uvOut, int pitchUVOut,
+                                int w, int h)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Process Y plane
+    if (x < w && y < h) {
+        const uint16_t *yIn = (const uint16_t *)d_yIn;
+        uint16_t y16 = yIn[y * (pitchYIn / 2) + x];
+        // P010: 10 bits in upper bits, shift right 2 to get upper 8 bits
+        uint8_t y8 = (uint8_t)(y16 >> 8);
+        d_yOut[y * pitchYOut + x] = y8;
+    }
+
+    // Process UV plane (half resolution)
+    int uvY = y / 2;
+    int uvX = (x / 2) * 2; // Align to UV pair
+    if (uvX < w && uvY < h / 2 && (x % 2 == 0)) {
+        const uint16_t *uvIn = (const uint16_t *)d_uvIn;
+        uint16_t u16 = uvIn[uvY * (pitchUVIn / 2) + uvX + 0];
+        uint16_t v16 = uvIn[uvY * (pitchUVIn / 2) + uvX + 1];
+        // Downsample to 8-bit
+        uint8_t u8 = (uint8_t)(u16 >> 8);
+        uint8_t v8 = (uint8_t)(v16 >> 8);
+        d_uvOut[uvY * pitchUVOut + uvX + 0] = u8;
+        d_uvOut[uvY * pitchUVOut + uvX + 1] = v8;
+    }
+}
+
 void launch_nv12_to_bgra(const uint8_t *d_y, int pitchY,
                          const uint8_t *d_uv, int pitchUV,
                          uint8_t *outBGRA, int outPitch,
@@ -382,6 +417,20 @@ void launch_nv12_to_bgra(const uint8_t *d_y, int pitchY,
     dim3 block(32, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
     k_nv12_to_rgba<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outBGRA, outPitch, w, h, bt2020);
+}
+
+void launch_p010_to_nv12(const uint8_t *d_yIn, int pitchYIn,
+                         const uint8_t *d_uvIn, int pitchUVIn,
+                         uint8_t *d_yOut, int pitchYOut,
+                         uint8_t *d_uvOut, int pitchUVOut,
+                         int w, int h,
+                         cudaStream_t stream)
+{
+    dim3 block(32, 16);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    k_p010_to_nv12<<<grid, block, 0, stream>>>(d_yIn, pitchYIn, d_uvIn, pitchUVIn,
+                                                d_yOut, pitchYOut, d_uvOut, pitchUVOut,
+                                                w, h);
 }
 
 void launch_p010_to_x2bgr10(const uint8_t *d_y, int pitchY,

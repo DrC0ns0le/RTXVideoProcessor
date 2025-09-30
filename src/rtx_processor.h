@@ -75,6 +75,23 @@ public:
                               AVFrame *encP010Frame,
                               bool bt2020);
 
+    // Fully GPU path: consume a P010 frame and output NV12 (downsample 10-bit to 8-bit).
+    // Used for SDR output when decoder outputs P010 but we need 8-bit output.
+    // d_y, d_uv: device pointers to P010 input planes.
+    // encNV12Frame: AVFrame with format AV_PIX_FMT_CUDA and sw_format NV12; planes will be written on device.
+    bool processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
+                              const uint8_t *d_uv, int pitchUV,
+                              AVFrame *encNV12Frame);
+
+    // Fully GPU path: consume a P010 SDR frame and output P010 with THDR applied.
+    // Used when input is SDR in P010 container (Main10) and THDR is enabled.
+    // Simply converts P010→NV12 (extract 8-bit) then delegates to processGpuNV12ToP010.
+    // d_y, d_uv: device pointers to P010 SDR input planes.
+    // encP010Frame: AVFrame with format AV_PIX_FMT_CUDA and sw_format P010; planes will be written on device.
+    bool processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
+                                 const uint8_t *d_uv, int pitchUV,
+                                 AVFrame *encP010Frame);
+
     // Fully GPU path producing NV12 (8-bit) into an FFmpeg CUDA frame whose sw_format is NV12.
     // Used for SDR output when THDR is disabled.
     bool processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,

@@ -46,6 +46,17 @@ void launch_bgra8_to_nv12(const uint8_t *inBGRA, int inPitch,
                           bool bt2020,
                           cudaStream_t stream);
 
+// Launch P010 (10-bit YUV420) -> NV12 (8-bit YUV420) conversion on device.
+// Downsamples 10-bit to 8-bit by taking upper 8 bits.
+// d_yIn, d_uvIn: device pointers to P010 input planes with pitches pitchYIn and pitchUVIn.
+// d_yOut, d_uvOut: device pointers to NV12 output planes with pitches pitchYOut and pitchUVOut.
+void launch_p010_to_nv12(const uint8_t *d_yIn, int pitchYIn,
+                         const uint8_t *d_uvIn, int pitchUVIn,
+                         uint8_t *d_yOut, int pitchYOut,
+                         uint8_t *d_uvOut, int pitchUVOut,
+                         int w, int h,
+                         cudaStream_t stream);
+
 // Launch P010 (10-bit YUV420) -> X2BGR10LE (10-bit RGB) conversion on device.
 // d_y, d_uv are device pointers to P010 planes with pitches pitchY and pitchUV.
 // outX2BGR10 is device pointer with pitch outPitch (bytes per row), size w x h.

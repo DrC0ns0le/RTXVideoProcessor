@@ -950,7 +950,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
 
     cfg->gop = 1;
     cfg->bframes = 2;
-    cfg->qp = 24;
+    cfg->qp = 21;
     cfg->targetBitrateMultiplier = 2;
 
     int i = 1;
@@ -1901,11 +1901,6 @@ int run_pipeline(PipelineConfig cfg)
                     // Use the simpler derive_output_pts method which was working previously
                     int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base, in.seek_offset_us);
 
-                    if (in.seek_offset_us > 0) {
-                        printf("SEEK DEBUG: Video frame PTS: %lld, output: %lld\n",
-                               (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp,
-                               output_pts);
-                    }
                     // Ensure strict monotonicity to satisfy encoder/muxer
                     if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
                         output_pts = last_output_pts + 1;
@@ -1943,7 +1938,6 @@ int run_pipeline(PipelineConfig cfg)
                 // When seeking, wait for video baseline to be established before processing audio
                 // This ensures better A/V sync by aligning audio timeline with video
                 if (in.seek_offset_us > 0 && global_baseline_pts_us == AV_NOPTS_VALUE) {
-                    printf("SEEK DEBUG: Skipping audio packet - waiting for video baseline\n");
                     av_packet_unref(pkt.get());
                     continue;
                 }
@@ -1990,7 +1984,6 @@ int run_pipeline(PipelineConfig cfg)
                         // When seeking, ensure we have video baseline before processing audio copy
                         if (in.seek_offset_us > 0) {
                             if (global_baseline_pts_us == AV_NOPTS_VALUE) {
-                                printf("SEEK DEBUG: Skipping audio copy packet - waiting for video baseline\n");
                                 av_packet_unref(pkt.get());
                                 continue;
                             }
@@ -2082,13 +2075,12 @@ int run_pipeline(PipelineConfig cfg)
             double total_sec = total_ms / 1000.0;
             double avg_fps = (total_sec > 0) ? processed_frames / total_sec : 0.0;
 
-            fprintf(stdout, "\nProcessing completed in %.1f seconds (%.1f fps)\n",
+            fprintf(stderr, "\nProcessing completed in %.1f seconds (%.1f fps)\n",
                     total_sec, avg_fps);
         }
         if (sws_to_argb)
             sws_freeContext(sws_to_argb);
         sws_freeContext(sws_to_p010);
-
         // Ensure all CUDA operations complete before cleanup
         if (use_cuda_path)
         {

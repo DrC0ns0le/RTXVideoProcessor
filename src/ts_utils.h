@@ -31,11 +31,7 @@ static inline int64_t derive_output_pts(int64_t &v_start_pts,
             if (seek_offset_us > 0)
             {
                 int64_t seek_offset_in_timebase = av_rescale_q(seek_offset_us, {1, AV_TIME_BASE}, in_time_base);
-                double original_time = in_pts * av_q2d(in_time_base);
                 v_start_pts -= seek_offset_in_timebase;
-                double adjusted_baseline_time = v_start_pts * av_q2d(in_time_base);
-                printf("SEEK DEBUG: Video baseline - Original PTS: %lld (%.3fs), Seek offset: %.3fs, Adjusted baseline: %lld (%.3fs)\n",
-                       in_pts, original_time, seek_offset_us / 1000000.0, v_start_pts, adjusted_baseline_time);
             }
         }
         in_pts -= v_start_pts;
@@ -63,11 +59,7 @@ static inline int64_t derive_copied_stream_pts(int64_t &stream_start_pts,
         // When seeking, adjust the baseline to account for the seek offset
         if (seek_offset_us > 0) {
             int64_t seek_offset_in_timebase = av_rescale_q(seek_offset_us, {1, AV_TIME_BASE}, stream_time_base);
-            double original_time = packet_pts * av_q2d(stream_time_base);
             stream_start_pts -= seek_offset_in_timebase;
-            double adjusted_baseline_time = stream_start_pts * av_q2d(stream_time_base);
-            printf("SEEK DEBUG: Stream baseline - Original PTS: %lld (%.3fs), Seek offset: %.3fs, Adjusted baseline: %lld (%.3fs)\n",
-                   packet_pts, original_time, seek_offset_us / 1000000.0, stream_start_pts, adjusted_baseline_time);
         }
     }
 

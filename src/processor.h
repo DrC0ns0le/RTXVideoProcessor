@@ -41,12 +41,31 @@ public:
         bool ok = false;
 
         if (sw_format == AV_PIX_FMT_P010LE) {
-            // HDR content: P010 input -> P010 output (full 10-bit pipeline)
-            ok = m_rtx.processGpuP010ToP010(decframe->data[0], decframe->linesize[0],
-                                           decframe->data[1], decframe->linesize[1],
-                                           enc_hw, m_bt2020);
+            // P010 input: could be true HDR (BT.2020) or SDR (BT.709) in 10-bit container (Main10)
+            // Key distinction: m_bt2020 tells us if input is true HDR or just SDR in P010 format
+            
+            if (m_bt2020) {
+                // True HDR input (BT.2020): preserve 10-bit pipeline
+                // P010 -> X2BGR10LE (10-bit) -> RTX -> ABGR10 -> P010
+                ok = m_rtx.processGpuP010ToP010(decframe->data[0], decframe->linesize[0],
+                                               decframe->data[1], decframe->linesize[1],
+                                               enc_hw, m_bt2020);
+            } else {
+                // SDR input in P010 format (BT.709): treat as 8-bit SDR
+                if (m_thdrEnabled) {
+                    // THDR enabled for SDR: P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR+THDR) -> ABGR10 -> P010
+                    ok = m_rtx.processGpuP010SDRToP010(decframe->data[0], decframe->linesize[0],
+                                                       decframe->data[1], decframe->linesize[1],
+                                                       enc_hw);
+                } else {
+                    // No THDR: P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR only) -> BGRA8 -> NV12
+                    ok = m_rtx.processGpuP010ToNV12(decframe->data[0], decframe->linesize[0],
+                                                   decframe->data[1], decframe->linesize[1],
+                                                   enc_hw);
+                }
+            }
         } else {
-            // SDR content: NV12 input
+            // NV12 input: SDR content
             if (m_thdrEnabled) {
                 ok = m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
                                                 decframe->data[1], decframe->linesize[1],
