@@ -58,6 +58,7 @@ struct AudioConfig
     std::string codec;
     int channels = -1;
     int bitrate = -1;
+    int sampleRate = -1;
     std::string filter;
     bool enabled = false;
 };

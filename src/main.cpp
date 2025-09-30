@@ -200,6 +200,18 @@ static std::string format_windows_error(DWORD error_code)
 }
 #endif
 
+// Helper to check if input is a network URL
+static bool is_network_input(const char* input)
+{
+    if (!input) return false;
+    return (std::strncmp(input, "http://", 7) == 0 ||
+            std::strncmp(input, "https://", 8) == 0 ||
+            std::strncmp(input, "rtmp://", 7) == 0 ||
+            std::strncmp(input, "rtsp://", 7) == 0 ||
+            std::strncmp(input, "tcp://", 6) == 0 ||
+            std::strncmp(input, "udp://", 6) == 0);
+}
+
 static bool passthrough_required(int argc, char **argv)
 {
     if (argc <= 0)
@@ -210,21 +222,57 @@ static bool passthrough_required(int argc, char **argv)
     if (!binary_is_ffmpeg)
         return false;
 
-    bool input_looks_supported = (argc > 1) && (endsWith(argv[1], ".mp4") || endsWith(argv[1], ".mkv"));
-    bool output_looks_supported = (argc > 2) && (endsWith(argv[2], ".mp4") || endsWith(argv[2], ".mkv") || endsWith(argv[2], ".m3u8"));
-
-    bool requests_hls_muxer = false;
+    // Check if input is a network URL (we support these now via FFmpeg's network protocols)
     for (int i = 1; i < argc; ++i)
     {
-        if (!requests_hls_muxer && std::strcmp(argv[i], "-f") == 0 && i + 1 < argc && std::strcmp(argv[i + 1], "hls") == 0)
+        if (std::strcmp(argv[i], "-i") == 0 && i + 1 < argc)
         {
-            requests_hls_muxer = true;
+            // Network inputs are supported via FFmpeg's built-in protocols
+            // No passthrough needed just because of network input
             break;
         }
     }
 
-    // Passthrough is  needed if either input and output are not supported, and if hls is not requested
-    return !input_looks_supported && !output_looks_supported && !requests_hls_muxer;
+    bool input_looks_supported = (argc > 1) && (endsWith(argv[1], ".mp4") || endsWith(argv[1], ".mkv"));
+    bool output_looks_supported = (argc > 2) && (endsWith(argv[2], ".mp4") || endsWith(argv[2], ".mkv") || endsWith(argv[2], ".m3u8"));
+
+    bool requests_hls_muxer = false;
+    bool requests_mp4_to_pipe = false;
+    bool requests_video_exclusion = false;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+        {
+            if (std::strcmp(argv[i + 1], "hls") == 0)
+            {
+                requests_hls_muxer = true;
+            }
+            else if (std::strcmp(argv[i + 1], "mp4") == 0)
+            {
+                // Check if output is pipe
+                for (int j = i + 2; j < argc; ++j)
+                {
+                    if (std::strcmp(argv[j], "-") == 0 ||
+                        std::strcmp(argv[j], "pipe:") == 0 ||
+                        std::strcmp(argv[j], "pipe:1") == 0)
+                    {
+                        requests_mp4_to_pipe = true;
+                        break;
+                    }
+                }
+            }
+        }
+        else if (std::strcmp(argv[i], "-map") == 0 && i + 1 < argc && std::strcmp(argv[i + 1], "-0:v?") == 0)
+        {
+            requests_video_exclusion = true;
+        }
+    }
+
+    // Passthrough is needed if either input and output are not supported and if hls or mp4-to-pipe is not requested
+    // or if excluding video
+
+    return (!input_looks_supported && !output_looks_supported && !requests_hls_muxer && !requests_mp4_to_pipe) || requests_video_exclusion;
 }
 
 static int run_ffmpeg_passthrough(int argc, char **argv)
@@ -273,6 +321,12 @@ static int run_ffmpeg_passthrough(int argc, char **argv)
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
 
+    // Inherit stdin/stdout/stderr for pipe support
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
     const char *application_name = use_absolute_ffmpeg ? forwarded_args_storage[0].c_str() : nullptr;
 
     BOOL success = CreateProcessA(
@@ -280,7 +334,7 @@ static int run_ffmpeg_passthrough(int argc, char **argv)
         command_line_buffer.data(),
         nullptr,
         nullptr,
-        FALSE,
+        TRUE,  // bInheritHandles = TRUE to inherit stdout/stderr/stdin
         0,
         nullptr,
         nullptr,
@@ -482,6 +536,7 @@ struct PipelineConfig
     std::string audioCodec;
     int audioChannels = -1;
     int audioBitrate = -1;
+    int audioSampleRate = -1;
     std::string audioFilter;
 
     // Seek options
@@ -493,6 +548,11 @@ static char *extract_ffmpeg_file_path(char *value)
     if (!value)
         return value;
 
+    // Preserve pipe: prefix for stdout/stdin handling
+    if (std::strncmp(value, "pipe:", 5) == 0)
+        return value;
+
+    // Strip file: prefix if present
     if (std::strncmp(value, "file:", 5) == 0)
         value += 5;
 
@@ -516,6 +576,16 @@ static std::string lowercase_copy(std::string s)
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
                    { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+// Helper to check if output is a pipe/stdout
+static bool is_pipe_output(const char* path)
+{
+    if (!path) return false;
+    return (std::strcmp(path, "-") == 0) ||
+           (std::strcmp(path, "pipe:") == 0) ||
+           (std::strcmp(path, "pipe:1") == 0) ||
+           (std::strncmp(path, "pipe:", 5) == 0);
 }
 
 // Helper to check if HLS output will be used
@@ -565,16 +635,20 @@ static void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     hlsOpts.enabled = true;
     hlsOpts.overwrite = cfg->overwrite;
 
-    // Create the output directory if it doesn't exist
+    // Parse playlist path (skip directory creation for pipe output)
     std::filesystem::path playlistPath(cfg->outputPath);
     std::filesystem::path playlistDir = playlistPath.parent_path();
-    if (!playlistDir.empty())
+
+    if (!is_pipe_output(cfg->outputPath))
     {
-        std::error_code ec;
-        std::filesystem::create_directories(playlistDir, ec);
-        if (ec)
+        if (!playlistDir.empty())
         {
-            throw std::runtime_error("Failed to create HLS output directory: " + playlistDir.string() + " (" + ec.message() + ")");
+            std::error_code ec;
+            std::filesystem::create_directories(playlistDir, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to create HLS output directory: " + playlistDir.string() + " (" + ec.message() + ")");
+            }
         }
     }
     std::string playlistStem = playlistPath.stem().string();
@@ -815,14 +889,14 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->streamMaps.push_back(argv[++i]);
         }
-        else if (arg.substr(0, 7) == "-codec:")
+        else if (arg.substr(0, 7) == "-codec:" || arg.substr(0, 3) == "-c:")
         {
             if (i + 1 >= argc)
             {
                 fprintf(stderr, "%s requires an argument\n", arg.c_str());
                 exit(1);
             }
-            if (arg == "-codec:a:0" || arg == "-c:a:0")
+            if (arg == "-codec:a:0" || arg == "-c:a:0" || arg == "-codec:a" || arg == "-c:a")
             {
                 cfg->audioCodec = argv[++i];
             }
@@ -863,6 +937,24 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "-ar" || arg == "-ar:a")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-ar requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->audioSampleRate = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -ar: %s\n", value);
+                exit(1);
+            }
+        }
         else if (arg == "-af")
         {
             if (i + 1 >= argc)
@@ -881,7 +973,9 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->seekTime = argv[++i];
         }
-        if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv"))
+        // Detect output path: file extensions or pipe/stdout
+        if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv") ||
+            arg == "-" || arg == "pipe:" || arg == "pipe:1")
         {
             cfg->outputPath = argv[i];
             LOG_DEBUG("Set outputPath = '%s'\n", cfg->outputPath);
@@ -891,8 +985,15 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
 
 static void print_help(const char *argv0)
 {
-    fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv|m3u8} [options]\n", argv0);
-    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "Usage: %s input output.{mp4|mkv|m3u8|-} [options]\n", argv0);
+    fprintf(stderr, "\nInput can be:\n");
+    fprintf(stderr, "  - Local file: input.mp4, input.mkv\n");
+    fprintf(stderr, "  - HTTP/HTTPS URL: http://example.com/video.mp4\n");
+    fprintf(stderr, "  - RTMP/RTSP stream: rtmp://server/stream\n");
+    fprintf(stderr, "\nOutput can be:\n");
+    fprintf(stderr, "  - Local file: output.mp4, output.mkv, output.m3u8\n");
+    fprintf(stderr, "  - Stdout pipe: - or pipe:1\n");
+    fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
     fprintf(stderr, "  -d, --debug Enable debug logging\n");
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
@@ -1334,6 +1435,7 @@ static void configure_audio_processing(PipelineConfig& cfg, InputContext& in, Ou
         audioParams.codec = cfg.audioCodec;
         audioParams.channels = cfg.audioChannels;
         audioParams.bitrate = cfg.audioBitrate;
+        audioParams.sampleRate = cfg.audioSampleRate;
         audioParams.filter = cfg.audioFilter;
         audioParams.streamMaps = cfg.streamMaps;
 
@@ -1594,20 +1696,25 @@ static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use
 }
 
 // Helper function for writing muxer header
-static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff, const AVRational& fr) {
+static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff, const AVRational& fr, bool is_pipe) {
     // Write header
     out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
     out.vstream->avg_frame_rate = fr;
     // Write header with MOV/MP4 muxer flags for broad compatibility
-    // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
     AVDictionary *muxopts = out.muxOptions;
     // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
-    if (!hls_enabled && mux_is_isobmff) {
+
+    if (is_pipe) {
+        // For pipe output, use fragmented MP4 which doesn't require seeking
+        // frag_keyframe: fragment on every keyframe
+        // empty_moov: write a minimal moov at the start
+        // default_base_moof: use default base for movie fragments
+        av_dict_set(&muxopts, "movflags", "+empty_moov+default_base_moof+delay_moov+dash+write_colr", 0);
+    } else if (!hls_enabled && mux_is_isobmff) {
+        // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
         av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
-        printf("MUXER DEBUG: Set movflags for regular MP4: +faststart+write_colr\n");
     } else {
         av_dict_set(&muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
-        printf("MUXER DEBUG: Set movflags for HLS/fragmented: +frag_keyframe+delay_moov+faststart+write_colr\n");
     }
     ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
     if (muxopts)
@@ -1730,7 +1837,8 @@ int run_pipeline(PipelineConfig cfg)
         const int MAX_BUFFER_SIZE = 4;
 
         // Stage 10: Write muxer header
-        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr);
+        bool isPipeOutput = is_pipe_output(cfg.outputPath);
+        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr, isPipeOutput);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
@@ -2008,6 +2116,13 @@ int run_pipeline(PipelineConfig cfg)
                 // Copy other streams
                 int out_index = out.map_streams[pkt->stream_index];
 
+                // Skip subtitle streams (they should already be filtered but double-check)
+                AVStream *input_stream = in.fmt->streams[pkt->stream_index];
+                if (input_stream->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                {
+                    av_packet_unref(pkt.get());
+                    continue;
+                }
 
                 if (out_index >= 0)
                 {
@@ -2111,6 +2226,22 @@ int run_pipeline(PipelineConfig cfg)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    // Only attach to parent console if stdout is not already redirected/piped
+    // When spawned from Node.js with stdio:["ignore","pipe","pipe"],
+    // stdout is already connected to a pipe and should not be reopened
+    DWORD mode;
+    BOOL stdoutIsPipe = !GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode);
+
+    if (!stdoutIsPipe && AttachConsole(ATTACH_PARENT_PROCESS))
+    {
+        // Reopen stdout/stderr to the parent console
+        FILE* fp;
+        freopen_s(&fp, "CONOUT$", "w", stdout);
+        freopen_s(&fp, "CONOUT$", "w", stderr);
+        freopen_s(&fp, "CONIN$", "r", stdin);
+    }
+#endif
 
     if (passthrough_required(argc, argv))
     {

@@ -121,6 +121,8 @@ set_target_properties(RTXVideoProcessor PROPERTIES
   CUDA_PROPAGATE_HOST_FLAGS OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS ON
   CUDA_RUNTIME_LIBRARY Static
+  # Ensure console subsystem for proper stdin/stdout/stderr handling
+  WIN32_EXECUTABLE FALSE
 )
 
 # Include directories
@@ -179,6 +181,10 @@ if(MSVC)
   # Apply MSVC options only to C++ compilation units, not to CUDA. Passing /EHsc or /MP to NVCC causes build failures.
   target_compile_options(RTXVideoProcessor PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/EHsc /MP>
+  )
+  # Explicitly set console subsystem to ensure proper stdin/stdout/stderr and prevent new window
+  set_target_properties(RTXVideoProcessor PROPERTIES
+    LINK_FLAGS "/SUBSYSTEM:CONSOLE"
   )
 endif()
 

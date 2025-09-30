@@ -5,6 +5,11 @@
 #include <cstdio>
 #include <cstring>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
@@ -35,6 +40,24 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     if (options && !options->fflags.empty())
     {
         av_dict_set(&openOpts, "fflags", options->fflags.c_str(), 0);
+    }
+
+    // Check if input is a network URL
+    bool isNetworkInput = (std::strncmp(inPath, "http://", 7) == 0 ||
+                          std::strncmp(inPath, "https://", 8) == 0 ||
+                          std::strncmp(inPath, "rtmp://", 7) == 0 ||
+                          std::strncmp(inPath, "rtsp://", 7) == 0);
+
+    // For network inputs, set some helpful options
+    if (isNetworkInput)
+    {
+        // Timeout for network operations (30 seconds)
+        av_dict_set(&openOpts, "timeout", "30000000", 0);
+        // Reconnect settings
+        av_dict_set(&openOpts, "reconnect", "1", 0);
+        av_dict_set(&openOpts, "reconnect_streamed", "1", 0);
+        av_dict_set(&openOpts, "reconnect_delay_max", "5", 0);
+        LOG_VERBOSE("Opening network input: %s", inPath);
     }
 
     int err = avformat_open_input(&in.fmt, inPath, nullptr, &openOpts);
@@ -238,14 +261,24 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     if (out.fmt)
         close_output(out);
 
+    // Detect pipe/stdout output
+    bool isPipe = (std::strcmp(outPath, "-") == 0) ||
+                  (std::strcmp(outPath, "pipe:") == 0) ||
+                  (std::strcmp(outPath, "pipe:1") == 0);
 
     const char *effectiveFormat = nullptr;
     if (out.hlsOptions.enabled)
     {
         effectiveFormat = "hls";
     }
+    else if (isPipe)
+    {
+        // For pipe output, we need to specify format explicitly since we can't infer from filename
+        // Default to mp4 for pipe output (most compatible for streaming)
+        effectiveFormat = "mp4";
+    }
 
-    ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, effectiveFormat, outPath), "alloc output context");
+    ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, effectiveFormat, isPipe ? nullptr : outPath), "alloc output context");
     if (!out.fmt)
         throw std::runtime_error("Failed to allocate output format context");
     
@@ -371,12 +404,35 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     out.map_streams.assign(in.fmt->nb_streams, -1);
     out.map_streams[in.vstream] = out.vstream->index;
 
+    if (!out.streamMappings.empty())
+    {
+        apply_stream_mappings(out.streamMappings, in, out);
+    }
+
+    // Check if output is a pipe
+    bool isPipeOutput = (std::strcmp(outPath, "-") == 0) ||
+                       (std::strcmp(outPath, "pipe:") == 0) ||
+                       (std::strcmp(outPath, "pipe:1") == 0);
+
     for (unsigned int i = 0; i < in.fmt->nb_streams; ++i)
     {
         if ((int)i == in.vstream)
             continue;
 
         AVStream *ist = in.fmt->streams[i];
+
+        if (i < out.map_streams.size() && out.map_streams[i] == -1) { continue; }
+
+        // Drop subtitle streams when outputting to pipe to avoid text contamination in stdout
+        if (isPipeOutput && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        {
+            const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
+            LOG_INFO("Dropping subtitle stream %u (%s): not supported for pipe output", i,
+                     codec_name ? codec_name : "unknown");
+            out.map_streams[i] = -1;
+            continue;
+        }
+
         // Drop unsupported subtitle codecs for HLS outputs (only WebVTT is supported).
         if (out.hlsOptions.enabled && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
             ist->codecpar->codec_id != AV_CODEC_ID_WEBVTT)
@@ -414,7 +470,17 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             throw std::runtime_error("Failed to allocate output stream");
 
         ff_check(avcodec_parameters_copy(ost->codecpar, ist->codecpar), "copy stream parameters");
-        ost->time_base = ist->time_base;
+
+        // For audio streams, set timescale to sample rate for MP4 parser compatibility (e.g., Stremio)
+        if (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ist->codecpar->sample_rate > 0)
+        {
+            ost->time_base = {1, ist->codecpar->sample_rate};
+        }
+        else
+        {
+            ost->time_base = ist->time_base;
+        }
+
         out.map_streams[i] = ost->index;
     }
 
@@ -424,7 +490,27 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         AVDictionary *avioOpts = nullptr;
         if (out.hlsOptions.enabled && out.hlsOptions.overwrite)
             av_dict_set(&avioOpts, "truncate", "1", 0);
-        int openErr = avio_open2(&out.fmt->pb, outPath, avioFlags, nullptr, &avioOpts);
+
+        // Handle pipe/stdout output
+        bool isPipe = (std::strcmp(outPath, "-") == 0) ||
+                      (std::strcmp(outPath, "pipe:") == 0) ||
+                      (std::strcmp(outPath, "pipe:1") == 0);
+
+        int openErr;
+        if (isPipe)
+        {
+#ifdef _WIN32
+            // Set stdout to binary mode on Windows to prevent newline conversion
+            _setmode(_fileno(stdout), _O_BINARY);
+#endif
+            // Use pipe:1 to write to stdout
+            openErr = avio_open2(&out.fmt->pb, "pipe:1", avioFlags, nullptr, &avioOpts);
+        }
+        else
+        {
+            openErr = avio_open2(&out.fmt->pb, outPath, avioFlags, nullptr, &avioOpts);
+        }
+
         if (avioOpts)
             av_dict_free(&avioOpts);
         ff_check(openErr, "open output file");
@@ -564,10 +650,11 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
     out.audioConfig.codec = params.codec;
     out.audioConfig.channels = params.channels;
     out.audioConfig.bitrate = params.bitrate;
+    out.audioConfig.sampleRate = params.sampleRate;
     out.audioConfig.filter = params.filter;
 
     // Only enable audio processing if there are actual audio parameters specified
-    bool hasAudioParams = !params.codec.empty() || params.channels > 0 || params.bitrate > 0 || !params.filter.empty();
+    bool hasAudioParams = !params.codec.empty() || params.channels > 0 || params.bitrate > 0 || params.sampleRate > 0 || !params.filter.empty();
 
     // Check if stream mappings include audio (0:1) or explicitly request audio processing
     bool hasAudioMapping = false;
@@ -626,9 +713,35 @@ bool apply_stream_mappings(const std::vector<std::string> &mappings, const Input
         }
 
         if (exclude) {
-            if (streamType == "s") {
+            if (streamType == "s" || streamType == "s?") {
                 // Exclude subtitles - this is handled in the main loop
                 LOG_INFO("Excluding subtitle streams as requested");
+            } else if (streamType == "a" || streamType == "a?") {
+                // Exclude audio streams
+                LOG_INFO("Excluding audio streams as requested");
+                // Disable audio processing and mark all audio streams for exclusion
+                out.audioConfig.enabled = false;
+                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
+                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                        out.map_streams[i] = -1;
+                    }
+                }
+            } else if (streamType == "d" || streamType == "d?") {
+                // Exclude data streams
+                LOG_INFO("Excluding data streams as requested");
+                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
+                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
+                        out.map_streams[i] = -1;
+                    }
+                }
+            } else if (streamType == "t" || streamType == "t?") {
+                // Exclude attachment streams
+                LOG_INFO("Excluding attachment streams as requested");
+                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
+                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT) {
+                        out.map_streams[i] = -1;
+                    }
+                }
             }
         } else {
             // Include specific streams - mark them for processing
@@ -637,6 +750,27 @@ bool apply_stream_mappings(const std::vector<std::string> &mappings, const Input
             } else if (streamType == "1") {
                 // Second stream (usually audio) - ensure it's included
                 out.audioConfig.enabled = true;
+            } else if (streamType == "a" || streamType == "a?") {
+                // Include audio streams (a? = optional, don't fail if missing)
+                LOG_INFO("Including audio streams as requested");
+                // Audio streams are already included by default in open_output
+                // Just ensure audio processing is not disabled
+                if (!out.audioConfig.codec.empty()) {
+                    out.audioConfig.enabled = true;
+                }
+            } else if (streamType == "s" || streamType == "s?") {
+                // Include subtitle streams (s? = optional, don't fail if missing)
+                LOG_INFO("Including subtitle streams as requested");
+                // Subtitle streams are already included by default in open_output
+                // The ? suffix means don't fail if no subtitle streams exist
+            } else if (streamType == "d" || streamType == "d?") {
+                // Include data streams (d? = optional, don't fail if missing)
+                LOG_INFO("Including data streams as requested");
+                // Data streams are included by default if supported by container
+            } else if (streamType == "t" || streamType == "t?") {
+                // Include attachment streams (t? = optional, don't fail if missing)
+                LOG_INFO("Including attachment streams as requested");
+                // Attachment streams are included by default if supported by container
             }
         }
     }
@@ -694,7 +828,13 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
     AVStream *input_audio = in.fmt->streams[audio_stream_idx];
     out.aenc->codec_id = audio_encoder->id;
     out.aenc->codec_type = AVMEDIA_TYPE_AUDIO;
-    out.aenc->sample_rate = input_audio->codecpar->sample_rate;
+
+    // Use configured sample rate if specified, otherwise use input sample rate
+    if (out.audioConfig.sampleRate > 0) {
+        out.aenc->sample_rate = out.audioConfig.sampleRate;
+    } else {
+        out.aenc->sample_rate = input_audio->codecpar->sample_rate;
+    }
     
     // Use new AVChannelLayout API instead of deprecated channels/channel_layout
     if (out.audioConfig.channels > 0) {
@@ -749,7 +889,9 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
         return false;
     }
 
-    out.astream->time_base = out.aenc->time_base;
+    // Set audio stream time_base to match sample rate for MP4 muxer compatibility
+    // This is required for fragmented MP4 formats (dash, fmp4) where timescale must equal sample rate
+    out.astream->time_base = {1, out.aenc->sample_rate};
 
     // Initialize audio PTS tracking (will be adjusted after seeking if needed)
     init_audio_pts_after_seek(in, out);
