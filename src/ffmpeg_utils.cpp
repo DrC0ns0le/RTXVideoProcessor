@@ -128,6 +128,11 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     in.vdec->pkt_timebase = in.vst->time_base;
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
+    // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
+    // This is especially important after seeking where reference frames may not be available
+    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
+    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
+
     // Try to enable CUDA hardware decoding
     err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
     if (err >= 0 && in.hw_device_ctx)

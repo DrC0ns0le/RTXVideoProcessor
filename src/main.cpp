@@ -1008,9 +1008,9 @@ static void print_help(const char *argv0)
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000\n");
     fprintf(stderr, "\nNVENC options:\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq\n");
-    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7\n");
+    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p4\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
-    fprintf(stderr, "  --nvenc-gop         Set NVENC GOP, default 1\n");
+    fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
@@ -1049,7 +1049,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     cfg->preset = "p4";
     cfg->rc = "constqp";
 
-    cfg->gop = 1;
+    cfg->gop = 3;  // 3 seconds GOP for HLS compatibility (will be multiplied by framerate)
     cfg->bframes = 2;
     cfg->qp = 21;
     cfg->targetBitrateMultiplier = 2;
