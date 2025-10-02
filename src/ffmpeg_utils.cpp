@@ -131,25 +131,11 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     in.vdec->pkt_timebase = in.vst->time_base;
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
-    // Conditional error concealment (FFmpeg does NOT enable this by default)
-    // Enable if explicitly requested OR when seek2any is used (to handle non-keyframe seeks)
-    bool needsErrorConcealment = (options && options->enableErrorConcealment) ||
-                                  (options && options->seek2any && !options->seekTime.empty());
-
-    if (needsErrorConcealment)
-    {
-        // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
-        // This is especially important after seeking where reference frames may not be available
-        in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
-        in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
-        in.vdec->err_recognition = AV_EF_IGNORE_ERR;  // Ignore decode errors and continue
-
-        if (options && options->seek2any) {
-            LOG_DEBUG("Decoder error concealment auto-enabled for -seek2any (non-keyframe seek support)\n");
-        } else {
-            LOG_DEBUG("Decoder error concealment enabled (non-FFmpeg default)\n");
-        }
-    }
+    // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
+    // This is especially important after seeking where reference frames may not be available
+    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
+    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
+    LOG_DEBUG("Decoder error concealment enabled");
 
     // Try to enable CUDA hardware decoding
     err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -197,14 +183,6 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         ff_check(avcodec_open2(in.vdec, decoder, nullptr), "open decoder");
     }
 
-    // Conditional decoder flush (FFmpeg does NOT do this by default)
-    // Only flush if explicitly requested (non-standard behavior)
-    if (options && options->flushOnSeek && !options->seekTime.empty() && in.vdec)
-    {
-        avcodec_flush_buffers(in.vdec);
-        LOG_DEBUG("Decoder flushed after seek (non-FFmpeg default)\n");
-    }
-
     // Find and set up audio stream if available
     int astream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (astream >= 0)
@@ -232,14 +210,6 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
                 }
             }
         }
-    }
-
-    // Conditional audio decoder flush (FFmpeg does NOT do this by default)
-    // Only flush if explicitly requested (non-standard behavior)
-    if (options && options->flushOnSeek && !options->seekTime.empty() && in.adec)
-    {
-        avcodec_flush_buffers(in.adec);
-        LOG_DEBUG("Audio decoder flushed after seek (non-FFmpeg default)\n");
     }
 
     return true;
@@ -1289,17 +1259,12 @@ void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64
     }
 
     // Initialize audio PTS tracking to align with video timeline
+    // Both video and audio use the same baseline (global_baseline_us)
+    // Audio should start from 0 (relative to baseline), just like video
     if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
-        // Use the same global baseline as video to ensure A/V sync
-        // Subtract seek offset to start output from 0 (matching video baseline logic)
-        int64_t relative_baseline_us = global_baseline_pts_us - in.seek_offset_us;
-        out.next_audio_pts = av_rescale_q(relative_baseline_us, {1, AV_TIME_BASE}, out.aenc->time_base);
-        LOG_DEBUG("Audio PTS aligned with global baseline: %lld us - %lld us = %lld (%.3fs)",
-               global_baseline_pts_us, in.seek_offset_us, relative_baseline_us,
-               out.next_audio_pts * av_q2d(out.aenc->time_base));
-    } else if (in.seek_offset_us > 0) {
-        // Fallback: start from 0 if no global baseline established yet
+        // Start from 0 to match video (video: first_frame - baseline, audio: start at 0)
         out.next_audio_pts = 0;
+        LOG_DEBUG("Audio PTS initialized to 0 (baseline at %.3fs)", global_baseline_pts_us / 1000000.0);
     } else {
         out.next_audio_pts = 0;
     }

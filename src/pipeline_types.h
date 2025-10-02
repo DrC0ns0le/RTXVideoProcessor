@@ -105,6 +105,9 @@ struct OutputContext
     int64_t last_audio_dts = AV_NOPTS_VALUE;
     int64_t a_start_pts = AV_NOPTS_VALUE; // First audio PTS for baseline
 
+    // Video DTS tracking for monotonicity enforcement
+    int64_t last_video_dts = AV_NOPTS_VALUE;
+
     std::vector<int> map_streams; // input->output map, -1 for unmapped
     std::vector<std::string> streamMappings; // parsed -map arguments
     HlsMuxOptions hlsOptions;

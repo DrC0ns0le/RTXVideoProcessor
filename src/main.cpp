@@ -434,6 +434,7 @@ using PacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket *)>;
 static inline void encode_and_write(AVCodecContext *enc,
                                     AVStream *vstream,
                                     AVFormatContext *ofmt,
+                                    OutputContext &out,
                                     AVFrame *frame,
                                     PacketPtr &opkt,
                                     const char *ctx_label)
@@ -1631,7 +1632,8 @@ static AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& i
     out.venc->codec_id = AV_CODEC_ID_HEVC;
     out.venc->width = dstW;
     out.venc->height = dstH;
-    out.venc->time_base = av_inv_q(fr);
+    // Use input stream timebase to avoid precision loss during timestamp conversion
+    out.venc->time_base = in.vst->time_base;
     out.venc->framerate = fr;
 
     // Prefer CUDA frames if decoder is CUDA-capable to avoid copies
@@ -2285,6 +2287,9 @@ int run_pipeline(PipelineConfig cfg)
                         break;
                     ff_check(ret, "receive frame");
 
+                    // Note: Corrupt frames are acceptable - we encode them with artifacts
+                    // This maintains continuous timeline when seeking with -seek2any to non-keyframes
+
                     AVFrame *decframe = frame.get();
                     FramePtr tmp(nullptr, &av_frame_free_single);
                     bool frame_is_cuda = (decframe->format == AV_PIX_FMT_CUDA);
@@ -2323,9 +2328,9 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set consistent PTS/DTS to prevent stuttering
+                    // Set frame PTS - encoder will generate its own DTS based on encoding structure
+                    // NOTE: Do NOT set pkt_dts - encoder ignores it and generates correct DTS for B-frames
                     outFrame->pts = timestamps.pts;
-                    outFrame->pkt_dts = timestamps.dts;
 
                     // IMPORTANT: Must sync before encoder accesses CUDA frame data
                     // RTX processor syncs internally, but this ensures frame is ready for NVENC
@@ -2333,7 +2338,7 @@ int run_pipeline(PipelineConfig cfg)
                         cudaStreamSynchronize(0);
 
                     // Encode frame
-                    encode_and_write(out.venc, out.vstream, out.fmt, outFrame, opkt, "send frame to encoder");
+                    encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                     av_frame_unref(frame.get());
                     if (swframe)
                         av_frame_unref(swframe.get());

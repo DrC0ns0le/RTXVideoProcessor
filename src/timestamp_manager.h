@@ -66,7 +66,6 @@ public:
 
     /**
      * Derive both PTS and DTS for encoded video frame
-     * Handles B-frames, monotonicity, and all edge cases
      */
     TimestampPair deriveVideoTimestamps(const AVFrame* frame,
                                         AVRational in_time_base,
@@ -91,12 +90,8 @@ public:
             result.pts = deriveNormalPTS(in_pts, in_time_base, out_time_base);
         }
 
-        // Derive DTS (same as PTS for I/P frames, or from frame's coded_picture_number)
-        // For now, assume DTS = PTS (most common case)
-        // TODO: Handle B-frames properly using frame->pict_type
-        result.dts = result.pts;
 
-        // Enforce monotonicity FIRST (may modify result.pts/dts)
+        // Enforce PTS monotonicity only (encoder handles DTS)
         enforceMonotonicity(result, out_time_base);
 
         // THEN update tracking with FINAL corrected value
@@ -288,28 +283,20 @@ private:
 
     int64_t deriveNormalPTS(int64_t in_pts, AVRational in_tb, AVRational out_tb) {
         if (video_baseline_pts_ == AV_NOPTS_VALUE) {
-            // Use global baseline (from first packet) if available when seeking
-            // This prevents desync when seek2any lands on non-keyframe and decoder
-            // skips frames until next keyframe (making first decoded frame != first packet)
-            if (cfg_.input_seek_us > 0 && global_baseline_us_ != AV_NOPTS_VALUE) {
-                // Convert global baseline from microseconds to input timebase
-                video_baseline_pts_ = av_rescale_q_rnd(global_baseline_us_,
-                                                       {1, AV_TIME_BASE},
-                                                       in_tb,
-                                                       AV_ROUND_NEAR_INF);
-                LOG_DEBUG("Video baseline established from global baseline (first packet): %lld (%.3fs)",
-                         video_baseline_pts_, global_baseline_us_ / 1000000.0);
-            } else {
-                // Fallback to first decoded frame PTS (original behavior for non-seeking)
-                video_baseline_pts_ = in_pts;
-            }
+            video_baseline_pts_ = in_pts;
 
             if (cfg_.input_seek_us > 0) {
+                // Use user's requested seek position (not actual seek landing position)
+                // This ensures output timestamps align with user's intent and audio sync
                 int64_t seek_offset = av_rescale_q_rnd(cfg_.input_seek_us,
                                                        {1, AV_TIME_BASE},
                                                        in_tb,
                                                        AV_ROUND_NEAR_INF);
                 video_baseline_pts_ -= seek_offset;
+                LOG_DEBUG("Video baseline adjusted for seek: first_frame=%lld, user_seek=%lld, baseline=%lld",
+                         in_pts, seek_offset, video_baseline_pts_);
+            } else {
+                LOG_DEBUG("Video baseline from first decoded frame: %lld", video_baseline_pts_);
             }
         }
 
@@ -368,20 +355,22 @@ private:
         // Initialize tracking on first frame
         if (last_video_pts_ == AV_NOPTS_VALUE) {
             last_video_pts_ = ts.pts;
-            last_video_dts_ = ts.dts;
             return;
         }
 
-        // FFmpeg mode: Detect but don't fix violations
+        // FFmpeg mode: Detect but don't fix PTS violations
         if (!cfg_.enforce_monotonicity) {
-            detectViolations(ts);
+            if (ts.pts <= last_video_pts_) {
+                monotonicity_violation_count_++;
+                LOG_WARN("PTS monotonicity violation: %lld <= %lld (FFmpeg mode: not fixing)",
+                         ts.pts, last_video_pts_);
+            }
             updateTracking(ts);
             return;
         }
 
-        // Legacy mode: Auto-fix violations for compatibility
+        // Legacy mode: Auto-fix PTS violations for compatibility
         fixPTSViolation(ts, out_tb);
-        fixDTSViolation(ts);
         updateTracking(ts);
     }
 
@@ -409,22 +398,35 @@ private:
     }
 
     void fixDTSViolation(TimestampPair& ts) {
-        // Ensure DTS <= PTS
-        if (ts.dts > ts.pts) {
-            LOG_DEBUG("Fixed DTS > PTS: %lld -> %lld", ts.dts, ts.pts);
+        // Ensure DTS <= PTS (FFmpeg enforces this strictly)
+        if (ts.dts != AV_NOPTS_VALUE && ts.dts > ts.pts) {
+            LOG_ERROR("DTS > PTS detected: DTS=%lld, PTS=%lld - clamping DTS=PTS (may cause issues)",
+                     ts.dts, ts.pts);
             ts.dts = ts.pts;
         }
-        // Ensure DTS monotonicity
-        if (ts.dts <= last_video_dts_) {
+
+        // Ensure DTS strict monotonicity (DTS must be GREATER than last, not equal)
+        if (ts.dts != AV_NOPTS_VALUE && last_video_dts_ != AV_NOPTS_VALUE && ts.dts <= last_video_dts_) {
+            int64_t original_dts = ts.dts;
             ts.dts = last_video_dts_ + 1;
+            LOG_VERBOSE("DTS monotonicity fix: %lld <= %lld, adjusted to %lld",
+                       original_dts, last_video_dts_, ts.dts);
+
+            // FFmpeg-compliant behavior: Do NOT increment PTS
+            // If DTS > PTS after fix, this will cause muxer error (as in vanilla FFmpeg)
+            if (ts.dts > ts.pts) {
+                LOG_ERROR("DTS monotonicity fix created DTS > PTS: DTS=%lld, PTS=%lld",
+                         ts.dts, ts.pts);
+                LOG_ERROR("This will cause muxer error (vanilla FFmpeg behavior)");
+                // Clamp DTS to PTS to prevent immediate error, but warn user
+                ts.dts = ts.pts;
+            }
         }
     }
 
     void updateTracking(const TimestampPair& ts) {
         last_video_pts_ = ts.pts;
-        if (ts.dts != AV_NOPTS_VALUE) {
-            last_video_dts_ = ts.dts;
-        }
+        // DTS tracking removed - encoder handles DTS generation
     }
 
     bool detectDiscontinuity(int64_t pts_us, int64_t last_pts_us) {
