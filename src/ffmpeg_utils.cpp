@@ -132,15 +132,23 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
     // Conditional error concealment (FFmpeg does NOT enable this by default)
-    // Only enable if explicitly requested (legacy mode) or when seeking to non-keyframes
-    if (options && options->enableErrorConcealment)
+    // Enable if explicitly requested OR when seek2any is used (to handle non-keyframe seeks)
+    bool needsErrorConcealment = (options && options->enableErrorConcealment) ||
+                                  (options && options->seek2any && !options->seekTime.empty());
+
+    if (needsErrorConcealment)
     {
         // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
         // This is especially important after seeking where reference frames may not be available
         in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
         in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
         in.vdec->err_recognition = AV_EF_IGNORE_ERR;  // Ignore decode errors and continue
-        LOG_DEBUG("Decoder error concealment enabled (non-FFmpeg default)\n");
+
+        if (options && options->seek2any) {
+            LOG_DEBUG("Decoder error concealment auto-enabled for -seek2any (non-keyframe seek support)\n");
+        } else {
+            LOG_DEBUG("Decoder error concealment enabled (non-FFmpeg default)\n");
+        }
     }
 
     // Try to enable CUDA hardware decoding
@@ -1283,12 +1291,15 @@ void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64
     // Initialize audio PTS tracking to align with video timeline
     if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
         // Use the same global baseline as video to ensure A/V sync
-        out.next_audio_pts = av_rescale_q(global_baseline_pts_us, {1, AV_TIME_BASE}, out.aenc->time_base);
-        LOG_DEBUG("Audio PTS aligned with global baseline: %lld (%.3fs)",
-               out.next_audio_pts, out.next_audio_pts * av_q2d(out.aenc->time_base));
+        // Subtract seek offset to start output from 0 (matching video baseline logic)
+        int64_t relative_baseline_us = global_baseline_pts_us - in.seek_offset_us;
+        out.next_audio_pts = av_rescale_q(relative_baseline_us, {1, AV_TIME_BASE}, out.aenc->time_base);
+        LOG_DEBUG("Audio PTS aligned with global baseline: %lld us - %lld us = %lld (%.3fs)",
+               global_baseline_pts_us, in.seek_offset_us, relative_baseline_us,
+               out.next_audio_pts * av_q2d(out.aenc->time_base));
     } else if (in.seek_offset_us > 0) {
-        // Fallback to seek offset if no global baseline established yet
-        out.next_audio_pts = av_rescale_q(in.seek_offset_us, {1, AV_TIME_BASE}, out.aenc->time_base);
+        // Fallback: start from 0 if no global baseline established yet
+        out.next_audio_pts = 0;
     } else {
         out.next_audio_pts = 0;
     }

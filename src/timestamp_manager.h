@@ -288,7 +288,21 @@ private:
 
     int64_t deriveNormalPTS(int64_t in_pts, AVRational in_tb, AVRational out_tb) {
         if (video_baseline_pts_ == AV_NOPTS_VALUE) {
-            video_baseline_pts_ = in_pts;
+            // Use global baseline (from first packet) if available when seeking
+            // This prevents desync when seek2any lands on non-keyframe and decoder
+            // skips frames until next keyframe (making first decoded frame != first packet)
+            if (cfg_.input_seek_us > 0 && global_baseline_us_ != AV_NOPTS_VALUE) {
+                // Convert global baseline from microseconds to input timebase
+                video_baseline_pts_ = av_rescale_q_rnd(global_baseline_us_,
+                                                       {1, AV_TIME_BASE},
+                                                       in_tb,
+                                                       AV_ROUND_NEAR_INF);
+                LOG_DEBUG("Video baseline established from global baseline (first packet): %lld (%.3fs)",
+                         video_baseline_pts_, global_baseline_us_ / 1000000.0);
+            } else {
+                // Fallback to first decoded frame PTS (original behavior for non-seeking)
+                video_baseline_pts_ = in_pts;
+            }
 
             if (cfg_.input_seek_us > 0) {
                 int64_t seek_offset = av_rescale_q_rnd(cfg_.input_seek_us,
