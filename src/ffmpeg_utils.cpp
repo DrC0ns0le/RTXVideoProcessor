@@ -80,20 +80,23 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         // Store the seek offset for A/V sync correction
         in.seek_offset_us = seek_target;
 
-        // Choose seeking strategy based on output format
-        int seek_flags;
-        if (options && options->keyframeSeekForHLS)
+        // Choose seeking strategy based on options (FFmpeg-compliant behavior)
+        int seek_flags = AVSEEK_FLAG_BACKWARD;
+
+        // Apply -seek2any: Allow seeking to non-keyframes
+        if (options && options->seek2any)
         {
-            // For HLS output, use keyframe-precise seeking to ensure clean segment boundaries
-            seek_flags = AVSEEK_FLAG_BACKWARD;
-            LOG_DEBUG("Using keyframe-precise seeking for HLS output\n");
+            seek_flags |= AVSEEK_FLAG_ANY;
+            LOG_DEBUG("Non-keyframe seeking enabled (-seek2any): AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY\n");
         }
-        else
+
+        // Apply -seek_timestamp: Prefer timestamp-based seeking over byte-based
+        if (options && options->seekTimestamp)
         {
-            // Use AVSEEK_FLAG_ANY for fast seeking (equivalent to noaccurate_seek)
-            seek_flags = AVSEEK_FLAG_ANY;
-            LOG_DEBUG("Using fast seeking (any frame)\n");
+            seek_flags |= AVSEEK_FLAG_FRAME;
+            LOG_DEBUG("Timestamp-based seeking enabled (-seek_timestamp): added AVSEEK_FLAG_FRAME\n");
         }
+
         ret = avformat_seek_file(in.fmt, -1, INT64_MIN, seek_target, INT64_MAX, seek_flags);
         if (ret < 0)
         {
@@ -128,10 +131,17 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     in.vdec->pkt_timebase = in.vst->time_base;
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
-    // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
-    // This is especially important after seeking where reference frames may not be available
-    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
-    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
+    // Conditional error concealment (FFmpeg does NOT enable this by default)
+    // Only enable if explicitly requested (legacy mode) or when seeking to non-keyframes
+    if (options && options->enableErrorConcealment)
+    {
+        // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
+        // This is especially important after seeking where reference frames may not be available
+        in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
+        in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
+        in.vdec->err_recognition = AV_EF_IGNORE_ERR;  // Ignore decode errors and continue
+        LOG_DEBUG("Decoder error concealment enabled (non-FFmpeg default)\n");
+    }
 
     // Try to enable CUDA hardware decoding
     err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -179,10 +189,12 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         ff_check(avcodec_open2(in.vdec, decoder, nullptr), "open decoder");
     }
 
-    // Flush decoder after seeking to ensure clean state
-    if (options && !options->seekTime.empty() && in.vdec)
+    // Conditional decoder flush (FFmpeg does NOT do this by default)
+    // Only flush if explicitly requested (non-standard behavior)
+    if (options && options->flushOnSeek && !options->seekTime.empty() && in.vdec)
     {
         avcodec_flush_buffers(in.vdec);
+        LOG_DEBUG("Decoder flushed after seek (non-FFmpeg default)\n");
     }
 
     // Find and set up audio stream if available
@@ -214,10 +226,12 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
         }
     }
 
-    // Flush audio decoder after seeking as well
-    if (options && !options->seekTime.empty() && in.adec)
+    // Conditional audio decoder flush (FFmpeg does NOT do this by default)
+    // Only flush if explicitly requested (non-standard behavior)
+    if (options && options->flushOnSeek && !options->seekTime.empty() && in.adec)
     {
         avcodec_flush_buffers(in.adec);
+        LOG_DEBUG("Audio decoder flushed after seek (non-FFmpeg default)\n");
     }
 
     return true;
@@ -359,10 +373,11 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             LOG_DEBUG("Set hls_flags = %s\n", hlsFlags.c_str());
         }
 
-        // Minimal HLS fix for seek issues - only add essential discontinuity marker
-        if (in.seek_offset_us > 0)
+        // Conditional HLS discontinuity marking (FFmpeg does NOT do this automatically)
+        // Only mark discontinuity if explicitly requested (legacy mode)
+        if (in.seek_offset_us > 0 && out.hlsOptions.autoDiscontinuity)
         {
-            LOG_DEBUG("Seek offset detected (%lld us), marking HLS discontinuity\n", in.seek_offset_us);
+            LOG_DEBUG("Seek offset detected (%lld us), marking HLS discontinuity (non-FFmpeg default)\n", in.seek_offset_us);
 
             // Add discont_start flag to mark the beginning as a discontinuity
             // This tells HLS players that this is a new starting point
@@ -659,12 +674,32 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
     out.audioConfig.filter = params.filter;
 
     // Only enable audio processing if there are actual audio parameters specified
-    bool hasAudioParams = !params.codec.empty() || params.channels > 0 || params.bitrate > 0 || params.sampleRate > 0 || !params.filter.empty();
+    // Exclude "copy" codec as it doesn't require processing pipeline (FFmpeg compatibility)
+    bool hasAudioParams = (!params.codec.empty() && params.codec != "copy") || params.channels > 0 || params.bitrate > 0 || params.sampleRate > 0 || !params.filter.empty();
 
     // Check if stream mappings include audio (0:1) or explicitly request audio processing
     bool hasAudioMapping = false;
     for (const auto& mapping : params.streamMaps) {
-        if (mapping == "0:1" || mapping.find(":a") != std::string::npos) {
+        std::string clean = mapping;
+        const auto first = clean.find_first_not_of(" \t");
+        if (first == std::string::npos)
+            continue;
+        clean = clean.substr(first);
+        const bool isExclusion = !clean.empty() && clean[0] == '-';
+        if (isExclusion)
+            continue;
+
+        const auto colonPos = clean.find(':');
+        if (colonPos == std::string::npos)
+            continue;
+
+        const std::string streamIdx = clean.substr(0, colonPos);
+        const std::string streamType = clean.substr(colonPos + 1);
+        if (streamIdx != "0")
+            continue;
+    
+        if (streamType == "1" || streamType == "1?" ||
+            (!streamType.empty() && streamType[0] == 'a')) {
             hasAudioMapping = true;
             break;
         }
@@ -688,94 +723,90 @@ void resolve_stream_conflicts(const InputContext &in, OutputContext &out)
     // Left as placeholder for potential future conflict resolution needs
 }
 
-bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out)
-{
-    if (mappings.empty()) {
-        return true; // No custom mappings, use default behavior
+struct StreamMapping {
+    std::string type;
+    bool exclude;
+    bool optional;  // Has '?' suffix
+};
+
+static StreamMapping parse_stream_mapping(const std::string& mapping) {
+    StreamMapping result;
+    result.exclude = (mapping[0] == '-');
+
+    std::string cleanMapping = result.exclude ? mapping.substr(1) : mapping;
+
+    size_t colonPos = cleanMapping.find(':');
+    if (colonPos == std::string::npos) {
+        LOG_WARN("Invalid stream mapping format: %s", mapping.c_str());
+        return result;
     }
 
-    // Parse stream mappings like "0:0", "0:1", "-0:s"
+    std::string part1 = cleanMapping.substr(0, colonPos);
+    std::string part2 = cleanMapping.substr(colonPos + 1);
+
+    // Parse stream type (supports both "v:0" and "0:v" formats)
+    if (part1 == "v" || part1 == "a" || part1 == "s" || part1 == "d" || part1 == "t") {
+        result.type = part1;
+    } else if (part1 == "0") {
+        result.type = part2;
+    } else {
+        LOG_WARN("Unsupported file index: %s", part1.c_str());
+        return result;
+    }
+
+    // Check for optional suffix '?'
+    result.optional = (!result.type.empty() && result.type.back() == '?');
+    if (result.optional) {
+        result.type.pop_back();
+    }
+
+    return result;
+}
+
+static void exclude_streams_by_type(AVMediaType type, const InputContext& in, OutputContext& out) {
+    for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
+        if (in.fmt->streams[i]->codecpar->codec_type == type) {
+            out.map_streams[i] = -1;
+        }
+    }
+}
+
+bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out)
+{
+    if (mappings.empty()) return true;
+
     for (const std::string &mapping : mappings) {
         if (mapping.empty()) continue;
 
-        bool exclude = (mapping[0] == '-');
-        std::string cleanMapping = exclude ? mapping.substr(1) : mapping;
+        StreamMapping parsed = parse_stream_mapping(mapping);
+        if (parsed.type.empty()) continue;
 
-        // Parse format: stream_index:stream_type or just stream_index
-        size_t colonPos = cleanMapping.find(':');
-        if (colonPos == std::string::npos) {
-            LOG_WARN("Invalid stream mapping format: %s", mapping.c_str());
-            continue;
-        }
-
-        std::string streamIdx = cleanMapping.substr(0, colonPos);
-        std::string streamType = cleanMapping.substr(colonPos + 1);
-
-        // For now, handle basic cases: 0:0 (first video), 0:1 (first audio), 0:s (subtitles)
-        if (streamIdx != "0") {
-            LOG_WARN("Only input 0 is supported in stream mappings, got: %s", streamIdx.c_str());
-            continue;
-        }
-
-        if (exclude) {
-            if (streamType == "s" || streamType == "s?") {
-                // Exclude subtitles - this is handled in the main loop
-                LOG_INFO("Excluding subtitle streams as requested");
-            } else if (streamType == "a" || streamType == "a?") {
-                // Exclude audio streams
-                LOG_INFO("Excluding audio streams as requested");
-                // Disable audio processing and mark all audio streams for exclusion
+        if (parsed.exclude) {
+            // Handle stream exclusions
+            if (parsed.type == "s") {
+                LOG_INFO("Excluding subtitles");
+            } else if (parsed.type == "a") {
+                LOG_INFO("Excluding audio");
                 out.audioConfig.enabled = false;
-                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
-                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                        out.map_streams[i] = -1;
-                    }
-                }
-            } else if (streamType == "d" || streamType == "d?") {
-                // Exclude data streams
-                LOG_INFO("Excluding data streams as requested");
-                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
-                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
-                        out.map_streams[i] = -1;
-                    }
-                }
-            } else if (streamType == "t" || streamType == "t?") {
-                // Exclude attachment streams
-                LOG_INFO("Excluding attachment streams as requested");
-                for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
-                    if (in.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT) {
-                        out.map_streams[i] = -1;
-                    }
-                }
+                exclude_streams_by_type(AVMEDIA_TYPE_AUDIO, in, out);
+            } else if (parsed.type == "d") {
+                LOG_INFO("Excluding data streams");
+                exclude_streams_by_type(AVMEDIA_TYPE_DATA, in, out);
+            } else if (parsed.type == "t") {
+                LOG_INFO("Excluding attachments");
+                exclude_streams_by_type(AVMEDIA_TYPE_ATTACHMENT, in, out);
             }
         } else {
-            // Include specific streams - mark them for processing
-            if (streamType == "0") {
-                // First stream (usually video) - already handled
-            } else if (streamType == "1") {
-                // Second stream (usually audio) - ensure it's included
-                out.audioConfig.enabled = true;
-            } else if (streamType == "a" || streamType == "a?") {
-                // Include audio streams (a? = optional, don't fail if missing)
-                LOG_INFO("Including audio streams as requested");
-                // Audio streams are already included by default in open_output
-                // Just ensure audio processing is not disabled
+            // Handle stream inclusions
+            if (parsed.type == "v") {
+                LOG_INFO("Including video streams");
+            } else if (parsed.type == "a") {
+                LOG_INFO("Including audio streams");
                 if (!out.audioConfig.codec.empty()) {
                     out.audioConfig.enabled = true;
                 }
-            } else if (streamType == "s" || streamType == "s?") {
-                // Include subtitle streams (s? = optional, don't fail if missing)
-                LOG_INFO("Including subtitle streams as requested");
-                // Subtitle streams are already included by default in open_output
-                // The ? suffix means don't fail if no subtitle streams exist
-            } else if (streamType == "d" || streamType == "d?") {
-                // Include data streams (d? = optional, don't fail if missing)
-                LOG_INFO("Including data streams as requested");
-                // Data streams are included by default if supported by container
-            } else if (streamType == "t" || streamType == "t?") {
-                // Include attachment streams (t? = optional, don't fail if missing)
-                LOG_INFO("Including attachment streams as requested");
-                // Attachment streams are included by default if supported by container
+            } else if (parsed.type == "1") {
+                out.audioConfig.enabled = true;
             }
         }
     }
@@ -1253,7 +1284,7 @@ void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64
     if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
         // Use the same global baseline as video to ensure A/V sync
         out.next_audio_pts = av_rescale_q(global_baseline_pts_us, {1, AV_TIME_BASE}, out.aenc->time_base);
-        printf("SEEK DEBUG: Audio PTS aligned with global baseline: %lld (%.3fs)\n",
+        LOG_DEBUG("Audio PTS aligned with global baseline: %lld (%.3fs)",
                out.next_audio_pts, out.next_audio_pts * av_q2d(out.aenc->time_base));
     } else if (in.seek_offset_us > 0) {
         // Fallback to seek offset if no global baseline established yet

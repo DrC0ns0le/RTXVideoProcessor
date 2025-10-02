@@ -17,7 +17,9 @@
 #include <cerrno>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <process.h>
 #else
@@ -43,6 +45,7 @@ extern "C"
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/display.h>
 #include <libavutil/rational.h>
+#include <libavutil/parseutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -52,9 +55,16 @@ extern "C"
 #include "rtx_processor.h"
 #include "frame_pool.h"
 #include "ts_utils.h"
+#include "timestamp_manager.h"
 #include "processor.h"
 #include "logger.h"
 #include "audio_config.h"
+#include "async_demuxer.h"
+
+// Compatibility for older FFmpeg versions
+#ifndef AV_FRAME_FLAG_KEY
+#define AV_FRAME_FLAG_KEY (1 << 0)
+#endif
 
 // RAII deleters for FFmpeg types that require ** double-pointer frees
 static inline void av_frame_free_single(AVFrame *f)
@@ -436,6 +446,7 @@ static inline void encode_and_write(AVCodecContext *enc,
             break;
         ff_check(ret, "receive encoded packet");
         opkt->stream_index = vstream->index;
+
         av_packet_rescale_ts(opkt.get(), enc->time_base, vstream->time_base);
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
@@ -540,7 +551,24 @@ struct PipelineConfig
     std::string audioFilter;
 
     // Seek options
-    std::string seekTime;
+    std::string seekTime;          // Input seeking (-ss before -i)
+    std::string outputSeekTime;    // Output seeking (-ss after -i)
+    std::string outputTsOffset;    // Output timestamp offset (-output_ts_offset)
+    bool copyts = false;           // Preserve original timestamps (-copyts)
+    bool noAccurateSeek = false;   // Fast seek to nearest keyframe (-noaccurate_seek)
+    bool seek2any = false;         // Allow seeking to non-keyframes (-seek2any)
+    bool seekTimestamp = false;    // Use timestamp-based seeking (-seek_timestamp)
+
+    // Timestamp handling options (FFmpeg compatibility)
+    std::string avoidNegativeTs = "auto";  // FFmpeg -avoid_negative_ts (auto/make_zero/make_non_negative/disabled)
+    bool startAtZero = false;              // FFmpeg -start_at_zero
+
+    // Muxer options (essential - affect output structure/playback)
+    std::string movflags;          // User-specified movflags (-movflags)
+    int64_t fragDuration = 0;      // Fragment duration in microseconds (-frag_duration)
+    int fragmentIndex = -1;        // Fragment index number (-fragment_index)
+    int useEditlist = -1;          // Use edit list in MP4 (-use_editlist)
+    int maxMuxingQueueSize = -1;   // Max muxing queue size (-max_muxing_queue_size)
 };
 
 static char *extract_ffmpeg_file_path(char *value)
@@ -634,6 +662,8 @@ static void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
 
     hlsOpts.enabled = true;
     hlsOpts.overwrite = cfg->overwrite;
+    // FFmpeg compatibility: Don't automatically mark discontinuities on seek
+    hlsOpts.autoDiscontinuity = !cfg->ffCompatible;
 
     // Parse playlist path (skip directory creation for pipe output)
     std::filesystem::path playlistPath(cfg->outputPath);
@@ -971,7 +1001,107 @@ static void compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 fprintf(stderr, "-ss requires a time value\n");
                 exit(1);
             }
-            cfg->seekTime = argv[++i];
+            // Determine if this is input seeking or output seeking based on context
+            // If we haven't seen -i yet, it's input seeking
+            // If we have seen -i, it's output seeking
+            if (cfg->inputPath == nullptr) {
+                cfg->seekTime = argv[++i];
+            } else {
+                cfg->outputSeekTime = argv[++i];
+            }
+        }
+        else if (arg == "-copyts")
+        {
+            cfg->copyts = true;
+        }
+        else if (arg == "-start_at_zero")
+        {
+            cfg->startAtZero = true;
+        }
+        else if (arg == "-avoid_negative_ts")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-avoid_negative_ts requires a value (auto/make_zero/make_non_negative/disabled)\n");
+                exit(1);
+            }
+            cfg->avoidNegativeTs = argv[++i];
+        }
+        else if (arg == "-output_ts_offset")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-output_ts_offset requires a time value\n");
+                exit(1);
+            }
+            cfg->outputTsOffset = argv[++i];
+        }
+        else if (arg == "-noaccurate_seek")
+        {
+            cfg->noAccurateSeek = true;
+        }
+        else if (arg == "-seek2any")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-seek2any requires a value\n");
+                exit(1);
+            }
+            cfg->seek2any = (std::stoi(argv[++i]) != 0);
+        }
+        else if (arg == "-seek_timestamp")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-seek_timestamp requires a value\n");
+                exit(1);
+            }
+            cfg->seekTimestamp = (std::stoi(argv[++i]) != 0);
+        }
+        else if (arg == "-movflags")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-movflags requires flags\n");
+                exit(1);
+            }
+            cfg->movflags = argv[++i];
+        }
+        else if (arg == "-frag_duration")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-frag_duration requires a value\n");
+                exit(1);
+            }
+            cfg->fragDuration = std::stoll(argv[++i]);
+        }
+        else if (arg == "-fragment_index")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-fragment_index requires a value\n");
+                exit(1);
+            }
+            cfg->fragmentIndex = std::stoi(argv[++i]);
+        }
+        else if (arg == "-use_editlist")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-use_editlist requires a value\n");
+                exit(1);
+            }
+            cfg->useEditlist = std::stoi(argv[++i]);
+        }
+        else if (arg == "-max_muxing_queue_size")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-max_muxing_queue_size requires a value\n");
+                exit(1);
+            }
+            cfg->maxMuxingQueueSize = std::stoi(argv[++i]);
         }
         // Detect output path: file extensions or pipe/stdout
         if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv") ||
@@ -1011,7 +1141,7 @@ static void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p4\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3\n");
-    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
+    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 0\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
@@ -1050,7 +1180,7 @@ static void init_setup(int argc, char **argv, PipelineConfig *cfg)
     cfg->rc = "constqp";
 
     cfg->gop = 3;  // 3 seconds GOP for HLS compatibility (will be multiplied by framerate)
-    cfg->bframes = 2;
+    cfg->bframes = 0;
     cfg->qp = 21;
     cfg->targetBitrateMultiplier = 2;
 
@@ -1402,7 +1532,12 @@ static bool configure_input_hdr_detection(PipelineConfig& cfg, InputContext& in)
         inputOpts.fflags = cfg.fflags;
         inputOpts.preferP010ForHDR = true;
         inputOpts.seekTime = cfg.seekTime;
-        inputOpts.keyframeSeekForHLS = will_use_hls_output(cfg); // Use keyframe seeking for HLS
+        inputOpts.noAccurateSeek = cfg.noAccurateSeek;
+        inputOpts.seek2any = cfg.seek2any;
+        inputOpts.seekTimestamp = cfg.seekTimestamp;
+        // FFmpeg compatibility: Disable non-standard behaviors
+        inputOpts.enableErrorConcealment = !cfg.ffCompatible;
+        inputOpts.flushOnSeek = false;
         open_input(cfg.inputPath, in, &inputOpts);
         LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
     }
@@ -1508,7 +1643,24 @@ static AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& i
         out.venc->pix_fmt = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
     }
 
-    out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
+    // For HLS, align GOP with segment duration for clean boundaries
+    // At high frame rates, use shorter segments to reduce IDR encoding overhead
+    int gop_duration_sec = cfg.gop;
+    if (hls_enabled && out.hlsOptions.hlsTime > 0) {
+        gop_duration_sec = out.hlsOptions.hlsTime;
+
+        // For high frame rates (>50fps), recommend shorter segments to reduce IDR cost
+        double fps = (double)fr.num / fr.den;
+        if (fps > 50 && gop_duration_sec > 2) {
+            LOG_WARN("High frame rate (%.1f fps) with %d-sec segments may cause periodic slowdowns",
+                     fps, gop_duration_sec);
+            LOG_WARN("Consider using -hls_time 2 for better performance at high FPS");
+        }
+
+        LOG_INFO("Aligning GOP size (%d sec = %d frames) with HLS segment duration",
+                 gop_duration_sec, gop_duration_sec * fr.num / std::max(1, fr.den));
+    }
+    out.venc->gop_size = gop_duration_sec * fr.num / std::max(1, fr.den);
     out.venc->max_b_frames = 2;
     out.venc->color_range = AVCOL_RANGE_MPEG;
 
@@ -1545,6 +1697,20 @@ static AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& i
     av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
     av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+
+    // Note: async_depth can cause frame reordering issues with some muxers
+    // Removed for now - can re-enable if needed for extreme high-fps scenarios
+    // av_opt_set_int(out.venc->priv_data, "async_depth", 4, 0);
+    // av_opt_set_int(out.venc->priv_data, "delay", 4, 0);
+
+    // For HLS output, force IDR frames to ensure clean segment boundaries
+    if (hls_enabled) {
+        av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
+        // Note: strict_gop disabled - it prevents adaptive scene-change IDRs which hurts encoding performance
+        // forced-idr alone is sufficient to ensure IDRs at GOP boundaries for HLS
+        // av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
+        LOG_INFO("Enabled forced-idr for HLS segment alignment (strict_gop disabled for better performance)");
+    }
 
     // Set HEVC profile based on HDR output: use Main10 for HDR, Main for SDR
     if (outputHDR) {
@@ -1695,30 +1861,60 @@ static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use
     }
 }
 
-// Helper function for writing muxer header
-static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff, const AVRational& fr, bool is_pipe) {
-    // Write header
-    out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
-    out.vstream->avg_frame_rate = fr;
-    // Write header with MOV/MP4 muxer flags for broad compatibility
-    AVDictionary *muxopts = out.muxOptions;
-    // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
+static void apply_movflags(AVDictionary** muxopts, bool is_pipe, bool hls_enabled, const PipelineConfig& cfg) {
+    // User-specified flags take priority (FFmpeg-compatible)
+    if (!cfg.movflags.empty()) {
+        av_dict_set(muxopts, "movflags", cfg.movflags.c_str(), 0);
+        LOG_DEBUG("Applied user movflags: %s\n", cfg.movflags.c_str());
+        return;
+    }
+
+    // Legacy mode: Auto-apply flags for compatibility
+    if (cfg.ffCompatible) return;
 
     if (is_pipe) {
-        // For pipe output, use fragmented MP4 which doesn't require seeking
-        // frag_keyframe: fragment on every keyframe
-        // empty_moov: write a minimal moov at the start
-        // default_base_moof: use default base for movie fragments
-        av_dict_set(&muxopts, "movflags", "+empty_moov+default_base_moof+delay_moov+dash+write_colr", 0);
-    } else if (!hls_enabled && mux_is_isobmff) {
-        // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
-        av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
+        av_dict_set(muxopts, "movflags", "+empty_moov+default_base_moof+delay_moov+dash+write_colr", 0);
+    } else if (!hls_enabled) {
+        av_dict_set(muxopts, "movflags", "+faststart+write_colr", 0);
     } else {
-        av_dict_set(&muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
+        av_dict_set(muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
     }
+}
+
+static void apply_fragment_options(AVDictionary** muxopts, const PipelineConfig& cfg) {
+    if (cfg.fragDuration > 0) {
+        av_dict_set(muxopts, "frag_duration", std::to_string(cfg.fragDuration).c_str(), 0);
+    }
+    if (cfg.fragmentIndex >= 0) {
+        av_dict_set(muxopts, "fragment_index", std::to_string(cfg.fragmentIndex).c_str(), 0);
+    }
+    if (cfg.useEditlist >= 0) {
+        av_dict_set(muxopts, "use_editlist", std::to_string(cfg.useEditlist).c_str(), 0);
+    }
+}
+
+static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff,
+                               const AVRational& fr, bool is_pipe, const PipelineConfig& cfg) {
+    out.vstream->time_base = out.venc->time_base;
+    out.vstream->avg_frame_rate = fr;
+
+    AVDictionary *muxopts = out.muxOptions;
+
+    if (mux_is_isobmff) {
+        apply_movflags(&muxopts, is_pipe, hls_enabled, cfg);
+        apply_fragment_options(&muxopts, cfg);
+    }
+
+    // Apply FFmpeg-compatible timestamp handling to muxer (affects all formats)
+    av_dict_set(&muxopts, "avoid_negative_ts", cfg.avoidNegativeTs.c_str(), 0);
+    LOG_DEBUG("Muxer avoid_negative_ts: %s", cfg.avoidNegativeTs.c_str());
+
+    if (cfg.maxMuxingQueueSize > 0) {
+        out.fmt->max_interleave_delta = cfg.maxMuxingQueueSize;
+    }
+
     ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
-    if (muxopts)
-        av_dict_free(&muxopts);
+    if (muxopts) av_dict_free(&muxopts);
     out.muxOptions = nullptr;
 }
 
@@ -1742,7 +1938,12 @@ int run_pipeline(PipelineConfig cfg)
         InputOpenOptions inputOpts;
         inputOpts.fflags = cfg.fflags;
         inputOpts.seekTime = cfg.seekTime;
-        inputOpts.keyframeSeekForHLS = will_use_hls_output(cfg); // Use keyframe seeking for HLS
+        inputOpts.noAccurateSeek = cfg.noAccurateSeek;
+        inputOpts.seek2any = cfg.seek2any;
+        inputOpts.seekTimestamp = cfg.seekTimestamp;
+        // FFmpeg compatibility: Disable non-standard behaviors
+        inputOpts.enableErrorConcealment = !cfg.ffCompatible;  // FFmpeg doesn't enable error concealment by default
+        inputOpts.flushOnSeek = false;  // FFmpeg never flushes decoder on seek
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
@@ -1838,22 +2039,13 @@ int run_pipeline(PipelineConfig cfg)
 
         // Stage 10: Write muxer header
         bool isPipeOutput = is_pipe_output(cfg.outputPath);
-        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr, isPipeOutput);
+        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr, isPipeOutput, cfg);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
 
-        // PTS handling: derive video PTS from input timestamps to avoid A/V drift
-        int64_t v_start_pts = AV_NOPTS_VALUE;              // first input video pts
-        int64_t last_output_pts = AV_NOPTS_VALUE;          // last emitted video pts in encoder tb
-        AVRational output_time_base = out.venc->time_base; // encoder time base
-
-        // Baseline tracking for copied streams
-        int64_t a_start_pts_copied = AV_NOPTS_VALUE;       // first audio pts for copied streams
-        std::vector<int64_t> stream_start_pts(in.fmt->nb_streams, AV_NOPTS_VALUE); // per-stream baselines
-
-        // Global baseline approach: use the very first packet timestamp as baseline
-        int64_t global_baseline_pts_us = AV_NOPTS_VALUE;  // first packet timestamp in microseconds
+        // Legacy variables removed - now using TimestampManager
+        // All PTS/DTS handling centralized in ts_manager
 
         const uint8_t *rtx_data = nullptr;
         uint32_t rtxW = 0, rtxH = 0;
@@ -1942,37 +2134,141 @@ int run_pipeline(PipelineConfig cfg)
             processor = std::move(cpuProc);
         }
 
+        // Initialize centralized timestamp manager (V2)
+        TimestampManager::Config ts_config;
+        ts_config.mode = cfg.copyts ? TimestampManager::Mode::COPYTS : TimestampManager::Mode::NORMAL;
+        ts_config.input_seek_us = in.seek_offset_us;
+        // FFmpeg compatibility: Don't automatically fix timestamp violations
+        ts_config.enforce_monotonicity = !cfg.ffCompatible;  // FFmpeg reports errors, doesn't auto-fix
+
+        // Parse avoid_negative_ts setting (FFmpeg-compatible)
+        std::string avoid_ts_lower = cfg.avoidNegativeTs;
+        std::transform(avoid_ts_lower.begin(), avoid_ts_lower.end(), avoid_ts_lower.begin(), ::tolower);
+        if (avoid_ts_lower == "disabled") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::DISABLED;
+        } else if (avoid_ts_lower == "make_zero") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_ZERO;
+        } else if (avoid_ts_lower == "make_non_negative") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_NON_NEGATIVE;
+        } else {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::AUTO;  // Default
+        }
+
+        // Set start_at_zero flag (FFmpeg-compatible)
+        ts_config.start_at_zero = cfg.startAtZero;
+
+        // Store settings in OutputContext for muxer reference
+        out.avoidNegativeTs = ts_config.avoid_negative_ts;
+        out.startAtZero = ts_config.start_at_zero;
+
+        // Detect actual frame rate for better monotonicity recovery
+        AVRational detected_fr = av_guess_frame_rate(in.fmt, in.vst, nullptr);
+        if (detected_fr.num > 0 && detected_fr.den > 0) {
+            ts_config.expected_frame_rate = detected_fr;
+            LOG_DEBUG("Detected frame rate: %d/%d (%.3f fps)",
+                     detected_fr.num, detected_fr.den, av_q2d(detected_fr));
+        } else {
+            ts_config.expected_frame_rate = {24, 1};  // Default fallback
+            LOG_WARN("Could not detect frame rate, using default 24fps");
+        }
+
+        // Parse output seeking time
+        if (!cfg.outputSeekTime.empty()) {
+            int ret = av_parse_time(&ts_config.output_seek_target_us, cfg.outputSeekTime.c_str(), 1);
+            if (ret < 0) {
+                throw std::runtime_error("Invalid output seek time format: " + cfg.outputSeekTime);
+            }
+            LOG_DEBUG("Output seeking enabled: target = %.3fs", ts_config.output_seek_target_us / 1000000.0);
+
+            // Edge case: Warn if output seek < input seek
+            if (in.seek_offset_us > 0 && ts_config.output_seek_target_us < in.seek_offset_us) {
+                LOG_WARN("Output seek target (%.3fs) < input seek (%.3fs) - may cause unexpected behavior",
+                         ts_config.output_seek_target_us / 1000000.0, in.seek_offset_us / 1000000.0);
+            }
+        }
+
+        // Parse output timestamp offset
+        if (!cfg.outputTsOffset.empty()) {
+            int ret = av_parse_time(&ts_config.output_ts_offset_us, cfg.outputTsOffset.c_str(), 1);
+            if (ret < 0) {
+                throw std::runtime_error("Invalid output timestamp offset format: " + cfg.outputTsOffset);
+            }
+            LOG_DEBUG("Output timestamp offset: %.3fs", ts_config.output_ts_offset_us / 1000000.0);
+        }
+
+        // Edge case: Validate copyts + output_ts_offset usage
+        if (ts_config.output_ts_offset_us != 0 && !cfg.copyts) {
+            LOG_WARN("-output_ts_offset specified without -copyts. This may produce unexpected timestamps.");
+            LOG_WARN("Typically use: -copyts -output_ts_offset <value> together");
+        }
+
+        // Create timestamp manager (V2)
+        TimestampManager ts_manager(ts_config);
+        ts_manager.dumpState();
+
+        // Initialize async demuxer for non-blocking I/O
+        AsyncDemuxer::Config demux_config;
+        // Scale buffer based on frame rate: target 2-3 seconds of buffering
+        // At 30fps: 60-90 frames, at 60fps: 120-180 frames, at 120fps: 240-360 frames
+        double fps = av_q2d(fr);
+        size_t target_buffer_seconds = 3;
+        demux_config.max_queue_size = static_cast<size_t>(fps * target_buffer_seconds);
+        demux_config.max_queue_size = std::max<size_t>(60, std::min<size_t>(360, demux_config.max_queue_size));
+        demux_config.enable_stats = true;
+        AsyncDemuxer async_demuxer(in.fmt, demux_config);
+        LOG_DEBUG("Async demuxer queue size: %zu frames (%.1f fps, %zu sec buffer)",
+                  demux_config.max_queue_size, fps, target_buffer_seconds);
+
+        // Start async demuxing thread
+        if (!async_demuxer.start()) {
+            throw std::runtime_error("Failed to start async demuxer");
+        }
+
         // Read packets
-        LOG_DEBUG("Starting frame processing loop...");
+        LOG_DEBUG("Starting frame processing loop with async demuxing...");
         LOG_DEBUG("Video stream index: %d, Audio stream index: %d", in.vstream, in.astream);
         LOG_DEBUG("Audio config enabled: %s", out.audioConfig.enabled ? "true" : "false");
-        printf("SEEK DEBUG: Starting processing with seek_offset_us = %lld (%.3fs)\n", in.seek_offset_us, in.seek_offset_us / 1000000.0);
+        LOG_DEBUG("Copyts mode: %s", cfg.copyts ? "enabled" : "disabled");
+        LOG_DEBUG("FFmpeg compatibility: avoid_negative_ts=%s, start_at_zero=%s",
+                 cfg.avoidNegativeTs.c_str(), cfg.startAtZero ? "enabled" : "disabled");
+        LOG_DEBUG("Starting processing with seek_offset_us = %lld (%.3fs)", in.seek_offset_us, in.seek_offset_us / 1000000.0);
         int packet_count = 0;
         bool audio_pts_aligned = false;  // Track if we've aligned audio PTS with video baseline
         while (true)
         {
-            int ret = av_read_frame(in.fmt, pkt.get());
-            if (ret == AVERROR_EOF)
-            {
+            // Get packet from async demuxer (non-blocking I/O)
+            AVPacket* raw_pkt = async_demuxer.getPacket();
+            if (!raw_pkt) {
+                // Check for EOF or error
+                if (async_demuxer.isEOF()) {
+                    break;
+                }
+                int err = async_demuxer.getError();
+                if (err != 0) {
+                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_make_error_string(errbuf, sizeof(errbuf), err);
+                    throw std::runtime_error(std::string("Async demuxer error: ") + errbuf);
+                }
                 break;
             }
-            ff_check(ret, "read frame");
+
+            // Transfer ownership to smart pointer
+            av_packet_unref(pkt.get());
+            av_packet_move_ref(pkt.get(), raw_pkt);
+            av_packet_free(&raw_pkt);
             packet_count++;
 
             // Establish global baseline from the first VIDEO packet when seeking to ensure A/V sync
-            if (in.seek_offset_us > 0 && global_baseline_pts_us == AV_NOPTS_VALUE &&
+            if (in.seek_offset_us > 0 && ts_manager.getGlobalBaseline() == AV_NOPTS_VALUE &&
                 pkt->stream_index == in.vstream && pkt->pts != AV_NOPTS_VALUE) {
                 AVStream *stream = in.fmt->streams[pkt->stream_index];
-                global_baseline_pts_us = av_rescale_q(pkt->pts, stream->time_base, {1, AV_TIME_BASE});
-                printf("SEEK DEBUG: Established global baseline from VIDEO stream %d: %lld (%.3fs)\n",
-                       pkt->stream_index, pkt->pts, global_baseline_pts_us / 1000000.0);
+                ts_manager.establishGlobalBaseline(pkt.get(), stream->time_base);
 
                 // Align audio PTS with the newly established video baseline
                 if (out.audioConfig.enabled && !audio_pts_aligned) {
-                    init_audio_pts_after_seek(in, out, global_baseline_pts_us);
+                    init_audio_pts_after_seek(in, out, ts_manager.getGlobalBaseline());
                     audio_pts_aligned = true;
-                    printf("SEEK DEBUG: Audio PTS aligned with video baseline at %.3fs\n",
-                           global_baseline_pts_us / 1000000.0);
+                    LOG_DEBUG("Audio PTS aligned with video baseline at %.3fs", ts_manager.getGlobalBaseline() / 1000000.0);
                 }
             }
 
@@ -1984,7 +2280,7 @@ int run_pipeline(PipelineConfig cfg)
 
                 while (true)
                 {
-                    ret = avcodec_receive_frame(in.vdec, frame.get());
+                    int ret = avcodec_receive_frame(in.vdec, frame.get());
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         break;
                     ff_check(ret, "receive frame");
@@ -2001,19 +2297,19 @@ int run_pipeline(PipelineConfig cfg)
                         decframe = swframe.get();
                         frame_is_cuda = false;
                     }
-                    // Compute output PTS by rescaling input timestamps to encoder time base
-                    int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
-                                         ? decframe->pts
-                                         : decframe->best_effort_timestamp;
-                    // Prioritize HLS segment continuity over perfect A/V sync
-                    // Use the simpler derive_output_pts method which was working previously
-                    int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base, in.seek_offset_us);
 
-                    // Ensure strict monotonicity to satisfy encoder/muxer
-                    if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
-                        output_pts = last_output_pts + 1;
+                    // Output seeking: Drop frames until target reached (handled by TimestampManager)
+                    if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base)) {
+                        av_frame_unref(frame.get());
+                        if (swframe)
+                            av_frame_unref(swframe.get());
+                        continue;
                     }
-                    last_output_pts = output_pts;
+
+                    // Derive output PTS/DTS using centralized timestamp manager V2
+                    // Handles NORMAL/COPYTS modes, output_ts_offset, monotonicity, DTS, etc.
+                    TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
+                        decframe, in.vst->time_base, out.venc->time_base);
 
                     // Use unified processor
                     AVFrame *outFrame = nullptr;
@@ -2027,14 +2323,16 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set consistent PTS to prevent stuttering
-                    outFrame->pts = output_pts;
+                    // Set consistent PTS/DTS to prevent stuttering
+                    outFrame->pts = timestamps.pts;
+                    outFrame->pkt_dts = timestamps.dts;
 
-                    // Ensure GPU work completes before encoding when on CUDA path
+                    // IMPORTANT: Must sync before encoder accesses CUDA frame data
+                    // RTX processor syncs internally, but this ensures frame is ready for NVENC
                     if (use_cuda_path)
                         cudaStreamSynchronize(0);
 
-                    // Encode
+                    // Encode frame
                     encode_and_write(out.venc, out.vstream, out.fmt, outFrame, opkt, "send frame to encoder");
                     av_frame_unref(frame.get());
                     if (swframe)
@@ -2043,12 +2341,14 @@ int run_pipeline(PipelineConfig cfg)
             }
             else if (cfg.ffCompatible && out.audioConfig.enabled && in.astream >= 0 && pkt->stream_index == in.astream)
             {
-                // When seeking, wait for video baseline to be established before processing audio
-                // This ensures better A/V sync by aligning audio timeline with video
-                if (in.seek_offset_us > 0 && global_baseline_pts_us == AV_NOPTS_VALUE) {
-                    av_packet_unref(pkt.get());
-                    continue;
-                }
+                // FFmpeg does NOT wait for video baseline before processing audio
+                // Dropping audio packets while waiting for video can cause A/V desync
+                // Only drop if explicitly required for custom sync logic (non-FFmpeg behavior)
+                // NOTE: Disabled by default for FFmpeg compatibility
+                // if (in.seek_offset_us > 0 && ts_manager.getGlobalBaseline() == AV_NOPTS_VALUE) {
+                //     av_packet_unref(pkt.get());
+                //     continue;
+                // }
 
                 // Process audio packets when audio encoding is enabled
                 if (in.adec && out.aenc)
@@ -2063,6 +2363,14 @@ int run_pipeline(PipelineConfig cfg)
                         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                             break;
                         ff_check(ret, "receive audio frame");
+
+                        // Update A/V drift monitoring
+                        if (audio_frame->pts != AV_NOPTS_VALUE) {
+                            int64_t audio_pts_us = av_rescale_q(audio_frame->pts,
+                                                                in.ast->time_base,
+                                                                {1, AV_TIME_BASE});
+                            ts_manager.updateAudioTimestamp(audio_pts_us);
+                        }
 
                         // Use the new helper function to process audio
                         if (process_audio_frame(audio_frame.get(), out, opkt.get()))
@@ -2089,19 +2397,13 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
 
-                        // When seeking, ensure we have video baseline before processing audio copy
-                        if (in.seek_offset_us > 0) {
-                            if (global_baseline_pts_us == AV_NOPTS_VALUE) {
-                                av_packet_unref(pkt.get());
-                                continue;
-                            }
-                            // Use global baseline for audio copy
-                            int64_t adjusted_pts = derive_global_baseline_pts(pkt->pts, global_baseline_pts_us, ist->time_base);
-                            pkt->pts = adjusted_pts;
-                            if (pkt->dts != AV_NOPTS_VALUE) {
-                                int64_t adjusted_dts = derive_global_baseline_pts(pkt->dts, global_baseline_pts_us, ist->time_base);
-                                pkt->dts = adjusted_dts;
-                            }
+                        // Use centralized timestamp manager for audio copy packets
+                        ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+
+                        // Check if packet was invalidated (waiting for baseline)
+                        if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+                            av_packet_unref(pkt.get());
+                            continue;
                         }
 
                         av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
@@ -2129,15 +2431,8 @@ int run_pipeline(PipelineConfig cfg)
                     AVStream *ist = in.fmt->streams[pkt->stream_index];
                     AVStream *ost = out.fmt->streams[out_index];
 
-                    // Use unified PTS derivation for other streams
-                    int64_t adjusted_pts = derive_copied_stream_pts(stream_start_pts[pkt->stream_index], pkt->pts, in.seek_offset_us, ist->time_base);
-                    if (adjusted_pts != AV_NOPTS_VALUE) {
-                        pkt->pts = adjusted_pts;
-                        if (pkt->dts != AV_NOPTS_VALUE) {
-                            int64_t adjusted_dts = derive_copied_stream_pts(stream_start_pts[pkt->stream_index], pkt->dts, in.seek_offset_us, ist->time_base);
-                            pkt->dts = adjusted_dts;
-                        }
-                    }
+                    // Use centralized timestamp manager for all copied streams
+                    ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
 
                     av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
                     pkt->stream_index = out_index;
@@ -2182,7 +2477,10 @@ int run_pipeline(PipelineConfig cfg)
 
         ff_check(av_write_trailer(out.fmt), "write trailer");
 
-        // Print final progress
+        // Stop async demuxer
+        async_demuxer.stop();
+
+        // Print final progress and statistics
         if (total_frames > 0)
         {
             auto end_time = std::chrono::high_resolution_clock::now();
@@ -2190,8 +2488,41 @@ int run_pipeline(PipelineConfig cfg)
             double total_sec = total_ms / 1000.0;
             double avg_fps = (total_sec > 0) ? processed_frames / total_sec : 0.0;
 
-            fprintf(stderr, "\nProcessing completed in %.1f seconds (%.1f fps)\n",
-                    total_sec, avg_fps);
+            LOG_DEBUG("Processing completed in %.1fs @ %.1f fps", total_sec, avg_fps);
+
+            // Async demuxer statistics
+            AsyncDemuxer::Stats demux_stats = async_demuxer.getStats();
+            LOG_DEBUG("Demuxer stats: packets=%zu, queue_waits=%zu, queue_depth=%zu/%zu%s",
+                     demux_stats.total_reads, demux_stats.queue_full_waits,
+                     demux_stats.min_queue_depth != SIZE_MAX ? demux_stats.min_queue_depth : 0,
+                     demux_stats.max_queue_depth,
+                     demux_stats.queue_full_waits > 0 ? " (backpressure)" : "");
+
+            // Report timestamp statistics
+            TimestampManager::Stats ts_stats = ts_manager.getStats();
+            if (ts_stats.dropped_frames > 0 || ts_stats.discontinuities > 0 ||
+                ts_stats.monotonicity_violations > 0 || ts_stats.negative_pts > 0 ||
+                ts_stats.av_drift_warnings > 0) {
+                LOG_DEBUG("Timestamp stats: dropped=%d, discontinuities=%d, monotonic_fix=%d, neg_pts=%d, av_drift=%d (max=%.1fms)%s",
+                         ts_stats.dropped_frames, ts_stats.discontinuities,
+                         ts_stats.monotonicity_violations, ts_stats.negative_pts,
+                         ts_stats.av_drift_warnings, ts_stats.max_av_drift_ms,
+                         ts_stats.max_av_drift_ms > 500.0 ? " WARNING:HIGH_DRIFT" : "");
+            }
+
+            // Overall health assessment
+            bool healthy = true;
+            std::string warnings;
+            if (demux_stats.queue_full_waits > demux_stats.total_reads * 0.1) {
+                warnings += "demux_backpressure ";
+                healthy = false;
+            }
+            if (ts_stats.max_av_drift_ms > 500.0) {
+                warnings += "high_av_drift ";
+                healthy = false;
+            }
+            LOG_DEBUG("Pipeline health: %s%s", healthy ? "OK" : "WARN",
+                     warnings.empty() ? "" : (" - " + warnings).c_str());
         }
         if (sws_to_argb)
             sws_freeContext(sws_to_argb);

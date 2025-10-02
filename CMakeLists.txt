@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 project(RTXVideoProcessor LANGUAGES C CXX CUDA)
 
+# Modern CMake policies
+cmake_policy(SET CMP0144 NEW)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
@@ -20,53 +23,67 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-message(STATUS "FFmpeg libs:\n  avformat=${FFMPEG_AVFORMAT_LIB}\n  avcodec=${FFMPEG_AVCODEC_LIB}\n  avfilter=${FFMPEG_AVFILTER_LIB}\n  avutil=${FFMPEG_AVUTIL_LIB}\n  swscale=${FFMPEG_SWSCALE_LIB}\n  swresample=${FFMPEG_SWRESAMPLE_LIB}")
 
 # CUDA (Toolkit 12.x)
 find_package(CUDAToolkit REQUIRED)
 
-# Find packages
+# FFmpeg - Prioritize vcpkg, fallback to manual C:/ffmpeg
 find_package(PkgConfig)
+set(FFMPEG_FOUND FALSE)
 
-# FFmpeg - Try to find using pkg-config first, then manual search
-if(PKG_CONFIG_FOUND)
-    pkg_check_modules(FFMPEG QUIET
-        libavformat>=60.0
-        libavcodec>=60.0 
-        libavutil>=58.0
-        libswscale>=7.0
+# Try vcpkg/CMake package first
+find_package(FFMPEG QUIET COMPONENTS avformat avcodec avfilter avutil swscale swresample)
+if(NOT FFMPEG_FOUND)
+  # Try individual find_package for vcpkg FFmpeg
+  find_package(ffmpeg QUIET CONFIG)
+  if(ffmpeg_FOUND)
+    set(FFMPEG_FOUND TRUE)
+    message(STATUS "Found FFmpeg via vcpkg")
+  endif()
+endif()
+
+# Fallback to pkg-config
+if(NOT FFMPEG_FOUND AND PKG_CONFIG_FOUND)
+  pkg_check_modules(FFMPEG QUIET
+    libavformat>=60.0
+    libavcodec>=60.0
+    libavfilter>=9.0
+    libavutil>=58.0
+    libswscale>=7.0
+    libswresample>=4.0
+  )
+  if(FFMPEG_FOUND)
+    message(STATUS "Found FFmpeg via pkg-config")
+  endif()
+endif()
+
+# Fallback to manual C:/ffmpeg
+if(NOT FFMPEG_FOUND)
+  message(STATUS "FFmpeg not found via vcpkg/pkg-config, trying manual path")
+  set(FFMPEG_ROOT "C:/ffmpeg" CACHE PATH "Path to FFmpeg prebuilt root containing include/ and lib/")
+  set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+  set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
+
+  # Resolve FFmpeg import libraries explicitly
+  foreach(lib avformat avcodec avfilter avutil swscale swresample)
+    string(TOUPPER ${lib} lib_upper)
+    find_library(FFMPEG_${lib_upper}_LIB
+      NAMES ${lib} ${lib}.lib ${lib}-61 ${lib}-61.lib ${lib}-60 ${lib}-60.lib
+            ${lib}-10 ${lib}-10.lib ${lib}-9 ${lib}-9.lib ${lib}-59 ${lib}-59.lib
+            ${lib}-58 ${lib}-58.lib ${lib}-8 ${lib}-8.lib ${lib}-7 ${lib}-7.lib
+            ${lib}-5 ${lib}-5.lib ${lib}-4 ${lib}-4.lib
+      PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH
     )
+  endforeach()
+
+  if(NOT FFMPEG_AVFORMAT_LIB OR NOT FFMPEG_AVCODEC_LIB OR NOT FFMPEG_AVFILTER_LIB OR NOT FFMPEG_AVUTIL_LIB OR NOT FFMPEG_SWSCALE_LIB OR NOT FFMPEG_SWRESAMPLE_LIB)
+    message(FATAL_ERROR "FFmpeg libraries not found.\n"
+      "Install via vcpkg: vcpkg install ffmpeg:x64-windows\n"
+      "Or set FFMPEG_ROOT to FFmpeg directory with include/ and lib/. Example: -DFFMPEG_ROOT=C:/ffmpeg")
+  endif()
+
+  message(STATUS "Found FFmpeg at ${FFMPEG_ROOT}")
 endif()
-
-# Required FFmpeg libraries
-set(FFMPEG_LIBS
-  avformat
-  avcodec
-  avfilter
-  avutil
-  swscale
-  swresample
-)
-
-# FFmpeg from C:\\ffmpeg
-set(FFMPEG_ROOT "C:/ffmpeg" CACHE PATH "Path to FFmpeg prebuilt root containing include/ and lib/")
-set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
-set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
-
-# Resolve FFmpeg import libraries explicitly to avoid linker "cannot open input file" issues
-find_library(FFMPEG_AVFORMAT_LIB  NAMES avformat avformat.lib avformat-61 avformat-61.lib avformat-60 avformat-60.lib PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-find_library(FFMPEG_AVCODEC_LIB   NAMES avcodec  avcodec.lib  avcodec-61  avcodec-61.lib  avcodec-60  avcodec-60.lib  PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-find_library(FFMPEG_AVFILTER_LIB  NAMES avfilter avfilter.lib avfilter-10 avfilter-10.lib avfilter-9  avfilter-9.lib  PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-find_library(FFMPEG_AVUTIL_LIB    NAMES avutil   avutil.lib   avutil-59   avutil-59.lib   avutil-58   avutil-58.lib   PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-find_library(FFMPEG_SWSCALE_LIB   NAMES swscale  swscale.lib  swscale-8   swscale-8.lib   swscale-7   swscale-7.lib   PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-find_library(FFMPEG_SWRESAMPLE_LIB NAMES swresample swresample.lib swresample-5 swresample-5.lib swresample-4 swresample-4.lib PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
-
-if(NOT FFMPEG_AVFORMAT_LIB OR NOT FFMPEG_AVCODEC_LIB OR NOT FFMPEG_AVFILTER_LIB OR NOT FFMPEG_AVUTIL_LIB OR NOT FFMPEG_SWSCALE_LIB OR NOT FFMPEG_SWRESAMPLE_LIB)
-  message(FATAL_ERROR "FFmpeg import libraries not found in ${FFMPEG_LIB_DIR}.\n"
-    "Expected files like avformat.lib, avcodec.lib, avutil.lib, swscale.lib, swresample.lib.\n"
-    "Set FFMPEG_ROOT to a directory with include/ and lib/ from an FFmpeg development build (MSVC). Example: -DFFMPEG_ROOT=C:/ffmpeg")
-endif()
-set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
 
 # RTX Video SDK via env var NV_RTX_VIDEO_SDK
 if(NOT DEFINED ENV{NV_RTX_VIDEO_SDK})
@@ -74,10 +91,17 @@ if(NOT DEFINED ENV{NV_RTX_VIDEO_SDK})
 endif()
 set(RTX_SDK_ROOT $ENV{NV_RTX_VIDEO_SDK})
 set(RTX_SDK_INCLUDE "${RTX_SDK_ROOT}/include")
-set(RTX_SDK_LIB_DIR "${RTX_SDK_ROOT}/lib")
 set(RTX_VIDEO_API_INCLUDE_DIR "${RTX_SDK_ROOT}/samples/RTX_Video_API")
-# Correct bin path for redistributable feature DLLs (TrueHDR/VSR)
 set(RTX_VIDEO_SDK_BIN "${RTX_SDK_ROOT}/bin/Windows/x64/rel")
+
+# Lib directory (Windows x64)
+if(EXISTS "${RTX_SDK_ROOT}/lib/Windows/x64")
+  set(RTX_SDK_LIB_DIR "${RTX_SDK_ROOT}/lib/Windows/x64")
+elseif(EXISTS "${RTX_SDK_ROOT}/lib/x64")
+  set(RTX_SDK_LIB_DIR "${RTX_SDK_ROOT}/lib/x64")
+else()
+  set(RTX_SDK_LIB_DIR "${RTX_SDK_ROOT}/lib")
+endif()
 
 # NVIDIA Video Codec SDK via env var NV_VIDEO_CODEC_SDK
 if(NOT DEFINED ENV{NV_VIDEO_CODEC_SDK})
@@ -98,9 +122,8 @@ else()
   set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/lib")
 endif()
 
-# Build options
-add_definitions(-DWIN32_LEAN_AND_MEAN)
-add_definitions(-DNOMINMAX)
+# Compiler definitions
+add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
 
 # Sources
 file(GLOB RVP_SOURCES
@@ -121,96 +144,91 @@ set_target_properties(RTXVideoProcessor PROPERTIES
   CUDA_PROPAGATE_HOST_FLAGS OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS ON
   CUDA_RUNTIME_LIBRARY Static
-  # Ensure console subsystem for proper stdin/stdout/stderr handling
   WIN32_EXECUTABLE FALSE
 )
 
 # Include directories
 target_include_directories(RTXVideoProcessor PRIVATE
-  ${FFMPEG_INCLUDE_DIR}
   ${RTX_SDK_INCLUDE}
   ${NV_CODEC_SDK_INCLUDE}
   ${CUDAToolkit_INCLUDE_DIRS}
   ${RTX_VIDEO_API_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  # Fallback for IDE IntelliSense or non-CMake consumers: use CUDA_PATH if defined
-  $ENV{CUDA_PATH}/include
 )
 
-# Link directories
-link_directories(${FFMPEG_LIB_DIR} ${RTX_SDK_LIB_DIR} ${NV_CODEC_SDK_LIB_DIR})
+# FFmpeg includes (vcpkg handles automatically, manual needs explicit path)
+if(NOT ffmpeg_FOUND AND FFMPEG_INCLUDE_DIR)
+  target_include_directories(RTXVideoProcessor PRIVATE ${FFMPEG_INCLUDE_DIR})
+endif()
+
 
 # Link libraries
-# FFmpeg (link by absolute paths for reliability)
-target_link_libraries(RTXVideoProcessor PRIVATE
-  ${FFMPEG_AVFORMAT_LIB}
-  ${FFMPEG_AVCODEC_LIB}
-  ${FFMPEG_AVFILTER_LIB}
-  ${FFMPEG_AVUTIL_LIB}
-  ${FFMPEG_SWSCALE_LIB}
-  ${FFMPEG_SWRESAMPLE_LIB}
-)
+# FFmpeg (vcpkg provides targets, manual uses absolute paths)
+if(ffmpeg_FOUND)
+  target_link_libraries(RTXVideoProcessor PRIVATE
+    ffmpeg::avformat
+    ffmpeg::avcodec
+    ffmpeg::avfilter
+    ffmpeg::avutil
+    ffmpeg::swscale
+    ffmpeg::swresample
+  )
+else()
+  target_link_libraries(RTXVideoProcessor PRIVATE
+    ${FFMPEG_AVFORMAT_LIB}
+    ${FFMPEG_AVCODEC_LIB}
+    ${FFMPEG_AVFILTER_LIB}
+    ${FFMPEG_AVUTIL_LIB}
+    ${FFMPEG_SWSCALE_LIB}
+    ${FFMPEG_SWRESAMPLE_LIB}
+  )
+endif()
 
 # CUDA core libs
 target_link_libraries(RTXVideoProcessor PRIVATE CUDA::cuda_driver CUDA::cudart_static)
 
-# NVCodec common (some SDKs provide these; keep optional)
-# Commonly needed: nvcuvid for NVDEC interop (shipped in NVIDIA drivers), and nvencodeapi for NVENC
-find_library(NVCUVID_LIB NAMES nvcuvid PATHS ${NV_CODEC_SDK_LIB_DIR} ENV LIB PATH_SUFFIXES . REQUIRED)
-find_library(NVENCODEAPI_LIB NAMES nvencodeapi PATHS ${NV_CODEC_SDK_LIB_DIR} ENV LIB PATH_SUFFIXES . REQUIRED)
+# NVIDIA Video Codec SDK libs
+find_library(NVCUVID_LIB NAMES nvcuvid PATHS ${NV_CODEC_SDK_LIB_DIR} ENV LIB PATH_SUFFIXES .)
+find_library(NVENCODEAPI_LIB NAMES nvencodeapi PATHS ${NV_CODEC_SDK_LIB_DIR} ENV LIB PATH_SUFFIXES .)
 if(NOT NVCUVID_LIB OR NOT NVENCODEAPI_LIB)
   message(FATAL_ERROR "Could not find nvcuvid or nvencodeapi in ${NV_CODEC_SDK_LIB_DIR}")
 endif()
+target_link_libraries(RTXVideoProcessor PRIVATE ${NVCUVID_LIB} ${NVENCODEAPI_LIB})
 
-# RTX Video SDK provided static/dynamic lib name (varies). Try nvsdk_ngx_s.
-find_library(RTX_VIDEO_LIB NAMES nvsdk_ngx_s PATHS ${RTX_SDK_LIB_DIR} REQUIRED)
-
-# Link SDK libs
-target_link_libraries(RTXVideoProcessor PRIVATE ${NVCUVID_LIB} ${NVENCODEAPI_LIB} ${RTX_VIDEO_LIB})
-
-# NGX SDK.
-find_library(NVSDK_NGX_LIB_RELEASE NAMES nvsdk_ngx_s PATHS ${RTX_SDK_LIB_DIR} NO_DEFAULT_PATH)
-if(NVSDK_NGX_LIB_RELEASE OR NVSDK_NGX_LIB_DEBUG)
-  message(STATUS "Linking NGX: ${NVSDK_NGX_LIB_RELEASE} ${NVSDK_NGX_LIB_DEBUG}")
-  target_link_libraries(RTXVideoProcessor PRIVATE ${NVSDK_NGX_LIB_RELEASE})
+# RTX Video SDK NGX lib
+find_library(NVSDK_NGX_LIB NAMES nvsdk_ngx_s PATHS ${RTX_SDK_LIB_DIR} NO_DEFAULT_PATH)
+if(NOT NVSDK_NGX_LIB)
+  message(FATAL_ERROR "Could not find nvsdk_ngx_s in ${RTX_SDK_LIB_DIR}")
 endif()
+message(STATUS "Linking NGX: ${NVSDK_NGX_LIB}")
+target_link_libraries(RTXVideoProcessor PRIVATE ${NVSDK_NGX_LIB})
 
-# Windows system libs
+# Windows-specific configuration
 if(MSVC)
-  target_link_libraries(RTXVideoProcessor PRIVATE ws2_32.lib bcrypt.lib Secur32.lib)
-  # Apply MSVC options only to C++ compilation units, not to CUDA. Passing /EHsc or /MP to NVCC causes build failures.
-  target_compile_options(RTXVideoProcessor PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/EHsc /MP>
-  )
-  # Explicitly set console subsystem to ensure proper stdin/stdout/stderr and prevent new window
-  set_target_properties(RTXVideoProcessor PROPERTIES
-    LINK_FLAGS "/SUBSYSTEM:CONSOLE"
-  )
+  target_link_libraries(RTXVideoProcessor PRIVATE ws2_32 bcrypt Secur32)
+  target_compile_options(RTXVideoProcessor PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc /MP>)
+  set_target_properties(RTXVideoProcessor PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 endif()
 
-# Copy RTX Video SDK DLLs to output directory
-set(RTX_DLLS
-    "${RTX_VIDEO_SDK_BIN}/nvngx_truehdr.dll"
-    "${RTX_VIDEO_SDK_BIN}/nvngx_vsr.dll"
-)
-
-# Copy NGX feature DLLs next to the executable if they exist. These come from the RTX Video SDK redistributables.
-foreach(dll ${RTX_DLLS})
-    if(EXISTS ${dll})
-        add_custom_command(TARGET RTXVideoProcessor POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${dll}"
-                "$<TARGET_FILE_DIR:RTXVideoProcessor>/"
-        )
-    else()
-        message(WARNING "RTX DLL not found: ${dll}")
-    endif()
+# Post-build: Copy RTX Video SDK DLLs
+foreach(dll_name nvngx_truehdr.dll nvngx_vsr.dll)
+  set(dll_path "${RTX_VIDEO_SDK_BIN}/${dll_name}")
+  if(EXISTS ${dll_path})
+    add_custom_command(TARGET RTXVideoProcessor POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll_path}" "$<TARGET_FILE_DIR:RTXVideoProcessor>/"
+      COMMENT "Copying ${dll_name}"
+    )
+  else()
+    message(WARNING "RTX DLL not found: ${dll_path}")
+  endif()
 endforeach()
 
-# Runtime paths and post build copy for FFmpeg DLLs (user to provide in C:/ffmpeg/bin)
-add_custom_command(TARGET RTXVideoProcessor POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E echo "Copy FFmpeg runtime DLLs from ${FFMPEG_ROOT}/bin next to the exe if needed."
-)
+# Post-build: Reminder for FFmpeg DLLs
+if(NOT ffmpeg_FOUND AND FFMPEG_ROOT)
+  add_custom_command(TARGET RTXVideoProcessor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Note: Copy FFmpeg runtime DLLs from ${FFMPEG_ROOT}/bin if needed."
+  )
+endif()
 
 # Install
 install(TARGETS RTXVideoProcessor RUNTIME DESTINATION bin)

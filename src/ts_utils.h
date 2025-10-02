@@ -85,3 +85,67 @@ static inline int64_t derive_global_baseline_pts(int64_t packet_pts,
     // Convert back to stream timebase
     return av_rescale_q(adjusted_pts_us, {1, AV_TIME_BASE}, stream_time_base);
 }
+
+// Derive output PTS for -copyts mode (preserves original timestamps)
+// This function does NOT subtract v_start_pts, preserving the original timeline
+// output_ts_offset_us: optional offset to SUBTRACT from timestamps (-output_ts_offset)
+static inline int64_t derive_copyts_pts(const AVFrame *decframe,
+                                        AVRational in_time_base,
+                                        AVRational out_time_base,
+                                        int64_t output_ts_offset_us = 0)
+{
+    int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
+                         ? decframe->pts
+                         : decframe->best_effort_timestamp;
+
+    if (in_pts == AV_NOPTS_VALUE) {
+        return AV_NOPTS_VALUE;
+    }
+
+    // Convert to output timebase without baseline adjustment (copyts behavior)
+    int64_t out_pts = av_rescale_q(in_pts, in_time_base, out_time_base);
+
+    // Apply output timestamp offset if specified
+    // NOTE: output_ts_offset SUBTRACTS from timestamps to shift timeline backward
+    // Example: frame at 424s with offset 424 → output at 0s (424 - 424 = 0)
+    if (output_ts_offset_us != 0) {
+        int64_t offset_in_out_tb = av_rescale_q(output_ts_offset_us, {1, AV_TIME_BASE}, out_time_base);
+        out_pts -= offset_in_out_tb;  // Subtract to shift timeline backward
+
+        // Edge case: Prevent negative timestamps (can happen if offset > actual PTS)
+        // FFmpeg clamps to 0 in this case
+        if (out_pts < 0) {
+            out_pts = 0;
+        }
+    }
+
+    return out_pts;
+}
+
+// Derive output PTS for -copyts mode for copied packets (no re-encoding)
+static inline int64_t derive_copyts_packet_pts(int64_t packet_pts,
+                                                AVRational in_time_base,
+                                                AVRational out_time_base,
+                                                int64_t output_ts_offset_us = 0)
+{
+    if (packet_pts == AV_NOPTS_VALUE) {
+        return AV_NOPTS_VALUE;
+    }
+
+    // Convert to output timebase without baseline adjustment (copyts behavior)
+    int64_t out_pts = av_rescale_q(packet_pts, in_time_base, out_time_base);
+
+    // Apply output timestamp offset if specified (subtracts to shift timeline backward)
+    if (output_ts_offset_us != 0) {
+        int64_t offset_in_out_tb = av_rescale_q(output_ts_offset_us, {1, AV_TIME_BASE}, out_time_base);
+        out_pts -= offset_in_out_tb;  // Subtract to shift timeline backward
+
+        // Edge case: Prevent negative timestamps (can happen if offset > actual PTS)
+        // FFmpeg clamps to 0 in this case
+        if (out_pts < 0) {
+            out_pts = 0;
+        }
+    }
+
+    return out_pts;
+}

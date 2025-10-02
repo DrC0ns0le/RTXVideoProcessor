@@ -123,6 +123,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                              (int)m_srcW, (int)m_srcH,
                              /*bt2020=*/bt2020,
                              m_stream);
+        // Must sync: this is fast path bypass, no more work after this
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -202,7 +203,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                              m_stream);
     }
 
-    // Ensure all GPU operations complete before returning
+    // Sync at final output - ensures frame is ready before returning
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -246,6 +247,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
                               (int)m_srcW, (int)m_srcH,
                               /*bt2020=*/true,  // Always use BT.2020 for HDR content
                               m_stream);
+        // Must sync: this is fast path bypass, no more work after this
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -311,7 +313,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
                           /*bt2020=*/true,  // Always use BT.2020 for HDR content
                           m_stream);
 
-    // Ensure all GPU operations complete before returning
+    // Sync at final output - ensures frame is ready before returning
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -349,6 +351,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                             d_outY, pitchOutY, d_outUV, pitchOutUV,
                             (int)m_srcW, (int)m_srcH,
                             m_stream);
+        // Must sync: this is fast path bypass, no more work after this
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -433,6 +436,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                          false, // bt2020 = false for SDR
                          m_stream);
 
+    // Sync at final output - ensures frame is ready before returning
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -523,6 +527,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                              (int)m_srcW, (int)m_srcH,
                              /*bt2020=*/bt2020,
                              m_stream);
+        // Must sync: this is fast path bypass, no more work after this
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -581,6 +586,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                          /*bt2020=*/bt2020,
                          m_stream);
 
+    // Sync at final output - ensures frame is ready before returning
     cudaStreamSynchronize(m_stream);
     return true;
 }
