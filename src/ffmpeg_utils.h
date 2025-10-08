@@ -38,12 +38,11 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
 void close_input(InputContext &in);
 
 // Open output, create video encoder stream and map non-video streams.
-bool open_output(const char *outPath, const InputContext &in, OutputContext &out);
+bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps = {});
 void close_output(OutputContext &out);
 
 // Audio configuration functions
 void configure_audio_from_params(const AudioParameters &params, OutputContext &out);
-void resolve_stream_conflicts(const InputContext &in, OutputContext &out);
 bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
 bool setup_audio_encoder(const InputContext &in, OutputContext &out);
 bool setup_audio_filter(const InputContext &in, OutputContext &out);

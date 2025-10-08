@@ -80,6 +80,14 @@ struct AudioConfig
     bool enabled = false;
 };
 
+// Stream mapping decision for each input stream
+enum class StreamMapDecision {
+    EXCLUDE,           // Stream should not be included in output
+    COPY,              // Stream should be copied to output
+    PROCESS_VIDEO,     // Video stream to be processed (encoded)
+    PROCESS_AUDIO      // Audio stream to be processed (re-encoded)
+};
+
 struct OutputContext
 {
     AVFormatContext *fmt = nullptr;
@@ -108,8 +116,10 @@ struct OutputContext
     // Video DTS tracking for monotonicity enforcement
     int64_t last_video_dts = AV_NOPTS_VALUE;
 
-    std::vector<int> map_streams; // input->output map, -1 for unmapped
-    std::vector<std::string> streamMappings; // parsed -map arguments
+    // Stream mapping: final decision for each input stream
+    std::vector<StreamMapDecision> stream_decisions;
+    // Mapping from input stream index to output stream index (-1 if not mapped)
+    std::vector<int> input_to_output_map;
     HlsMuxOptions hlsOptions;
     AVDictionary *muxOptions = nullptr;
 

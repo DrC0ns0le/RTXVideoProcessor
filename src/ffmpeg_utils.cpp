@@ -248,7 +248,7 @@ void close_input(InputContext &in)
     in.seek_offset_us = 0;
 }
 
-bool open_output(const char *outPath, const InputContext &in, OutputContext &out)
+bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps)
 {
     if (!outPath)
         throw std::invalid_argument("open_output: null path");
@@ -394,93 +394,125 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     if (out.venc->time_base.num == 0 || out.venc->time_base.den == 0)
         out.venc->time_base = {1, 60};
 
+    // Decide which streams to include based on -map arguments
+    if (!streamMaps.empty())
+    {
+        apply_stream_mappings(streamMaps, in, out);
+    }
+    else
+    {
+        // No explicit mappings - include all streams by default
+        out.stream_decisions.assign(in.fmt->nb_streams, StreamMapDecision::COPY);
+    }
+
+    // Initialize input-to-output mapping
+    out.input_to_output_map.assign(in.fmt->nb_streams, -1);
+
+    // Mark video stream for processing (it's always processed, not just copied)
+    out.stream_decisions[in.vstream] = StreamMapDecision::PROCESS_VIDEO;
+
+    // Create output video stream (always created)
     out.vstream = avformat_new_stream(out.fmt, nullptr);
     if (!out.vstream)
         throw std::runtime_error("Failed to allocate output video stream");
     out.vstream->time_base = out.venc->time_base;
-
-    out.map_streams.assign(in.fmt->nb_streams, -1);
-    out.map_streams[in.vstream] = out.vstream->index;
-
-    if (!out.streamMappings.empty())
-    {
-        apply_stream_mappings(out.streamMappings, in, out);
-    }
+    out.input_to_output_map[in.vstream] = out.vstream->index;
 
     // Check if output is a pipe
     bool isPipeOutput = (std::strcmp(outPath, "-") == 0) ||
                        (std::strcmp(outPath, "pipe:") == 0) ||
                        (std::strcmp(outPath, "pipe:1") == 0);
 
+    // Create output streams based on decisions
     for (unsigned int i = 0; i < in.fmt->nb_streams; ++i)
     {
+        // Skip video stream (already handled)
         if ((int)i == in.vstream)
+            continue;
+
+        // Skip excluded streams
+        if (out.stream_decisions[i] == StreamMapDecision::EXCLUDE)
             continue;
 
         AVStream *ist = in.fmt->streams[i];
 
-        // Only skip if stream mappings were explicitly set and this stream was excluded
-        if (!out.streamMappings.empty() && i < out.map_streams.size() && out.map_streams[i] == -1) { continue; }
+        // Apply output-specific filters (overrides user mapping decisions if needed)
 
-        // Drop subtitle streams when outputting to pipe to avoid text contamination in stdout
+        // Drop subtitle streams when outputting to pipe to avoid text contamination
         if (isPipeOutput && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
         {
             const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
             LOG_INFO("Dropping subtitle stream %u (%s): not supported for pipe output", i,
                      codec_name ? codec_name : "unknown");
-            out.map_streams[i] = -1;
+            out.stream_decisions[i] = StreamMapDecision::EXCLUDE;
             continue;
         }
 
-        // Drop unsupported subtitle codecs for HLS outputs (only WebVTT is supported).
+        // Drop unsupported subtitle codecs for HLS outputs (only WebVTT is supported)
         if (out.hlsOptions.enabled && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
             ist->codecpar->codec_id != AV_CODEC_ID_WEBVTT)
         {
             const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
             LOG_WARN("Dropping subtitle stream %u (%s): HLS output requires WebVTT subtitles", i,
                      codec_name ? codec_name : "unknown");
-            out.map_streams[i] = -1;
+            out.stream_decisions[i] = StreamMapDecision::EXCLUDE;
             continue;
         }
 
-        // Ensure the output container supports the codec when stream copying.
+        // Ensure the output container supports the codec when stream copying
         if (!avformat_query_codec(out.fmt->oformat, ist->codecpar->codec_id, FF_COMPLIANCE_NORMAL))
         {
             const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
             LOG_WARN("Dropping stream %u (%s): not supported by output container", i,
                      codec_name ? codec_name : "unknown");
-            out.map_streams[i] = -1;
+            out.stream_decisions[i] = StreamMapDecision::EXCLUDE;
             continue;
         }
 
-        // Skip creating output streams for original audio when re-encoding is enabled
-        if (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && out.audioConfig.enabled &&
-            !out.audioConfig.codec.empty() && out.audioConfig.codec != "copy")
+        // Skip creating output streams for audio that will be re-encoded
+        if (out.stream_decisions[i] == StreamMapDecision::PROCESS_AUDIO)
         {
             const char *codec_name = avcodec_get_name(ist->codecpar->codec_id);
-            LOG_INFO("Skipping original audio stream %u (%s): will be re-encoded", i,
+            LOG_INFO("Audio stream %u (%s) will be re-encoded", i,
                      codec_name ? codec_name : "unknown");
-            out.map_streams[i] = -1;
-            continue; // Skip avformat_new_stream() entirely
+            // Output stream will be created later in setup_audio_encoder
+            continue;
         }
 
+        // Create output stream for copying
         AVStream *ost = avformat_new_stream(out.fmt, nullptr);
         if (!ost)
             throw std::runtime_error("Failed to allocate output stream");
 
         ff_check(avcodec_parameters_copy(ost->codecpar, ist->codecpar), "copy stream parameters");
 
-        // For audio streams, set timescale to sample rate for MP4 parser compatibility (e.g., Stremio)
+        // For audio streams, set timescale to sample rate for MP4 parser compatibility
         if (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ist->codecpar->sample_rate > 0)
         {
             ost->time_base = {1, ist->codecpar->sample_rate};
+            // Track the first audio stream created (for audio passthrough/copy)
+            if (!out.astream) {
+                out.astream = ost;
+            }
         }
         else
         {
             ost->time_base = ist->time_base;
         }
 
-        out.map_streams[i] = ost->index;
+        out.input_to_output_map[i] = ost->index;
+    }
+
+    // Log final stream mapping for debugging
+    LOG_DEBUG("Stream mapping summary: %u input streams -> %u output streams",
+              in.fmt->nb_streams, out.fmt->nb_streams);
+    for (unsigned int i = 0; i < out.input_to_output_map.size(); ++i) {
+        if (out.input_to_output_map[i] >= 0) {
+            AVStream *ist = in.fmt->streams[i];
+            const char *type_name = av_get_media_type_string(ist->codecpar->codec_type);
+            LOG_DEBUG("  Input stream %u (%s) -> Output stream %d", i,
+                      type_name ? type_name : "unknown", out.input_to_output_map[i]);
+        }
     }
 
     if (!(out.fmt->oformat->flags & AVFMT_NOFILE))
@@ -566,8 +598,8 @@ void close_output(OutputContext &out)
     out.next_audio_pts = 0;
     out.last_audio_dts = AV_NOPTS_VALUE;
     out.a_start_pts = AV_NOPTS_VALUE;
-    out.map_streams.clear();
-    out.streamMappings.clear();
+    out.stream_decisions.clear();
+    out.input_to_output_map.clear();
 }
 
 static AVPixelFormat get_cuda_sw_format(AVCodecContext *ctx, const AVPixelFormat *pix_fmts)
@@ -643,6 +675,31 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
     }
 }
 
+// Helper: Check if stream mappings include audio streams
+static bool has_audio_in_mappings(const std::vector<std::string>& mappings) {
+    for (const auto& mapping : mappings) {
+        // Skip empty or exclusion mappings
+        if (mapping.empty() || mapping[0] == '-')
+            continue;
+
+        // Parse using same logic as parse_stream_mapping
+        size_t colonPos = mapping.find(':');
+        if (colonPos == std::string::npos)
+            continue;
+
+        std::string stream_part = mapping.substr(colonPos + 1);
+        // Remove trailing '?' if present
+        if (!stream_part.empty() && stream_part.back() == '?')
+            stream_part.pop_back();
+
+        // Check for audio: stream index 1 or type specifier 'a'
+        if (stream_part == "1" || stream_part == "a") {
+            return true;
+        }
+    }
+    return false;
+}
+
 void configure_audio_from_params(const AudioParameters &params, OutputContext &out)
 {
     // Configure audio settings from parsed parameters
@@ -654,41 +711,16 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
 
     // Only enable audio processing if there are actual audio parameters specified
     // Exclude "copy" codec as it doesn't require processing pipeline (FFmpeg compatibility)
-    bool hasAudioParams = (!params.codec.empty() && params.codec != "copy") || params.channels > 0 || params.bitrate > 0 || params.sampleRate > 0 || !params.filter.empty();
+    bool hasAudioParams = (!params.codec.empty() && params.codec != "copy") ||
+                          params.channels > 0 ||
+                          params.bitrate > 0 ||
+                          params.sampleRate > 0 ||
+                          !params.filter.empty();
 
-    // Check if stream mappings include audio (0:1) or explicitly request audio processing
-    bool hasAudioMapping = false;
-    for (const auto& mapping : params.streamMaps) {
-        std::string clean = mapping;
-        const auto first = clean.find_first_not_of(" \t");
-        if (first == std::string::npos)
-            continue;
-        clean = clean.substr(first);
-        const bool isExclusion = !clean.empty() && clean[0] == '-';
-        if (isExclusion)
-            continue;
-
-        const auto colonPos = clean.find(':');
-        if (colonPos == std::string::npos)
-            continue;
-
-        const std::string streamIdx = clean.substr(0, colonPos);
-        const std::string streamType = clean.substr(colonPos + 1);
-        if (streamIdx != "0")
-            continue;
-    
-        if (streamType == "1" || streamType == "1?" ||
-            (!streamType.empty() && streamType[0] == 'a')) {
-            hasAudioMapping = true;
-            break;
-        }
-    }
+    // Check if stream mappings include audio
+    bool hasAudioMapping = has_audio_in_mappings(params.streamMaps);
 
     out.audioConfig.enabled = hasAudioParams || hasAudioMapping;
-
-    // Note: Removed forced disable - audio re-encoding should work when explicitly requested
-
-    out.streamMappings = params.streamMaps;
 
     if (out.audioConfig.enabled) {
         LOG_INFO("Audio processing enabled with codec=%s, channels=%d, bitrate=%d, filter=%s",
@@ -696,100 +728,154 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
     }
 }
 
-void resolve_stream_conflicts(const InputContext &in, OutputContext &out)
-{
-    // This function is no longer needed since stream filtering now happens during open_output()
-    // Left as placeholder for potential future conflict resolution needs
-}
 
+// Helper structure for parsing -map arguments
 struct StreamMapping {
-    std::string type;
-    bool exclude;
-    bool optional;  // Has '?' suffix
+    bool exclude;           // true if mapping starts with '-'
+    int stream_index = -1;  // specific stream index (e.g., 0 from "0:0"), or -1 for type-based
+    AVMediaType media_type = AVMEDIA_TYPE_UNKNOWN; // type specifier (v/a/s/d/t)
 };
 
 static StreamMapping parse_stream_mapping(const std::string& mapping) {
-    StreamMapping result;
-    result.exclude = (mapping[0] == '-');
+    StreamMapping result{};
 
-    std::string cleanMapping = result.exclude ? mapping.substr(1) : mapping;
+    std::string clean = mapping;
 
-    size_t colonPos = cleanMapping.find(':');
+    // Check for exclusion prefix
+    result.exclude = (!clean.empty() && clean[0] == '-');
+    if (result.exclude) {
+        clean = clean.substr(1);
+    }
+
+    // Remove optional suffix '?' if present (not used but needs to be stripped for parsing)
+    if (!clean.empty() && clean.back() == '?') {
+        clean.pop_back();
+    }
+
+    // Parse "file:stream" format (we only support file 0)
+    size_t colonPos = clean.find(':');
     if (colonPos == std::string::npos) {
-        LOG_WARN("Invalid stream mapping format: %s", mapping.c_str());
+        LOG_WARN("Invalid stream mapping format (missing ':'): %s", mapping.c_str());
         return result;
     }
 
-    std::string part1 = cleanMapping.substr(0, colonPos);
-    std::string part2 = cleanMapping.substr(colonPos + 1);
+    std::string file_part = clean.substr(0, colonPos);
+    std::string stream_part = clean.substr(colonPos + 1);
 
-    // Parse stream type (supports both "v:0" and "0:v" formats)
-    if (part1 == "v" || part1 == "a" || part1 == "s" || part1 == "d" || part1 == "t") {
-        result.type = part1;
-    } else if (part1 == "0") {
-        result.type = part2;
+    if (file_part != "0") {
+        LOG_WARN("Only file index 0 is supported: %s", mapping.c_str());
+        return result;
+    }
+
+    // Parse stream specifier: can be index (0, 1, 2) or type (v, a, s, d, t)
+    if (!stream_part.empty() && std::isdigit(stream_part[0])) {
+        // Numeric stream index
+        result.stream_index = std::stoi(stream_part);
+    } else if (stream_part == "v") {
+        result.media_type = AVMEDIA_TYPE_VIDEO;
+    } else if (stream_part == "a") {
+        result.media_type = AVMEDIA_TYPE_AUDIO;
+    } else if (stream_part == "s") {
+        result.media_type = AVMEDIA_TYPE_SUBTITLE;
+    } else if (stream_part == "d") {
+        result.media_type = AVMEDIA_TYPE_DATA;
+    } else if (stream_part == "t") {
+        result.media_type = AVMEDIA_TYPE_ATTACHMENT;
     } else {
-        LOG_WARN("Unsupported file index: %s", part1.c_str());
-        return result;
-    }
-
-    // Check for optional suffix '?'
-    result.optional = (!result.type.empty() && result.type.back() == '?');
-    if (result.optional) {
-        result.type.pop_back();
+        LOG_WARN("Unknown stream specifier: %s", stream_part.c_str());
     }
 
     return result;
 }
 
-static void exclude_streams_by_type(AVMediaType type, const InputContext& in, OutputContext& out) {
-    for (unsigned int i = 0; i < in.fmt->nb_streams; ++i) {
-        if (in.fmt->streams[i]->codecpar->codec_type == type) {
-            out.map_streams[i] = -1;
+// Decide which streams should be included in output based on -map arguments
+// This is the SINGLE SOURCE OF TRUTH for all stream mapping decisions
+// Handles: inclusion, exclusion, copy vs process
+static void decide_stream_mappings(const std::vector<std::string>& mappings,
+                                    const InputContext& in,
+                                    OutputContext& out)
+{
+    unsigned int nb_streams = in.fmt->nb_streams;
+
+    // Initialize all streams as EXCLUDE
+    out.stream_decisions.assign(nb_streams, StreamMapDecision::EXCLUDE);
+
+    // Determine if audio should be re-encoded (not just copied)
+    bool audio_needs_processing = out.audioConfig.enabled &&
+                                   !out.audioConfig.codec.empty() &&
+                                   out.audioConfig.codec != "copy";
+
+    // Determine if we have explicit inclusions (non-exclusion -map directives)
+    bool has_explicit_inclusions = false;
+    for (const auto& mapping : mappings) {
+        if (mapping.empty()) continue;
+        if (mapping[0] != '-') {  // Not an exclusion
+            has_explicit_inclusions = true;
+            break;
         }
+    }
+
+    // FFmpeg behavior: if NO explicit inclusions, include all streams by default
+    if (!has_explicit_inclusions) {
+        for (unsigned int i = 0; i < nb_streams; ++i) {
+            out.stream_decisions[i] = StreamMapDecision::COPY;
+        }
+    }
+
+    // Process all -map directives in order
+    for (const auto& mapping : mappings) {
+        if (mapping.empty()) continue;
+
+        StreamMapping parsed = parse_stream_mapping(mapping);
+
+        // Apply the mapping
+        for (unsigned int i = 0; i < nb_streams; ++i) {
+            AVStream* stream = in.fmt->streams[i];
+            bool matches = false;
+
+            // Check if this stream matches the mapping specifier
+            if (parsed.stream_index >= 0) {
+                // Index-based mapping
+                matches = (i == (unsigned int)parsed.stream_index);
+            } else if (parsed.media_type != AVMEDIA_TYPE_UNKNOWN) {
+                // Type-based mapping
+                matches = (stream->codecpar->codec_type == parsed.media_type);
+            }
+
+            if (matches) {
+                if (parsed.exclude) {
+                    out.stream_decisions[i] = StreamMapDecision::EXCLUDE;
+                } else {
+                    // Decide between COPY and PROCESS based on stream type and config
+                    AVMediaType codec_type = stream->codecpar->codec_type;
+                    if (codec_type == AVMEDIA_TYPE_AUDIO && audio_needs_processing) {
+                        out.stream_decisions[i] = StreamMapDecision::PROCESS_AUDIO;
+                    } else {
+                        out.stream_decisions[i] = StreamMapDecision::COPY;
+                    }
+                }
+            }
+        }
+    }
+
+    LOG_DEBUG("Stream mapping decisions:");
+    for (unsigned int i = 0; i < nb_streams; ++i) {
+        const char* type_name = av_get_media_type_string(in.fmt->streams[i]->codecpar->codec_type);
+        const char* decision_name = "UNKNOWN";
+        switch (out.stream_decisions[i]) {
+            case StreamMapDecision::EXCLUDE: decision_name = "EXCLUDE"; break;
+            case StreamMapDecision::COPY: decision_name = "COPY"; break;
+            case StreamMapDecision::PROCESS_VIDEO: decision_name = "PROCESS_VIDEO"; break;
+            case StreamMapDecision::PROCESS_AUDIO: decision_name = "PROCESS_AUDIO"; break;
+        }
+        LOG_DEBUG("  Stream %u (%s): %s", i, type_name ? type_name : "unknown", decision_name);
     }
 }
 
 bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out)
 {
-    if (mappings.empty()) return true;
-
-    for (const std::string &mapping : mappings) {
-        if (mapping.empty()) continue;
-
-        StreamMapping parsed = parse_stream_mapping(mapping);
-        if (parsed.type.empty()) continue;
-
-        if (parsed.exclude) {
-            // Handle stream exclusions
-            if (parsed.type == "s") {
-                LOG_INFO("Excluding subtitles");
-            } else if (parsed.type == "a") {
-                LOG_INFO("Excluding audio");
-                out.audioConfig.enabled = false;
-                exclude_streams_by_type(AVMEDIA_TYPE_AUDIO, in, out);
-            } else if (parsed.type == "d") {
-                LOG_INFO("Excluding data streams");
-                exclude_streams_by_type(AVMEDIA_TYPE_DATA, in, out);
-            } else if (parsed.type == "t") {
-                LOG_INFO("Excluding attachments");
-                exclude_streams_by_type(AVMEDIA_TYPE_ATTACHMENT, in, out);
-            }
-        } else {
-            // Handle stream inclusions
-            if (parsed.type == "v") {
-                LOG_INFO("Including video streams");
-            } else if (parsed.type == "a") {
-                LOG_INFO("Including audio streams");
-                if (!out.audioConfig.codec.empty()) {
-                    out.audioConfig.enabled = true;
-                }
-            } else if (parsed.type == "1") {
-                out.audioConfig.enabled = true;
-            }
-        }
-    }
-
+    // All logic consolidated into decide_stream_mappings for clarity
+    decide_stream_mappings(mappings, in, out);
     return true;
 }
 
@@ -881,11 +967,13 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
         out.aenc->frame_size = 1024;
     }
 
-    // Create output audio stream
-    out.astream = avformat_new_stream(out.fmt, nullptr);
+    // Create output audio stream (only if not already created during stream mapping)
     if (!out.astream) {
-        LOG_WARN("Failed to create output audio stream");
-        return false;
+        out.astream = avformat_new_stream(out.fmt, nullptr);
+        if (!out.astream) {
+            LOG_WARN("Failed to create output audio stream");
+            return false;
+        }
     }
 
     // Open encoder

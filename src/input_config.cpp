@@ -90,20 +90,24 @@ void configure_audio_processing(PipelineConfig& cfg, InputContext& in, OutputCon
         LOG_DEBUG("Audio config completed, enabled=%s\n", out.audioConfig.enabled ? "true" : "false");
 
         if (out.audioConfig.enabled) {
-            LOG_DEBUG("Applying stream mappings...\n");
-            apply_stream_mappings(cfg.streamMaps, in, out);
+            // Stream mappings are now applied in open_output(), no need to call here
 
-            LOG_DEBUG("Setting up audio encoder...\n");
-            if (!setup_audio_encoder(in, out)) {
-                LOG_WARN("Failed to setup audio encoder, disabling audio processing");
-                out.audioConfig.enabled = false;
+            // Skip encoder setup for copy mode (audio will be copied directly)
+            if (out.audioConfig.codec == "copy") {
+                LOG_DEBUG("Audio copy mode enabled, skipping encoder setup\n");
             } else {
-                LOG_DEBUG("Audio encoder setup complete\n");
-                LOG_DEBUG("Setting up audio filter...\n");
-                if (!setup_audio_filter(in, out)) {
-                    LOG_WARN("Failed to setup audio filter, continuing without filtering");
+                LOG_DEBUG("Setting up audio encoder...\n");
+                if (!setup_audio_encoder(in, out)) {
+                    LOG_WARN("Failed to setup audio encoder, disabling audio processing");
+                    out.audioConfig.enabled = false;
                 } else {
-                    LOG_DEBUG("Audio filter setup complete\n");
+                    LOG_DEBUG("Audio encoder setup complete\n");
+                    LOG_DEBUG("Setting up audio filter...\n");
+                    if (!setup_audio_filter(in, out)) {
+                        LOG_WARN("Failed to setup audio filter, continuing without filtering");
+                    } else {
+                        LOG_DEBUG("Audio filter setup complete\n");
+                    }
                 }
             }
         }

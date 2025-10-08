@@ -275,7 +275,7 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         LOG_DEBUG("Opening output...");
-        open_output(cfg.outputPath, in, out);
+        open_output(cfg.outputPath, in, out, cfg.streamMaps);
         LOG_DEBUG("Output opened successfully");
 
         // Stage 4: Configure audio processing (complete the audio setup)
@@ -696,7 +696,7 @@ int run_pipeline(PipelineConfig cfg)
                 else
                 {
                     // Fallback: copy audio packet without re-encoding
-                    int out_index = out.map_streams[pkt->stream_index];
+                    int out_index = out.input_to_output_map[pkt->stream_index];
 
 
                     if (out_index >= 0)
@@ -727,7 +727,7 @@ int run_pipeline(PipelineConfig cfg)
             else
             {
                 // Copy other streams
-                int out_index = out.map_streams[pkt->stream_index];
+                int out_index = out.input_to_output_map[pkt->stream_index];
 
                 // Skip subtitle streams (they should already be filtered but double-check)
                 AVStream *input_stream = in.fmt->streams[pkt->stream_index];
