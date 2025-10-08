@@ -179,8 +179,16 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     out.venc->codec_id = AV_CODEC_ID_HEVC;
     out.venc->width = dstW;
     out.venc->height = dstH;
+
+    // Vanilla FFmpeg behavior: Use input stream timebase for encoder
+    // This matches -enc_time_base -1 (use decoder timebase)
     out.venc->time_base = in.vst->time_base;
     out.venc->framerate = fr;
+
+    // CRITICAL: Update stream timebase to match encoder timebase
+    // This prevents av_packet_rescale_ts() from doing unnecessary conversions
+    // that introduce rounding errors over time (causing video freezes in Chrome)
+    out.vstream->time_base = out.venc->time_base;
 
     bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
     if (use_cuda_path) {
@@ -205,7 +213,7 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
                  gop_duration_sec, gop_duration_sec * fr.num / std::max(1, fr.den));
     }
     out.venc->gop_size = gop_duration_sec * fr.num / std::max(1, fr.den);
-    out.venc->max_b_frames = 2;
+    out.venc->max_b_frames = cfg.bframes;
     out.venc->color_range = AVCOL_RANGE_MPEG;
 
     // HDR color settings
@@ -242,7 +250,8 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
 
     if (hls_enabled) {
         av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
-        LOG_INFO("Enabled forced-idr for HLS segment alignment (strict_gop disabled for better performance)");
+        av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
+        LOG_INFO("Enabled forced-idr + strict_gop for HLS segment alignment (ensures I-frame at every segment boundary)");
     }
 
     if (outputHDR) {

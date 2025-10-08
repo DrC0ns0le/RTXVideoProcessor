@@ -82,6 +82,35 @@ static inline void av_packet_free_single(AVPacket *p)
         av_packet_free(&p);
 }
 
+using FramePtr = std::unique_ptr<AVFrame, void (*)(AVFrame *)>;
+using PacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket *)>;
+
+// Pipeline types are provided by pipeline_types.h via ffmpeg_utils.h
+
+// Unified helper to send a frame to the encoder and interleaved-write all produced packets
+static inline void encode_and_write(AVCodecContext *enc,
+                                    AVStream *vstream,
+                                    AVFormatContext *ofmt,
+                                    OutputContext &out,
+                                    AVFrame *frame,
+                                    PacketPtr &opkt,
+                                    const char *ctx_label)
+{
+    ff_check(avcodec_send_frame(enc, frame), ctx_label);
+    while (true)
+    {
+        int ret = avcodec_receive_packet(enc, opkt.get());
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            break;
+        ff_check(ret, "receive encoded packet");
+        opkt->stream_index = vstream->index;
+
+        av_packet_rescale_ts(opkt.get(), enc->time_base, vstream->time_base);
+        ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
+        av_packet_unref(opkt.get());
+    }
+}
+
 // Helper function for frame buffer and context initialization
 static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, int dstH,
                                                  CudaFramePool& cuda_pool, SwsContext*& sws_to_p010,
@@ -175,7 +204,7 @@ static void apply_fragment_options(AVDictionary** muxopts, const PipelineConfig&
     }
 }
 
-static void write_muxer_header(OutputContext& out, bool hls_enabled, bool mux_is_isobmff,
+static void write_muxer_header(InputContext& in, OutputContext& out, bool hls_enabled, bool mux_is_isobmff,
                                const AVRational& fr, bool is_pipe, const PipelineConfig& cfg) {
     out.vstream->time_base = out.venc->time_base;
     out.vstream->avg_frame_rate = fr;
@@ -321,7 +350,7 @@ int run_pipeline(PipelineConfig cfg)
 
         // Stage 10: Write muxer header
         bool isPipeOutput = is_pipe_output(cfg.outputPath);
-        write_muxer_header(out, hls_enabled, mux_is_isobmff, fr, isPipeOutput, cfg);
+        write_muxer_header(in, out, hls_enabled, mux_is_isobmff, fr, isPipeOutput, cfg);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
@@ -591,11 +620,6 @@ int run_pipeline(PipelineConfig cfg)
                         continue;
                     }
 
-                    // Derive output PTS/DTS using centralized timestamp manager V2
-                    // Handles NORMAL/COPYTS modes, output_ts_offset, monotonicity, DTS, etc.
-                    TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
-                        decframe, in.vst->time_base, out.venc->time_base);
-
                     // Use unified processor
                     AVFrame *outFrame = nullptr;
                     if (!processor->process(decframe, outFrame))
@@ -608,9 +632,20 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set frame PTS - encoder will generate its own DTS based on encoding structure
-                    // NOTE: Do NOT set pkt_dts - encoder ignores it and generates correct DTS for B-frames
-                    outFrame->pts = timestamps.pts;
+                    // Set frame PTS
+                    // FFmpeg-compatible mode: Convert timebase but don't manipulate timestamps
+                    // This matches vanilla FFmpeg behavior: simple timebase conversion only
+                    if (cfg.ffCompatible && cfg.copyts) {
+                        // Even though timebases match, we still need rescaling because:
+                        // 1. Ensures proper integer conversion
+                        // 2. HLS muxer will later rescale to its own timebase (1/16000)
+                        outFrame->pts = av_rescale_q(decframe->pts, in.vst->time_base, out.venc->time_base);
+                    } else {
+                        // Custom mode: Use timestamp manager for advanced timestamp handling
+                        TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
+                            decframe, in.vst->time_base, out.venc->time_base);
+                        outFrame->pts = timestamps.pts;
+                    }
 
                     // IMPORTANT: Must sync before encoder accesses CUDA frame data
                     // RTX processor syncs internally, but this ensures frame is ready for NVENC
@@ -682,13 +717,17 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
 
-                        // Use centralized timestamp manager for audio copy packets
-                        ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+                        // FFmpeg-compatible mode: Skip custom timestamp adjustment
+                        // Let muxer handle timestamps naturally to avoid rounding errors
+                        if (!cfg.ffCompatible || !cfg.copyts) {
+                            // Custom mode: Use timestamp manager for advanced handling
+                            ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
 
-                        // Check if packet was invalidated (waiting for baseline)
-                        if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
-                            av_packet_unref(pkt.get());
-                            continue;
+                            // Check if packet was invalidated (waiting for baseline)
+                            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+                                av_packet_unref(pkt.get());
+                                continue;
+                            }
                         }
 
                         av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
@@ -716,8 +755,12 @@ int run_pipeline(PipelineConfig cfg)
                     AVStream *ist = in.fmt->streams[pkt->stream_index];
                     AVStream *ost = out.fmt->streams[out_index];
 
-                    // Use centralized timestamp manager for all copied streams
-                    ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+                    // FFmpeg-compatible mode: Skip custom timestamp adjustment
+                    // Let muxer handle timestamps naturally to avoid rounding errors
+                    if (!cfg.ffCompatible || !cfg.copyts) {
+                        // Custom mode: Use timestamp manager for advanced handling
+                        ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+                    }
 
                     av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
                     pkt->stream_index = out_index;
@@ -843,20 +886,8 @@ int run_pipeline(PipelineConfig cfg)
 int main(int argc, char **argv)
 {
 #ifdef _WIN32
-    // Only attach to parent console if stdout is not already redirected/piped
-    // When spawned from Node.js with stdio:["ignore","pipe","pipe"],
-    // stdout is already connected to a pipe and should not be reopened
-    DWORD mode;
-    BOOL stdoutIsPipe = !GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode);
-
-    if (!stdoutIsPipe && AttachConsole(ATTACH_PARENT_PROCESS))
-    {
-        // Reopen stdout/stderr to the parent console
-        FILE* fp;
-        freopen_s(&fp, "CONOUT$", "w", stdout);
-        freopen_s(&fp, "CONOUT$", "w", stderr);
-        freopen_s(&fp, "CONIN$", "r", stdin);
-    }
+    // Match ffmpeg behavior: minimal console handling
+    setvbuf(stderr, NULL, _IONBF, 0); /* win32 runtime needs this */
 #endif
 
     if (passthrough_required(argc, argv))
