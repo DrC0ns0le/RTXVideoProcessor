@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -9,13 +10,33 @@
 #include <sstream>
 #include <ctime>
 #include <queue>
+#include <filesystem>
+#include <cctype>
+#include <cstring>
+#include <system_error>
+#include <cerrno>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <process.h>
+#else
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 extern "C"
 {
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-#include <libavcodec/packet.h>
 #include <libavutil/avutil.h>
+#include <libavutil/error.h>
+#include <libavcodec/packet.h>
 #include <libavutil/common.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
@@ -24,6 +45,7 @@ extern "C"
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/display.h>
 #include <libavutil/rational.h>
+#include <libavutil/parseutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -33,9 +55,20 @@ extern "C"
 #include "rtx_processor.h"
 #include "frame_pool.h"
 #include "ts_utils.h"
+#include "timestamp_manager.h"
 #include "processor.h"
 #include "logger.h"
+#include "audio_config.h"
+#include "async_demuxer.h"
+#include "ffmpeg_passthrough.h"
+#include "config_parser.h"
+#include "input_config.h"
+#include "output_config.h"
 
+// Compatibility for older FFmpeg versions
+#ifndef AV_FRAME_FLAG_KEY
+#define AV_FRAME_FLAG_KEY (1 << 0)
+#endif
 
 // RAII deleters for FFmpeg types that require ** double-pointer frees
 static inline void av_frame_free_single(AVFrame *f)
@@ -58,6 +91,7 @@ using PacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket *)>;
 static inline void encode_and_write(AVCodecContext *enc,
                                     AVStream *vstream,
                                     AVFormatContext *ofmt,
+                                    OutputContext &out,
                                     AVFrame *frame,
                                     PacketPtr &opkt,
                                     const char *ctx_label)
@@ -70,313 +104,135 @@ static inline void encode_and_write(AVCodecContext *enc,
             break;
         ff_check(ret, "receive encoded packet");
         opkt->stream_index = vstream->index;
+
         av_packet_rescale_ts(opkt.get(), enc->time_base, vstream->time_base);
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
     }
 }
 
-// Ensure SWS context converts from source frame format to RGBA with proper colorspace
-static inline void ensure_sws_to_argb(SwsContext *&sws_to_argb,
-                                      int &last_src_format,
-                                      int srcW, int srcH,
-                                      AVPixelFormat srcFmt,
-                                      AVColorSpace colorspace)
-{
-    if (!sws_to_argb || last_src_format != srcFmt)
-    {
-        if (sws_to_argb)
-            sws_freeContext(sws_to_argb);
-        sws_to_argb = sws_getContext(
-            srcW, srcH, srcFmt,
-            srcW, srcH, AV_PIX_FMT_RGBA,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws_to_argb)
-            throw std::runtime_error("sws_to_argb alloc failed");
-        const int *coeffs = (colorspace == AVCOL_SPC_BT2020_NCL)
-                                ? sws_getCoefficients(SWS_CS_BT2020)
-                                : sws_getCoefficients(SWS_CS_ITU709);
-        sws_setColorspaceDetails(sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
-        last_src_format = srcFmt;
+// Helper function for frame buffer and context initialization
+static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, int dstH,
+                                                 CudaFramePool& cuda_pool, SwsContext*& sws_to_p010,
+                                                 FramePtr& bgra_frame, FramePtr& p010_frame,
+                                                 const InputContext& in, const OutputContext& out) {
+    // Initialize CUDA frame pool if using CUDA path
+    if (use_cuda_path) {
+        const int POOL_SIZE = 8; // Adjust based on your needs
+        cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
     }
+
+    // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
+    p010_frame->format = AV_PIX_FMT_P010LE;
+    p010_frame->width = dstW;
+    p010_frame->height = dstH;
+    ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
+
+    // CPU path colorspace for RGB(A)->P010
+    sws_to_p010 = sws_getContext(
+        dstW, dstH, AV_PIX_FMT_X2BGR10LE,
+        dstW, dstH, AV_PIX_FMT_P010LE,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_to_p010)
+        throw std::runtime_error("sws_to_p010 alloc failed");
+    const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
+    sws_setColorspaceDetails(sws_to_p010,
+                             coeffs_bt2020, 1,
+                             coeffs_bt2020, 0,
+                             0, 1 << 16, 1 << 16);
+
+    bgra_frame->format = AV_PIX_FMT_RGBA;
+    bgra_frame->width = in.vdec->width;
+    bgra_frame->height = in.vdec->height;
+    ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
 }
 
-// Ensure CPU RTX is initialized and process the BGRA frame
-static inline void ensure_rtx_cpu_and_process(RTXProcessor &rtx_cpu,
-                                              bool &rtx_cpu_init,
-                                              const RTXProcessConfig &rtxCfg,
-                                              int srcW, int srcH,
-                                              const uint8_t *inBGRA, size_t inPitch,
-                                              const uint8_t *&outData, uint32_t &outW, uint32_t &outH, size_t &outPitch)
-{
-    if (!rtx_cpu_init)
-    {
-        if (!rtx_cpu.initialize(0, rtxCfg, srcW, srcH))
-        {
-            std::string detail = rtx_cpu.lastError();
+// Helper function for RTX processor initialization
+static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use_cuda_path,
+                                   const PipelineConfig& cfg, const InputContext& in) {
+    if (use_cuda_path) {
+        AVHWDeviceContext *devctx = (AVHWDeviceContext *)in.hw_device_ctx->data;
+        AVCUDADeviceContext *cudactx = (AVCUDADeviceContext *)devctx->hwctx;
+        CUcontext cu = cudactx->cuda_ctx;
+        if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+            std::string detail = rtx.lastError();
             if (detail.empty())
                 detail = "unknown error";
-            throw std::runtime_error(std::string("Failed to initialize RTX CPU path: ") + detail);
+            throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
         }
-        rtx_cpu_init = true;
+        rtx_init = true;
+    } else {
+        if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+            std::string detail = rtx.lastError();
+            if (detail.empty())
+                detail = "unknown error";
+            throw std::runtime_error(std::string("Failed to init RTX CPU path: ") + detail);
+        }
+        rtx_init = true;
     }
-    if (!rtx_cpu.process(inBGRA, inPitch, outData, outW, outH, outPitch))
-        throw std::runtime_error("RTX CPU processing failed");
 }
 
-struct PipelineConfig
-{
-    bool verbose = false;
-    bool cpuOnly = false;
+static void apply_movflags(AVDictionary** muxopts, bool is_pipe, bool hls_enabled, const PipelineConfig& cfg) {
+    // User-specified flags take priority (FFmpeg-compatible)
+    if (!cfg.movflags.empty()) {
+        av_dict_set(muxopts, "movflags", cfg.movflags.c_str(), 0);
+        LOG_DEBUG("Applied user movflags: %s\n", cfg.movflags.c_str());
+        return;
+    }
 
-    char *inputPath = nullptr;
-    char *outputPath = nullptr;
+    // Legacy mode: Auto-apply flags for compatibility
+    if (cfg.ffCompatible) return;
 
-    // NVENC settings
-    std::string tune;
-    std::string preset;
-    std::string rc; // cbr, vbr, constqp
-
-    int gop; // keyframe interval, multiple of seconds
-    int bframes;
-    int qp;
-
-    int targetBitrateMultiplier;
-
-    RTXProcessConfig rtxCfg;
-};
-
-// FFmpeg setup helpers moved to ffmpeg_utils.cpp
-
-static void print_help(const char *argv0)
-{
-    fprintf(stderr, "Usage: %s input.mp4 output.{mp4|mkv} [options]\n", argv0);
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
-    fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
-    fprintf(stderr, "\nVSR options:\n");
-    fprintf(stderr, "  --no-vsr      Disable VSR\n");
-    fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4\n");
-    fprintf(stderr, "\nTHDR options:\n");
-    fprintf(stderr, "  --no-thdr     Disable THDR\n");
-    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115\n");
-    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75\n");
-    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30\n");
-    fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000\n");
-    fprintf(stderr, "\nNVENC options:\n");
-    fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq\n");
-    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7\n");
-    fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
-    fprintf(stderr, "  --nvenc-gop         Set NVENC GOP, default 1\n");
-    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
-    fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
-    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 5\n");
+    if (is_pipe) {
+        av_dict_set(muxopts, "movflags", "+empty_moov+default_base_moof+delay_moov+dash+write_colr", 0);
+    } else if (!hls_enabled) {
+        av_dict_set(muxopts, "movflags", "+faststart+write_colr", 0);
+    } else {
+        av_dict_set(muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
+    }
 }
 
-static void init_setup(int argc, char **argv, PipelineConfig *cfg)
-{
-    if (argc < 3)
-    {
-        print_help(argv[0]);
-        exit(1);
+static void apply_fragment_options(AVDictionary** muxopts, const PipelineConfig& cfg) {
+    if (cfg.fragDuration > 0) {
+        av_dict_set(muxopts, "frag_duration", std::to_string(cfg.fragDuration).c_str(), 0);
+    }
+    if (cfg.fragmentIndex >= 0) {
+        av_dict_set(muxopts, "fragment_index", std::to_string(cfg.fragmentIndex).c_str(), 0);
+    }
+    if (cfg.useEditlist >= 0) {
+        av_dict_set(muxopts, "use_editlist", std::to_string(cfg.useEditlist).c_str(), 0);
+    }
+}
+
+static void write_muxer_header(InputContext& in, OutputContext& out, bool hls_enabled, bool mux_is_isobmff,
+                               const AVRational& fr, bool is_pipe, const PipelineConfig& cfg) {
+    out.vstream->time_base = out.venc->time_base;
+    out.vstream->avg_frame_rate = fr;
+
+    AVDictionary *muxopts = out.muxOptions;
+
+    if (mux_is_isobmff) {
+        apply_movflags(&muxopts, is_pipe, hls_enabled, cfg);
+        apply_fragment_options(&muxopts, cfg);
     }
 
-    // Default VSR settings
-    cfg->rtxCfg.enableVSR = true;
-    cfg->rtxCfg.scaleFactor = 2;
-    cfg->rtxCfg.vsrQuality = 4;
+    // Apply FFmpeg-compatible timestamp handling to muxer (affects all formats)
+    av_dict_set(&muxopts, "avoid_negative_ts", cfg.avoidNegativeTs.c_str(), 0);
+    LOG_DEBUG("Muxer avoid_negative_ts: %s", cfg.avoidNegativeTs.c_str());
 
-    // Default THDR settings
-    cfg->rtxCfg.enableTHDR = true;
-    cfg->rtxCfg.thdrContrast = 115;
-    cfg->rtxCfg.thdrSaturation = 75;
-    cfg->rtxCfg.thdrMiddleGray = 30;
-    cfg->rtxCfg.thdrMaxLuminance = 1000;
-
-    // Default NVENC settings
-    cfg->tune = "hq";
-    cfg->preset = "p7";
-    cfg->rc = "constqp";
-
-    cfg->gop = 1;
-    cfg->bframes = 2;
-    cfg->qp = 21;
-    cfg->targetBitrateMultiplier = 5;
-
-    cfg->inputPath = argv[1];
-    cfg->outputPath = argv[2];
-
-    for (int i = 3; i < argc; ++i)
-    {
-        std::string arg = argv[i];
-        if (arg == "--verbose" || arg == "-v")
-            cfg->verbose = true;
-        else if (arg == "--cpu" || arg == "-cpu")
-            cfg->cpuOnly = true;
-        else if (arg == "--help" || arg == "-h")
-        {
-            print_help(argv[0]);
-            exit(0);
-        }
-
-        // VSR
-        else if (arg == "--no-vsr")
-            cfg->rtxCfg.enableVSR = false;
-        else if (arg == "--vsr-quality")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rtxCfg.vsrQuality = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --vsr-quality\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-
-        // THDR
-        else if (arg == "--no-thdr")
-        {
-            if (cfg->rtxCfg.enableVSR)
-                LOG_WARN("Both VSR & THDR are disabled, bypassing RTX evaluate");
-            cfg->rtxCfg.enableTHDR = false;
-        }
-        else if (arg == "--thdr-contrast")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rtxCfg.thdrContrast = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --thdr-contrast\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--thdr-saturation")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rtxCfg.thdrSaturation = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --thdr-saturation\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--thdr-middle-gray")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rtxCfg.thdrMiddleGray = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --thdr-middle-gray\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--thdr-max-luminance")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rtxCfg.thdrMaxLuminance = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --thdr-max-luminance\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-
-        // NVENC
-        else if (arg == "--nvenc-tune")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->tune = argv[++i];
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --nvenc-tune\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--nvenc-preset")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->preset = argv[++i];
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --nvenc-preset\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--nvenc-rc")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->rc = argv[++i];
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --nvenc-rc\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--nvenc-gop")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->gop = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --nvenc-gop\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-        else if (arg == "--nvenc-bframes")
-        {
-            if (i + 1 < argc)
-            {
-                cfg->bframes = std::stoi(argv[++i]);
-            }
-            else
-            {
-                fprintf(stderr, "Missing argument for --nvenc-bframes\n");
-                print_help(argv[0]);
-                exit(1);
-            }
-        }
-
-
-        else
-        {
-            fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
-            print_help(argv[0]);
-            exit(1);
-        }
+    if (cfg.maxMuxingQueueSize > 0) {
+        out.fmt->max_interleave_delta = cfg.maxMuxingQueueSize;
     }
+
+    ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
+    if (muxopts) av_dict_free(&muxopts);
+    out.muxOptions = nullptr;
 }
 
 int run_pipeline(PipelineConfig cfg)
 {
-    Logger::instance().setVerbose(cfg.verbose);
-    Logger::instance().setDebug(false);
+    Logger::instance().setVerbose(cfg.verbose || cfg.debug);
+    Logger::instance().setDebug(cfg.debug);
 
     LOG_VERBOSE("Starting video processing pipeline");
     LOG_DEBUG("Input: %s", cfg.inputPath);
@@ -389,38 +245,52 @@ int run_pipeline(PipelineConfig cfg)
 
     try
     {
-        open_input(cfg.inputPath, in);
+        // Stage 1: Open input and configure HDR detection
+        InputOpenOptions inputOpts;
+        inputOpts.fflags = cfg.fflags;
+        inputOpts.seekTime = cfg.seekTime;
+        inputOpts.noAccurateSeek = cfg.noAccurateSeek;
+        inputOpts.seek2any = cfg.seek2any;
+        inputOpts.seekTimestamp = cfg.seekTimestamp;
+        // FFmpeg compatibility: Disable non-standard behaviors
+        inputOpts.enableErrorConcealment = !cfg.ffCompatible;  // FFmpeg doesn't enable error concealment by default
+        inputOpts.flushOnSeek = false;  // FFmpeg never flushes decoder on seek
+        open_input(cfg.inputPath, in, &inputOpts);
+        bool inputIsHDR = configure_input_hdr_detection(cfg, in);
+
+        // Stage 2: Configure VSR auto-disable
+        configure_vsr_auto_disable(cfg, in);
+
+        // Stage 3: Setup output and HLS options
+        LOG_DEBUG("Finalizing HLS options...");
+        finalize_hls_options(&cfg, &out);
+
+        // Stage 3b: Pre-configure audio intent to guide stream creation
+        bool willReencodeAudio = cfg.ffCompatible &&
+                                ((!cfg.audioCodec.empty() && cfg.audioCodec != "copy") ||
+                                 cfg.audioChannels > 0 || cfg.audioBitrate > 0 || !cfg.audioFilter.empty());
+        if (willReencodeAudio) {
+            out.audioConfig.enabled = true;
+            out.audioConfig.codec = cfg.audioCodec.empty() ? "aac" : cfg.audioCodec;
+        }
+
+        LOG_DEBUG("Opening output...");
         open_output(cfg.outputPath, in, out);
+        LOG_DEBUG("Output opened successfully");
+
+        // Stage 4: Configure audio processing (complete the audio setup)
+        configure_audio_processing(cfg, in, out);
+
+        // Stage 5: Calculate frame rate and setup progress tracking
+        const bool hls_enabled = out.hlsOptions.enabled;
+        const bool hls_segments_are_fmp4 = hls_enabled && lowercase_copy(out.hlsOptions.segmentType) == "fmp4";
 
         // Read input bitrate and fps
         AVRational fr = in.vst->avg_frame_rate.num ? in.vst->avg_frame_rate : in.vst->r_frame_rate;
         if (fr.num == 0 || fr.den == 0)
             fr = {in.vst->time_base.den, in.vst->time_base.num};
 
-        // Get total duration and frames for progress tracking
-        int64_t total_frames = 0;
-        if (in.vst->nb_frames > 0)
-        {
-            total_frames = in.vst->nb_frames;
-        }
-        else
-        {
-            // Estimate total frames from duration if frame count is not available
-            double duration_sec = 0.0;
-            if (in.vst->duration > 0 && in.vst->duration != AV_NOPTS_VALUE)
-            {
-                duration_sec = in.vst->duration * av_q2d(in.vst->time_base);
-            }
-            else if (in.fmt->duration != AV_NOPTS_VALUE)
-            {
-                duration_sec = static_cast<double>(in.fmt->duration) / AV_TIME_BASE;
-            }
-
-            if (duration_sec > 0.0 && fr.num > 0 && fr.den > 0)
-            {
-                total_frames = static_cast<int64_t>(duration_sec * av_q2d(fr) + 0.5);
-            }
-        }
+        int64_t total_frames = setup_progress_tracking(in, fr);
 
         // Progress tracking variables
         int64_t processed_frames = 0;
@@ -435,21 +305,13 @@ int run_pipeline(PipelineConfig cfg)
 
         // A2R10G10B10 -> P010 for NVENC
         // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
-        // Auto-disable VSR for inputs >= 1920x1080 in either orientation
-        if (cfg.rtxCfg.enableVSR) {
-            bool ge1080p = (in.vdec->width >= 1920 && in.vdec->height >= 1080) ||
-                           (in.vdec->width >= 1080 && in.vdec->height >= 1920);
-            if (ge1080p) {
-                LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
-                cfg.rtxCfg.enableVSR = false;
-            }
-        }
         int effScale = cfg.rtxCfg.enableVSR ? cfg.rtxCfg.scaleFactor : 1;
         int dstW = in.vdec->width * effScale;
         int dstH = in.vdec->height * effScale;
         SwsContext *sws_to_p010 = nullptr; // CPU fallback
         bool use_cuda_path = (in.vdec->hw_device_ctx != nullptr) && !cfg.cpuOnly;
 
+        // Stage 6: Calculate output dimensions and setup muxer format
         LOG_VERBOSE("Processing path: %s", use_cuda_path ? "GPU (CUDA)" : "CPU");
         LOG_VERBOSE("Output resolution: %dx%d (scale factor: %d)", dstW, dstH, effScale);
         std::string muxer_name = (out.fmt && out.fmt->oformat && out.fmt->oformat->name)
@@ -457,180 +319,44 @@ int run_pipeline(PipelineConfig cfg)
                                      : "";
         bool mux_is_isobmff = muxer_name.find("mp4") != std::string::npos ||
                               muxer_name.find("mov") != std::string::npos;
+        if (hls_segments_are_fmp4) {
+            mux_is_isobmff = true;
+        }
         LOG_VERBOSE("Output container: %s",
                     muxer_name.empty() ? "unknown" : muxer_name.c_str());
 
-        // Configure encoder now that sizes are known
-        LOG_DEBUG("Configuring HEVC encoder...");
-        out.venc->codec_id = AV_CODEC_ID_HEVC;
-        out.venc->width = dstW;
-        out.venc->height = dstH;
-        out.venc->time_base = av_inv_q(fr);
-        out.venc->framerate = fr;
-        // Prefer CUDA frames if decoder is CUDA-capable to avoid copies
-        if (use_cuda_path)
-        {
-            out.venc->pix_fmt = AV_PIX_FMT_CUDA; // NVENC consumes CUDA frames via hw_frames_ctx
-        }
-        else
-        {
-            out.venc->pix_fmt = AV_PIX_FMT_P010LE; // CPU fallback
-        }
-        out.venc->gop_size = cfg.gop * fr.num / std::max(1, fr.den);
-        out.venc->max_b_frames = 2;
-        out.venc->color_range = AVCOL_RANGE_MPEG;
-        if (cfg.rtxCfg.enableTHDR) {
-            out.venc->color_trc = AVCOL_TRC_SMPTE2084; // PQ
-            out.venc->color_primaries = AVCOL_PRI_BT2020;
-            out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
-        } else {
-            out.venc->color_trc = AVCOL_TRC_BT709;
-            out.venc->color_primaries = AVCOL_PRI_BT709;
-            out.venc->colorspace = AVCOL_SPC_BT709;
-        }
+        // Stage 7: Configure video encoder
+        AVBufferRef *enc_hw_frames = configure_video_encoder(cfg, in, out, inputIsHDR, use_cuda_path,
+                                                            dstW, dstH, fr, hls_enabled, mux_is_isobmff);
 
-        // Ensure muxers that require extradata (e.g., Matroska) receive global headers
-        if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff)
-        {
-            out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        }
-
-        int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
-        LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
-        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
-                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
-        av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
-        av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
-        // Switch to constant QP rate control
-        av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
-        av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
-        av_opt_set(out.venc->priv_data, "profile", "main10", 0);
-
-        // If using CUDA path, create encoder hw_frames_ctx on the same device before opening encoder
-        AVBufferRef *enc_hw_frames = nullptr;
-        if (use_cuda_path)
-        {
-            enc_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
-            if (!enc_hw_frames)
-                throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
-            AVHWFramesContext *fctx = (AVHWFramesContext *)enc_hw_frames->data;
-            fctx->format = AV_PIX_FMT_CUDA;
-            fctx->sw_format = AV_PIX_FMT_P010LE;
-            fctx->width = dstW;
-            fctx->height = dstH;
-            fctx->initial_pool_size = 64;
-            ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
-            out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
-        }
-
-        ff_check(avcodec_open2(out.venc, out.venc->codec, nullptr), "open encoder");
-        LOG_VERBOSE("Pipeline: decode=%s, colorspace+scale+pack=%s\n",
-                    (in.vdec->hw_device_ctx ? "GPU(NVDEC)" : "CPU"),
-                    (use_cuda_path ? "GPU(RTX/CUDA)" : "CPU(SWS)"));
+        // Stage 8: Configure stream metadata and codec parameters
+        configure_stream_metadata(in, out, cfg, inputIsHDR, mux_is_isobmff, hls_enabled);
         if (enc_hw_frames)
             av_buffer_unref(&enc_hw_frames);
 
-        ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
-        if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr)
-        {
-            throw std::runtime_error("HEVC encoder did not provide extradata; required for Matroska outputs");
-        }
-        LOG_DEBUG("Encoder extradata size: %d bytes", out.vstream->codecpar->extradata_size);
-        if (out.vstream->codecpar->extradata_size >= 4)
-        {
-            const uint8_t *ed = out.vstream->codecpar->extradata;
-            LOG_DEBUG("Extradata head: %02X %02X %02X %02X", ed[0], ed[1], ed[2], ed[3]);
-        }
-        // Prefer 'hvc1' brand to carry parameter sets (VPS/SPS/PPS) in-band, which improves fMP4 compatibility, and required by macOS
-        if (out.vstream->codecpar)
-        {
-            if (mux_is_isobmff)
-            {
-                out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
-            }
-            else
-            {
-                out.vstream->codecpar->codec_tag = 0;
-            }
-            out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-            if (cfg.rtxCfg.enableTHDR) {
-                out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
-                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
-                out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
-            } else {
-                out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
-                out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
-                out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
-            }
-        }
-        if (cfg.rtxCfg.enableTHDR) {
-            add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
-        }
-
-        // CUDA frame pool for optimized GPU processing
+        // Stage 9: Initialize frame buffers and processing contexts
         CudaFramePool cuda_pool;
-        const int POOL_SIZE = 8; // Adjust based on your needs
-
-        // Frame buffering for handling processing spikes
-        std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
-        const int MAX_BUFFER_SIZE = 4;
-
-        // Initialize CUDA frame pool if using CUDA path
-        if (use_cuda_path)
-        {
-            cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
-        }
-
-        // Write header
-        out.vstream->time_base = out.venc->time_base; // Ensure muxer stream uses the same time_base as the encoder for consistent PTS/DTS
-        out.vstream->avg_frame_rate = fr;
-        // Write header with MOV/MP4 muxer flags for broad compatibility
-        // faststart: move moov atom to the beginning at finalize time; plays everywhere after encode completes
-        AVDictionary *muxopts = nullptr;
-        // write_colr: ensure colr (nclx) atom is written from color_* fields (needed for HDR on macOS)
-        if (mux_is_isobmff)
-        {
-            av_dict_set(&muxopts, "movflags", "+faststart+write_colr", 0);
-        }
-        ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
-        av_dict_free(&muxopts);
-
-        // Frame buffers
         FramePtr frame(av_frame_alloc(), &av_frame_free_single);
         FramePtr swframe(av_frame_alloc(), &av_frame_free_single);
         FramePtr bgra_frame(av_frame_alloc(), &av_frame_free_single);
         FramePtr p010_frame(av_frame_alloc(), &av_frame_free_single);
 
-        bgra_frame->format = AV_PIX_FMT_RGBA;
-        bgra_frame->width = in.vdec->width;
-        bgra_frame->height = in.vdec->height;
-        ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
+        initialize_frame_buffers_and_contexts(use_cuda_path, dstW, dstH, cuda_pool, sws_to_p010,
+                                            bgra_frame, p010_frame, in, out);
 
-        // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
-        p010_frame->format = AV_PIX_FMT_P010LE;
-        p010_frame->width = dstW;
-        p010_frame->height = dstH;
-        ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
-        // CPU path colorspace for RGB(A)->P010
-        sws_to_p010 = sws_getContext(
-            dstW, dstH, AV_PIX_FMT_X2BGR10LE,
-            dstW, dstH, AV_PIX_FMT_P010LE,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws_to_p010)
-            throw std::runtime_error("sws_to_p010 alloc failed");
-        const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
-        sws_setColorspaceDetails(sws_to_p010,
-                                 coeffs_bt2020, 1,
-                                 coeffs_bt2020, 0,
-                                 0, 1 << 16, 1 << 16);
+        // Frame buffering for handling processing spikes
+        std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
+        const int MAX_BUFFER_SIZE = 4;
+
+        // Stage 10: Write muxer header
+        bool isPipeOutput = is_pipe_output(cfg.outputPath);
+        write_muxer_header(in, out, hls_enabled, mux_is_isobmff, fr, isPipeOutput, cfg);
 
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
 
-        // PTS handling: derive video PTS from input timestamps to avoid A/V drift
-        int64_t v_start_pts = AV_NOPTS_VALUE;              // first input video pts
-        int64_t last_output_pts = AV_NOPTS_VALUE;          // last emitted video pts in encoder tb
-        AVRational output_time_base = out.venc->time_base; // encoder time base
+        // Legacy variables removed - now using TimestampManager
+        // All PTS/DTS handling centralized in ts_manager
 
         const uint8_t *rtx_data = nullptr;
         uint32_t rtxW = 0, rtxH = 0;
@@ -692,57 +418,172 @@ int run_pipeline(PipelineConfig cfg)
             fflush(stderr);
         };
 
-        // Single processor instance; choose CPU or GPU at initialization and stick with it
+        // Stage 11: Initialize RTX processor
         RTXProcessor rtx;
         bool rtx_init = false;
+        initialize_rtx_processor(rtx, rtx_init, use_cuda_path, cfg, in);
 
-        // Initialize the chosen processing path (GPU or CPU) once
-        if (use_cuda_path)
-        {
-            AVHWDeviceContext *devctx = (AVHWDeviceContext *)in.hw_device_ctx->data;
-            AVCUDADeviceContext *cudactx = (AVCUDADeviceContext *)devctx->hwctx;
-            CUcontext cu = cudactx->cuda_ctx;
-            if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height))
-            {
-                std::string detail = rtx.lastError();
-                if (detail.empty()) detail = "unknown error";
-                throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
-            }
-            rtx_init = true;
-        }
-        else
-        {
-            if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height))
-            {
-                std::string detail = rtx.lastError();
-                if (detail.empty()) detail = "unknown error";
-                throw std::runtime_error(std::string("Failed to initialize RTX CPU path: ") + detail);
-            }
-            rtx_init = true;
-        }
+        // Note: Audio PTS will be aligned with video baseline after first video packet
+        // This ensures proper A/V sync during seek operations
+
+        // Calculate whether output should be HDR
+        bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
 
         // Build a processor abstraction for the loop
         std::unique_ptr<IProcessor> processor;
         if (use_cuda_path)
         {
-            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace);
+            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR);
         }
         else
         {
             auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width, in.vdec->height, dstW, dstH);
-            cpuProc->setConfig(cfg.rtxCfg);
+            // Create a modified config for CPU processor to ensure it uses HDR pixel formats when outputting HDR
+            RTXProcessConfig cpuConfig = cfg.rtxCfg;
+            cpuConfig.enableTHDR = outputHDR; // Use HDR pixel formats for both THDR and HDR input
+            cpuProc->setConfig(cpuConfig);
             processor = std::move(cpuProc);
         }
 
+        // Initialize centralized timestamp manager (V2)
+        TimestampManager::Config ts_config;
+        ts_config.mode = cfg.copyts ? TimestampManager::Mode::COPYTS : TimestampManager::Mode::NORMAL;
+        ts_config.input_seek_us = in.seek_offset_us;
+        // FFmpeg compatibility: Don't automatically fix timestamp violations
+        ts_config.enforce_monotonicity = !cfg.ffCompatible;  // FFmpeg reports errors, doesn't auto-fix
+
+        // Parse avoid_negative_ts setting (FFmpeg-compatible)
+        std::string avoid_ts_lower = cfg.avoidNegativeTs;
+        std::transform(avoid_ts_lower.begin(), avoid_ts_lower.end(), avoid_ts_lower.begin(), ::tolower);
+        if (avoid_ts_lower == "disabled") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::DISABLED;
+        } else if (avoid_ts_lower == "make_zero") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_ZERO;
+        } else if (avoid_ts_lower == "make_non_negative") {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_NON_NEGATIVE;
+        } else {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::AUTO;  // Default
+        }
+
+        // Set start_at_zero flag (FFmpeg-compatible)
+        ts_config.start_at_zero = cfg.startAtZero;
+
+        // Store settings in OutputContext for muxer reference
+        out.avoidNegativeTs = ts_config.avoid_negative_ts;
+        out.startAtZero = ts_config.start_at_zero;
+
+        // Detect actual frame rate for better monotonicity recovery
+        AVRational detected_fr = av_guess_frame_rate(in.fmt, in.vst, nullptr);
+        if (detected_fr.num > 0 && detected_fr.den > 0) {
+            ts_config.expected_frame_rate = detected_fr;
+            LOG_DEBUG("Detected frame rate: %d/%d (%.3f fps)",
+                     detected_fr.num, detected_fr.den, av_q2d(detected_fr));
+        } else {
+            ts_config.expected_frame_rate = {24, 1};  // Default fallback
+            LOG_WARN("Could not detect frame rate, using default 24fps");
+        }
+
+        // Parse output seeking time
+        if (!cfg.outputSeekTime.empty()) {
+            int ret = av_parse_time(&ts_config.output_seek_target_us, cfg.outputSeekTime.c_str(), 1);
+            if (ret < 0) {
+                throw std::runtime_error("Invalid output seek time format: " + cfg.outputSeekTime);
+            }
+            LOG_DEBUG("Output seeking enabled: target = %.3fs", ts_config.output_seek_target_us / 1000000.0);
+
+            // Edge case: Warn if output seek < input seek
+            if (in.seek_offset_us > 0 && ts_config.output_seek_target_us < in.seek_offset_us) {
+                LOG_WARN("Output seek target (%.3fs) < input seek (%.3fs) - may cause unexpected behavior",
+                         ts_config.output_seek_target_us / 1000000.0, in.seek_offset_us / 1000000.0);
+            }
+        }
+
+        // Parse output timestamp offset
+        if (!cfg.outputTsOffset.empty()) {
+            int ret = av_parse_time(&ts_config.output_ts_offset_us, cfg.outputTsOffset.c_str(), 1);
+            if (ret < 0) {
+                throw std::runtime_error("Invalid output timestamp offset format: " + cfg.outputTsOffset);
+            }
+            LOG_DEBUG("Output timestamp offset: %.3fs", ts_config.output_ts_offset_us / 1000000.0);
+        }
+
+        // Edge case: Validate copyts + output_ts_offset usage
+        if (ts_config.output_ts_offset_us != 0 && !cfg.copyts) {
+            LOG_WARN("-output_ts_offset specified without -copyts. This may produce unexpected timestamps.");
+            LOG_WARN("Typically use: -copyts -output_ts_offset <value> together");
+        }
+
+        // Create timestamp manager (V2)
+        TimestampManager ts_manager(ts_config);
+        ts_manager.dumpState();
+
+        // Initialize async demuxer for non-blocking I/O
+        AsyncDemuxer::Config demux_config;
+        // Scale buffer based on frame rate: target 2-3 seconds of buffering
+        // At 30fps: 60-90 frames, at 60fps: 120-180 frames, at 120fps: 240-360 frames
+        double fps = av_q2d(fr);
+        size_t target_buffer_seconds = 3;
+        demux_config.max_queue_size = static_cast<size_t>(fps * target_buffer_seconds);
+        demux_config.max_queue_size = std::max<size_t>(60, std::min<size_t>(360, demux_config.max_queue_size));
+        demux_config.enable_stats = true;
+        AsyncDemuxer async_demuxer(in.fmt, demux_config);
+        LOG_DEBUG("Async demuxer queue size: %zu frames (%.1f fps, %zu sec buffer)",
+                  demux_config.max_queue_size, fps, target_buffer_seconds);
+
+        // Start async demuxing thread
+        if (!async_demuxer.start()) {
+            throw std::runtime_error("Failed to start async demuxer");
+        }
+
         // Read packets
+        LOG_DEBUG("Starting frame processing loop with async demuxing...");
+        LOG_DEBUG("Video stream index: %d, Audio stream index: %d", in.vstream, in.astream);
+        LOG_DEBUG("Audio config enabled: %s", out.audioConfig.enabled ? "true" : "false");
+        LOG_DEBUG("Copyts mode: %s", cfg.copyts ? "enabled" : "disabled");
+        LOG_DEBUG("FFmpeg compatibility: avoid_negative_ts=%s, start_at_zero=%s",
+                 cfg.avoidNegativeTs.c_str(), cfg.startAtZero ? "enabled" : "disabled");
+        LOG_DEBUG("Starting processing with seek_offset_us = %lld (%.3fs)", in.seek_offset_us, in.seek_offset_us / 1000000.0);
+        int packet_count = 0;
+        bool audio_pts_aligned = false;  // Track if we've aligned audio PTS with video baseline
         while (true)
         {
-            int ret = av_read_frame(in.fmt, pkt.get());
-            if (ret == AVERROR_EOF)
+            // Get packet from async demuxer (non-blocking I/O)
+            AVPacket* raw_pkt = async_demuxer.getPacket();
+            if (!raw_pkt) {
+                // Check for EOF or error
+                if (async_demuxer.isEOF()) {
+                    break;
+                }
+                int err = async_demuxer.getError();
+                if (err != 0) {
+                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_make_error_string(errbuf, sizeof(errbuf), err);
+                    throw std::runtime_error(std::string("Async demuxer error: ") + errbuf);
+                }
                 break;
-            ff_check(ret, "read frame");
+            }
 
-            // Skip non-video packets
+            // Transfer ownership to smart pointer
+            av_packet_unref(pkt.get());
+            av_packet_move_ref(pkt.get(), raw_pkt);
+            av_packet_free(&raw_pkt);
+            packet_count++;
+
+            // Establish global baseline from the first VIDEO packet when seeking to ensure A/V sync
+            if (in.seek_offset_us > 0 && ts_manager.getGlobalBaseline() == AV_NOPTS_VALUE &&
+                pkt->stream_index == in.vstream && pkt->pts != AV_NOPTS_VALUE) {
+                AVStream *stream = in.fmt->streams[pkt->stream_index];
+                ts_manager.establishGlobalBaseline(pkt.get(), stream->time_base);
+
+                // Align audio PTS with the newly established video baseline
+                if (out.audioConfig.enabled && !audio_pts_aligned) {
+                    init_audio_pts_after_seek(in, out, ts_manager.getGlobalBaseline());
+                    audio_pts_aligned = true;
+                    LOG_DEBUG("Audio PTS aligned with video baseline at %.3fs", ts_manager.getGlobalBaseline() / 1000000.0);
+                }
+            }
+
+            // Process packets by type
             if (pkt->stream_index == in.vstream)
             {
                 ff_check(avcodec_send_packet(in.vdec, pkt.get()), "send packet");
@@ -750,10 +591,13 @@ int run_pipeline(PipelineConfig cfg)
 
                 while (true)
                 {
-                    ret = avcodec_receive_frame(in.vdec, frame.get());
+                    int ret = avcodec_receive_frame(in.vdec, frame.get());
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         break;
                     ff_check(ret, "receive frame");
+
+                    // Note: Corrupt frames are acceptable - we encode them with artifacts
+                    // This maintains continuous timeline when seeking with -seek2any to non-keyframes
 
                     AVFrame *decframe = frame.get();
                     FramePtr tmp(nullptr, &av_frame_free_single);
@@ -768,16 +612,13 @@ int run_pipeline(PipelineConfig cfg)
                         frame_is_cuda = false;
                     }
 
-                    // Compute output PTS by rescaling input timestamps to encoder time base
-                    int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE)
-                                         ? decframe->pts
-                                         : decframe->best_effort_timestamp;
-                    int64_t output_pts = derive_output_pts(v_start_pts, decframe, in.vst->time_base, out.venc->time_base);
-                    // Ensure strict monotonicity to satisfy encoder/muxer
-                    // if (last_output_pts != AV_NOPTS_VALUE && output_pts <= last_output_pts) {
-                    //     output_pts = last_output_pts + 1;
-                    // }
-                    // last_output_pts = output_pts;
+                    // Output seeking: Drop frames until target reached (handled by TimestampManager)
+                    if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base)) {
+                        av_frame_unref(frame.get());
+                        if (swframe)
+                            av_frame_unref(swframe.get());
+                        continue;
+                    }
 
                     // Use unified processor
                     AVFrame *outFrame = nullptr;
@@ -791,28 +632,136 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set consistent PTS to prevent stuttering
-                    outFrame->pts = output_pts;
+                    // Set frame PTS
+                    // FFmpeg-compatible mode: Convert timebase but don't manipulate timestamps
+                    // This matches vanilla FFmpeg behavior: simple timebase conversion only
+                    if (cfg.ffCompatible && cfg.copyts) {
+                        // Even though timebases match, we still need rescaling because:
+                        // 1. Ensures proper integer conversion
+                        // 2. HLS muxer will later rescale to its own timebase (1/16000)
+                        outFrame->pts = av_rescale_q(decframe->pts, in.vst->time_base, out.venc->time_base);
+                    } else {
+                        // Custom mode: Use timestamp manager for advanced timestamp handling
+                        TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
+                            decframe, in.vst->time_base, out.venc->time_base);
+                        outFrame->pts = timestamps.pts;
+                    }
 
-                    // Ensure GPU work completes before encoding when on CUDA path
+                    // IMPORTANT: Must sync before encoder accesses CUDA frame data
+                    // RTX processor syncs internally, but this ensures frame is ready for NVENC
                     if (use_cuda_path)
                         cudaStreamSynchronize(0);
 
-                    // Encode
-                    encode_and_write(out.venc, out.vstream, out.fmt, outFrame, opkt, "send frame to encoder");
+                    // Encode frame
+                    encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                     av_frame_unref(frame.get());
                     if (swframe)
                         av_frame_unref(swframe.get());
+                }
+            }
+            else if (cfg.ffCompatible && out.audioConfig.enabled && in.astream >= 0 && pkt->stream_index == in.astream)
+            {
+                // FFmpeg does NOT wait for video baseline before processing audio
+                // Dropping audio packets while waiting for video can cause A/V desync
+                // Only drop if explicitly required for custom sync logic (non-FFmpeg behavior)
+                // NOTE: Disabled by default for FFmpeg compatibility
+                // if (in.seek_offset_us > 0 && ts_manager.getGlobalBaseline() == AV_NOPTS_VALUE) {
+                //     av_packet_unref(pkt.get());
+                //     continue;
+                // }
+
+                // Process audio packets when audio encoding is enabled
+                if (in.adec && out.aenc)
+                {
+                    ff_check(avcodec_send_packet(in.adec, pkt.get()), "send audio packet");
+                    av_packet_unref(pkt.get());
+
+                    FramePtr audio_frame(av_frame_alloc(), &av_frame_free_single);
+                    while (true)
+                    {
+                        int ret = avcodec_receive_frame(in.adec, audio_frame.get());
+                        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                            break;
+                        ff_check(ret, "receive audio frame");
+
+                        // Update A/V drift monitoring
+                        if (audio_frame->pts != AV_NOPTS_VALUE) {
+                            int64_t audio_pts_us = av_rescale_q(audio_frame->pts,
+                                                                in.ast->time_base,
+                                                                {1, AV_TIME_BASE});
+                            ts_manager.updateAudioTimestamp(audio_pts_us);
+                        }
+
+                        // Use the new helper function to process audio
+                        if (process_audio_frame(audio_frame.get(), out, opkt.get()))
+                        {
+                            // If we got a packet, write it
+                            if (opkt->data)
+                            {
+                                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet");
+                                av_packet_unref(opkt.get());
+                            }
+                        }
+
+                        av_frame_unref(audio_frame.get());
+                    }
+                }
+                else
+                {
+                    // Fallback: copy audio packet without re-encoding
+                    int out_index = out.map_streams[pkt->stream_index];
+
+
+                    if (out_index >= 0)
+                    {
+                        AVStream *ist = in.fmt->streams[pkt->stream_index];
+                        AVStream *ost = out.fmt->streams[out_index];
+
+                        // FFmpeg-compatible mode: Skip custom timestamp adjustment
+                        // Let muxer handle timestamps naturally to avoid rounding errors
+                        if (!cfg.ffCompatible || !cfg.copyts) {
+                            // Custom mode: Use timestamp manager for advanced handling
+                            ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+
+                            // Check if packet was invalidated (waiting for baseline)
+                            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+                                av_packet_unref(pkt.get());
+                                continue;
+                            }
+                        }
+
+                        av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
+                        pkt->stream_index = out_index;
+                        ff_check(av_interleaved_write_frame(out.fmt, pkt.get()), "write copied audio packet");
+                    }
+                    av_packet_unref(pkt.get());
                 }
             }
             else
             {
                 // Copy other streams
                 int out_index = out.map_streams[pkt->stream_index];
+
+                // Skip subtitle streams (they should already be filtered but double-check)
+                AVStream *input_stream = in.fmt->streams[pkt->stream_index];
+                if (input_stream->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                {
+                    av_packet_unref(pkt.get());
+                    continue;
+                }
+
                 if (out_index >= 0)
                 {
                     AVStream *ist = in.fmt->streams[pkt->stream_index];
                     AVStream *ost = out.fmt->streams[out_index];
+
+                    // FFmpeg-compatible mode: Skip custom timestamp adjustment
+                    // Let muxer handle timestamps naturally to avoid rounding errors
+                    if (!cfg.ffCompatible || !cfg.copyts) {
+                        // Custom mode: Use timestamp manager for advanced handling
+                        ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
+                    }
+
                     av_packet_rescale_ts(pkt.get(), ist->time_base, ost->time_base);
                     pkt->stream_index = out_index;
                     ff_check(av_interleaved_write_frame(out.fmt, pkt.get()), "write copied packet");
@@ -822,6 +771,7 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         // Flush encoder
+        LOG_DEBUG("Finished processing all frames, flushing encoder...");
         ff_check(avcodec_send_frame(out.venc, nullptr), "send flush");
         while (true)
         {
@@ -835,9 +785,30 @@ int run_pipeline(PipelineConfig cfg)
             av_packet_unref(opkt.get());
         }
 
+        // Flush audio encoder if enabled
+        if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)
+        {
+            LOG_DEBUG("Flushing audio encoder...");
+            ff_check(avcodec_send_frame(out.aenc, nullptr), "send audio flush");
+            while (true)
+            {
+                int ret = avcodec_receive_packet(out.aenc, opkt.get());
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                    break;
+                ff_check(ret, "receive audio packet flush");
+                opkt->stream_index = out.astream->index;
+                av_packet_rescale_ts(opkt.get(), out.aenc->time_base, out.astream->time_base);
+                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet flush");
+                av_packet_unref(opkt.get());
+            }
+        }
+
         ff_check(av_write_trailer(out.fmt), "write trailer");
 
-        // Print final progress
+        // Stop async demuxer
+        async_demuxer.stop();
+
+        // Print final progress and statistics
         if (total_frames > 0)
         {
             auto end_time = std::chrono::high_resolution_clock::now();
@@ -845,13 +816,45 @@ int run_pipeline(PipelineConfig cfg)
             double total_sec = total_ms / 1000.0;
             double avg_fps = (total_sec > 0) ? processed_frames / total_sec : 0.0;
 
-            fprintf(stdout, "\nProcessing completed in %.1f seconds (%.1f fps)\n",
-                    total_sec, avg_fps);
+            LOG_DEBUG("Processing completed in %.1fs @ %.1f fps", total_sec, avg_fps);
+
+            // Async demuxer statistics
+            AsyncDemuxer::Stats demux_stats = async_demuxer.getStats();
+            LOG_DEBUG("Demuxer stats: packets=%zu, queue_waits=%zu, queue_depth=%zu/%zu%s",
+                     demux_stats.total_reads, demux_stats.queue_full_waits,
+                     demux_stats.min_queue_depth != SIZE_MAX ? demux_stats.min_queue_depth : 0,
+                     demux_stats.max_queue_depth,
+                     demux_stats.queue_full_waits > 0 ? " (backpressure)" : "");
+
+            // Report timestamp statistics
+            TimestampManager::Stats ts_stats = ts_manager.getStats();
+            if (ts_stats.dropped_frames > 0 || ts_stats.discontinuities > 0 ||
+                ts_stats.monotonicity_violations > 0 || ts_stats.negative_pts > 0 ||
+                ts_stats.av_drift_warnings > 0) {
+                LOG_DEBUG("Timestamp stats: dropped=%d, discontinuities=%d, monotonic_fix=%d, neg_pts=%d, av_drift=%d (max=%.1fms)%s",
+                         ts_stats.dropped_frames, ts_stats.discontinuities,
+                         ts_stats.monotonicity_violations, ts_stats.negative_pts,
+                         ts_stats.av_drift_warnings, ts_stats.max_av_drift_ms,
+                         ts_stats.max_av_drift_ms > 500.0 ? " WARNING:HIGH_DRIFT" : "");
+            }
+
+            // Overall health assessment
+            bool healthy = true;
+            std::string warnings;
+            if (demux_stats.queue_full_waits > demux_stats.total_reads * 0.1) {
+                warnings += "demux_backpressure ";
+                healthy = false;
+            }
+            if (ts_stats.max_av_drift_ms > 500.0) {
+                warnings += "high_av_drift ";
+                healthy = false;
+            }
+            LOG_DEBUG("Pipeline health: %s%s", healthy ? "OK" : "WARN",
+                     warnings.empty() ? "" : (" - " + warnings).c_str());
         }
         if (sws_to_argb)
             sws_freeContext(sws_to_argb);
         sws_freeContext(sws_to_p010);
-
         // Ensure all CUDA operations complete before cleanup
         if (use_cuda_path)
         {
@@ -882,10 +885,19 @@ int run_pipeline(PipelineConfig cfg)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    // Match ffmpeg behavior: minimal console handling
+    setvbuf(stderr, NULL, _IONBF, 0); /* win32 runtime needs this */
+#endif
+
+    if (passthrough_required(argc, argv))
+    {
+        return run_ffmpeg_passthrough(argc, argv);
+    }
 
     PipelineConfig cfg;
 
-    init_setup(argc, argv, &cfg);
+    parse_arguments(argc, argv, &cfg);
 
     // Set log level
     av_log_set_level(AV_LOG_WARNING);

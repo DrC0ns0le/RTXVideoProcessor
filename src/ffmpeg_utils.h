@@ -11,6 +11,7 @@ extern "C"
 #include <string>
 
 #include "pipeline_types.h"
+#include "audio_config.h"
 
 inline void ff_check(int err, const char *what)
 {
@@ -33,9 +34,20 @@ inline std::string ff_ts(double seconds)
 void add_mastering_and_cll(AVStream *st, int max_luminance_nits);
 
 // Open input and locate video stream, prepare decoder. Tries to enable CUDA device.
-bool open_input(const char *inPath, InputContext &in);
+bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *options = nullptr);
 void close_input(InputContext &in);
 
 // Open output, create video encoder stream and map non-video streams.
 bool open_output(const char *outPath, const InputContext &in, OutputContext &out);
 void close_output(OutputContext &out);
+
+// Audio configuration functions
+void configure_audio_from_params(const AudioParameters &params, OutputContext &out);
+void resolve_stream_conflicts(const InputContext &in, OutputContext &out);
+bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
+bool setup_audio_encoder(const InputContext &in, OutputContext &out);
+bool setup_audio_filter(const InputContext &in, OutputContext &out);
+bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet);
+
+// Initialize audio PTS tracking after seeking
+void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us = AV_NOPTS_VALUE);
