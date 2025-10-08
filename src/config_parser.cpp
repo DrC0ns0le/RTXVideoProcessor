@@ -649,7 +649,7 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         // THDR
         else if (arg == "--no-thdr")
         {
-            if (cfg->rtxCfg.enableVSR)
+            if (!cfg->rtxCfg.enableVSR)
                 LOG_WARN("Both VSR & THDR are disabled, bypassing RTX evaluate");
             cfg->rtxCfg.enableTHDR = false;
         }

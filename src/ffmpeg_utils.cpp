@@ -419,7 +419,8 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
 
         AVStream *ist = in.fmt->streams[i];
 
-        if (i < out.map_streams.size() && out.map_streams[i] == -1) { continue; }
+        // Only skip if stream mappings were explicitly set and this stream was excluded
+        if (!out.streamMappings.empty() && i < out.map_streams.size() && out.map_streams[i] == -1) { continue; }
 
         // Drop subtitle streams when outputting to pipe to avoid text contamination in stdout
         if (isPipeOutput && ist->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)

@@ -355,9 +355,6 @@ int run_pipeline(PipelineConfig cfg)
         PacketPtr pkt(av_packet_alloc(), &av_packet_free_single);
         PacketPtr opkt(av_packet_alloc(), &av_packet_free_single);
 
-        // Legacy variables removed - now using TimestampManager
-        // All PTS/DTS handling centralized in ts_manager
-
         const uint8_t *rtx_data = nullptr;
         uint32_t rtxW = 0, rtxH = 0;
         size_t rtxPitch = 0;
@@ -632,20 +629,10 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set frame PTS
-                    // FFmpeg-compatible mode: Convert timebase but don't manipulate timestamps
-                    // This matches vanilla FFmpeg behavior: simple timebase conversion only
-                    if (cfg.ffCompatible && cfg.copyts) {
-                        // Even though timebases match, we still need rescaling because:
-                        // 1. Ensures proper integer conversion
-                        // 2. HLS muxer will later rescale to its own timebase (1/16000)
-                        outFrame->pts = av_rescale_q(decframe->pts, in.vst->time_base, out.venc->time_base);
-                    } else {
-                        // Custom mode: Use timestamp manager for advanced timestamp handling
-                        TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
-                            decframe, in.vst->time_base, out.venc->time_base);
-                        outFrame->pts = timestamps.pts;
-                    }
+                    // Set frame PTS using centralized timestamp manager
+                    TimestampManager::TimestampPair timestamps = ts_manager.deriveVideoTimestamps(
+                        decframe, in.vst->time_base, out.venc->time_base);
+                    outFrame->pts = timestamps.pts;
 
                     // IMPORTANT: Must sync before encoder accesses CUDA frame data
                     // RTX processor syncs internally, but this ensures frame is ready for NVENC
@@ -717,9 +704,9 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
 
-                        // FFmpeg-compatible mode: Skip custom timestamp adjustment
-                        // Let muxer handle timestamps naturally to avoid rounding errors
-                        if (!cfg.ffCompatible || !cfg.copyts) {
+                        // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
+                        // Default mode and FFmpeg+copyts use simple passthrough
+                        if (cfg.ffCompatible && !cfg.copyts) {
                             // Custom mode: Use timestamp manager for advanced handling
                             ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
 
@@ -755,9 +742,9 @@ int run_pipeline(PipelineConfig cfg)
                     AVStream *ist = in.fmt->streams[pkt->stream_index];
                     AVStream *ost = out.fmt->streams[out_index];
 
-                    // FFmpeg-compatible mode: Skip custom timestamp adjustment
-                    // Let muxer handle timestamps naturally to avoid rounding errors
-                    if (!cfg.ffCompatible || !cfg.copyts) {
+                    // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
+                    // Default mode and FFmpeg+copyts use simple passthrough
+                    if (cfg.ffCompatible && !cfg.copyts) {
                         // Custom mode: Use timestamp manager for advanced handling
                         ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
                     }
