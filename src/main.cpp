@@ -113,11 +113,13 @@ static inline void encode_and_write(AVCodecContext *enc,
 
 // Helper function for frame buffer and context initialization
 static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, int dstH,
-                                                 CudaFramePool& cuda_pool, SwsContext*& sws_to_p010,
-                                                 FramePtr& bgra_frame, FramePtr& p010_frame,
-                                                 const InputContext& in, const OutputContext& out) {
+                                                  CudaFramePool &cuda_pool, SwsContext *&sws_to_p010,
+                                                  FramePtr &bgra_frame, FramePtr &p010_frame,
+                                                  const InputContext &in, const OutputContext &out)
+{
     // Initialize CUDA frame pool if using CUDA path
-    if (use_cuda_path) {
+    if (use_cuda_path)
+    {
         const int POOL_SIZE = 8; // Adjust based on your needs
         cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
     }
@@ -148,21 +150,27 @@ static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, 
 }
 
 // Helper function for RTX processor initialization
-static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use_cuda_path,
-                                   const PipelineConfig& cfg, const InputContext& in) {
-    if (use_cuda_path) {
+static void initialize_rtx_processor(RTXProcessor &rtx, bool &rtx_init, bool use_cuda_path,
+                                     const PipelineConfig &cfg, const InputContext &in)
+{
+    if (use_cuda_path)
+    {
         AVHWDeviceContext *devctx = (AVHWDeviceContext *)in.hw_device_ctx->data;
         AVCUDADeviceContext *cudactx = (AVCUDADeviceContext *)devctx->hwctx;
         CUcontext cu = cudactx->cuda_ctx;
-        if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+        if (!rtx.initializeWithContext(cu, cfg.rtxCfg, in.vdec->width, in.vdec->height))
+        {
             std::string detail = rtx.lastError();
             if (detail.empty())
                 detail = "unknown error";
             throw std::runtime_error(std::string("Failed to init RTX GPU path: ") + detail);
         }
         rtx_init = true;
-    } else {
-        if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height)) {
+    }
+    else
+    {
+        if (!rtx.initialize(0, cfg.rtxCfg, in.vdec->width, in.vdec->height))
+        {
             std::string detail = rtx.lastError();
             if (detail.empty())
                 detail = "unknown error";
@@ -172,46 +180,60 @@ static void initialize_rtx_processor(RTXProcessor& rtx, bool& rtx_init, bool use
     }
 }
 
-static void apply_movflags(AVDictionary** muxopts, bool is_pipe, bool hls_enabled, const PipelineConfig& cfg) {
+static void apply_movflags(AVDictionary **muxopts, bool is_pipe, bool hls_enabled, const PipelineConfig &cfg)
+{
     // User-specified flags take priority (FFmpeg-compatible)
-    if (!cfg.movflags.empty()) {
+    if (!cfg.movflags.empty())
+    {
         av_dict_set(muxopts, "movflags", cfg.movflags.c_str(), 0);
         LOG_DEBUG("Applied user movflags: %s\n", cfg.movflags.c_str());
         return;
     }
 
     // Legacy mode: Auto-apply flags for compatibility
-    if (cfg.ffCompatible) return;
+    if (cfg.ffCompatible)
+        return;
 
-    if (is_pipe) {
+    if (is_pipe)
+    {
         av_dict_set(muxopts, "movflags", "+empty_moov+default_base_moof+delay_moov+dash+write_colr", 0);
-    } else if (!hls_enabled) {
+    }
+    else if (!hls_enabled)
+    {
         av_dict_set(muxopts, "movflags", "+faststart+write_colr", 0);
-    } else {
+    }
+    else
+    {
         av_dict_set(muxopts, "movflags", "+frag_keyframe+delay_moov+faststart+write_colr", 0);
     }
 }
 
-static void apply_fragment_options(AVDictionary** muxopts, const PipelineConfig& cfg) {
-    if (cfg.fragDuration > 0) {
+static void apply_fragment_options(AVDictionary **muxopts, const PipelineConfig &cfg)
+{
+    if (cfg.fragDuration > 0)
+    {
         av_dict_set(muxopts, "frag_duration", std::to_string(cfg.fragDuration).c_str(), 0);
     }
-    if (cfg.fragmentIndex >= 0) {
+    if (cfg.fragmentIndex >= 0)
+    {
         av_dict_set(muxopts, "fragment_index", std::to_string(cfg.fragmentIndex).c_str(), 0);
     }
-    if (cfg.useEditlist >= 0) {
+    if (cfg.useEditlist >= 0)
+    {
         av_dict_set(muxopts, "use_editlist", std::to_string(cfg.useEditlist).c_str(), 0);
     }
 }
 
-static void write_muxer_header(InputContext& in, OutputContext& out, bool hls_enabled, bool mux_is_isobmff,
-                               const AVRational& fr, bool is_pipe, const PipelineConfig& cfg) {
+static void write_muxer_header(InputContext &in, OutputContext &out, bool hls_enabled, bool mux_is_isobmff,
+                               const AVRational &fr, bool is_pipe, const PipelineConfig &cfg)
+{
     out.vstream->time_base = out.venc->time_base;
     out.vstream->avg_frame_rate = fr;
 
     AVDictionary *muxopts = out.muxOptions;
 
-    if (mux_is_isobmff) {
+    if (mux_is_isobmff)
+    {
         apply_movflags(&muxopts, is_pipe, hls_enabled, cfg);
         apply_fragment_options(&muxopts, cfg);
     }
@@ -220,12 +242,14 @@ static void write_muxer_header(InputContext& in, OutputContext& out, bool hls_en
     av_dict_set(&muxopts, "avoid_negative_ts", cfg.avoidNegativeTs.c_str(), 0);
     LOG_DEBUG("Muxer avoid_negative_ts: %s", cfg.avoidNegativeTs.c_str());
 
-    if (cfg.maxMuxingQueueSize > 0) {
+    if (cfg.maxMuxingQueueSize > 0)
+    {
         out.fmt->max_interleave_delta = cfg.maxMuxingQueueSize;
     }
 
     ff_check(avformat_write_header(out.fmt, &muxopts), "write header");
-    if (muxopts) av_dict_free(&muxopts);
+    if (muxopts)
+        av_dict_free(&muxopts);
     out.muxOptions = nullptr;
 }
 
@@ -253,8 +277,8 @@ int run_pipeline(PipelineConfig cfg)
         inputOpts.seek2any = cfg.seek2any;
         inputOpts.seekTimestamp = cfg.seekTimestamp;
         // FFmpeg compatibility: Disable non-standard behaviors
-        inputOpts.enableErrorConcealment = !cfg.ffCompatible;  // FFmpeg doesn't enable error concealment by default
-        inputOpts.flushOnSeek = false;  // FFmpeg never flushes decoder on seek
+        inputOpts.enableErrorConcealment = !cfg.ffCompatible; // FFmpeg doesn't enable error concealment by default
+        inputOpts.flushOnSeek = false;                        // FFmpeg never flushes decoder on seek
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
@@ -267,9 +291,10 @@ int run_pipeline(PipelineConfig cfg)
 
         // Stage 3b: Pre-configure audio intent to guide stream creation
         bool willReencodeAudio = cfg.ffCompatible &&
-                                ((!cfg.audioCodec.empty() && cfg.audioCodec != "copy") ||
-                                 cfg.audioChannels > 0 || cfg.audioBitrate > 0 || !cfg.audioFilter.empty());
-        if (willReencodeAudio) {
+                                 ((!cfg.audioCodec.empty() && cfg.audioCodec != "copy") ||
+                                  cfg.audioChannels > 0 || cfg.audioBitrate > 0 || !cfg.audioFilter.empty());
+        if (willReencodeAudio)
+        {
             out.audioConfig.enabled = true;
             out.audioConfig.codec = cfg.audioCodec.empty() ? "aac" : cfg.audioCodec;
         }
@@ -319,7 +344,8 @@ int run_pipeline(PipelineConfig cfg)
                                      : "";
         bool mux_is_isobmff = muxer_name.find("mp4") != std::string::npos ||
                               muxer_name.find("mov") != std::string::npos;
-        if (hls_segments_are_fmp4) {
+        if (hls_segments_are_fmp4)
+        {
             mux_is_isobmff = true;
         }
         LOG_VERBOSE("Output container: %s",
@@ -327,7 +353,7 @@ int run_pipeline(PipelineConfig cfg)
 
         // Stage 7: Configure video encoder
         AVBufferRef *enc_hw_frames = configure_video_encoder(cfg, in, out, inputIsHDR, use_cuda_path,
-                                                            dstW, dstH, fr, hls_enabled, mux_is_isobmff);
+                                                             dstW, dstH, fr, hls_enabled, mux_is_isobmff);
 
         // Stage 8: Configure stream metadata and codec parameters
         configure_stream_metadata(in, out, cfg, inputIsHDR, mux_is_isobmff, hls_enabled);
@@ -342,7 +368,7 @@ int run_pipeline(PipelineConfig cfg)
         FramePtr p010_frame(av_frame_alloc(), &av_frame_free_single);
 
         initialize_frame_buffers_and_contexts(use_cuda_path, dstW, dstH, cuda_pool, sws_to_p010,
-                                            bgra_frame, p010_frame, in, out);
+                                              bgra_frame, p010_frame, in, out);
 
         // Frame buffering for handling processing spikes
         std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
@@ -447,19 +473,26 @@ int run_pipeline(PipelineConfig cfg)
         ts_config.mode = cfg.copyts ? TimestampManager::Mode::COPYTS : TimestampManager::Mode::NORMAL;
         ts_config.input_seek_us = in.seek_offset_us;
         // FFmpeg compatibility: Don't automatically fix timestamp violations
-        ts_config.enforce_monotonicity = !cfg.ffCompatible;  // FFmpeg reports errors, doesn't auto-fix
+        ts_config.enforce_monotonicity = !cfg.ffCompatible; // FFmpeg reports errors, doesn't auto-fix
 
         // Parse avoid_negative_ts setting (FFmpeg-compatible)
         std::string avoid_ts_lower = cfg.avoidNegativeTs;
         std::transform(avoid_ts_lower.begin(), avoid_ts_lower.end(), avoid_ts_lower.begin(), ::tolower);
-        if (avoid_ts_lower == "disabled") {
+        if (avoid_ts_lower == "disabled")
+        {
             ts_config.avoid_negative_ts = AvoidNegativeTs::DISABLED;
-        } else if (avoid_ts_lower == "make_zero") {
+        }
+        else if (avoid_ts_lower == "make_zero")
+        {
             ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_ZERO;
-        } else if (avoid_ts_lower == "make_non_negative") {
+        }
+        else if (avoid_ts_lower == "make_non_negative")
+        {
             ts_config.avoid_negative_ts = AvoidNegativeTs::MAKE_NON_NEGATIVE;
-        } else {
-            ts_config.avoid_negative_ts = AvoidNegativeTs::AUTO;  // Default
+        }
+        else
+        {
+            ts_config.avoid_negative_ts = AvoidNegativeTs::AUTO; // Default
         }
 
         // Set start_at_zero flag (FFmpeg-compatible)
@@ -471,41 +504,50 @@ int run_pipeline(PipelineConfig cfg)
 
         // Detect actual frame rate for better monotonicity recovery
         AVRational detected_fr = av_guess_frame_rate(in.fmt, in.vst, nullptr);
-        if (detected_fr.num > 0 && detected_fr.den > 0) {
+        if (detected_fr.num > 0 && detected_fr.den > 0)
+        {
             ts_config.expected_frame_rate = detected_fr;
             LOG_DEBUG("Detected frame rate: %d/%d (%.3f fps)",
-                     detected_fr.num, detected_fr.den, av_q2d(detected_fr));
-        } else {
-            ts_config.expected_frame_rate = {24, 1};  // Default fallback
+                      detected_fr.num, detected_fr.den, av_q2d(detected_fr));
+        }
+        else
+        {
+            ts_config.expected_frame_rate = {24, 1}; // Default fallback
             LOG_WARN("Could not detect frame rate, using default 24fps");
         }
 
         // Parse output seeking time
-        if (!cfg.outputSeekTime.empty()) {
+        if (!cfg.outputSeekTime.empty())
+        {
             int ret = av_parse_time(&ts_config.output_seek_target_us, cfg.outputSeekTime.c_str(), 1);
-            if (ret < 0) {
+            if (ret < 0)
+            {
                 throw std::runtime_error("Invalid output seek time format: " + cfg.outputSeekTime);
             }
             LOG_DEBUG("Output seeking enabled: target = %.3fs", ts_config.output_seek_target_us / 1000000.0);
 
             // Edge case: Warn if output seek < input seek
-            if (in.seek_offset_us > 0 && ts_config.output_seek_target_us < in.seek_offset_us) {
+            if (in.seek_offset_us > 0 && ts_config.output_seek_target_us < in.seek_offset_us)
+            {
                 LOG_WARN("Output seek target (%.3fs) < input seek (%.3fs) - may cause unexpected behavior",
                          ts_config.output_seek_target_us / 1000000.0, in.seek_offset_us / 1000000.0);
             }
         }
 
         // Parse output timestamp offset
-        if (!cfg.outputTsOffset.empty()) {
+        if (!cfg.outputTsOffset.empty())
+        {
             int ret = av_parse_time(&ts_config.output_ts_offset_us, cfg.outputTsOffset.c_str(), 1);
-            if (ret < 0) {
+            if (ret < 0)
+            {
                 throw std::runtime_error("Invalid output timestamp offset format: " + cfg.outputTsOffset);
             }
             LOG_DEBUG("Output timestamp offset: %.3fs", ts_config.output_ts_offset_us / 1000000.0);
         }
 
         // Edge case: Validate copyts + output_ts_offset usage
-        if (ts_config.output_ts_offset_us != 0 && !cfg.copyts) {
+        if (ts_config.output_ts_offset_us != 0 && !cfg.copyts)
+        {
             LOG_WARN("-output_ts_offset specified without -copyts. This may produce unexpected timestamps.");
             LOG_WARN("Typically use: -copyts -output_ts_offset <value> together");
         }
@@ -528,7 +570,8 @@ int run_pipeline(PipelineConfig cfg)
                   demux_config.max_queue_size, fps, target_buffer_seconds);
 
         // Start async demuxing thread
-        if (!async_demuxer.start()) {
+        if (!async_demuxer.start())
+        {
             throw std::runtime_error("Failed to start async demuxer");
         }
 
@@ -538,21 +581,24 @@ int run_pipeline(PipelineConfig cfg)
         LOG_DEBUG("Audio config enabled: %s", out.audioConfig.enabled ? "true" : "false");
         LOG_DEBUG("Copyts mode: %s", cfg.copyts ? "enabled" : "disabled");
         LOG_DEBUG("FFmpeg compatibility: avoid_negative_ts=%s, start_at_zero=%s",
-                 cfg.avoidNegativeTs.c_str(), cfg.startAtZero ? "enabled" : "disabled");
+                  cfg.avoidNegativeTs.c_str(), cfg.startAtZero ? "enabled" : "disabled");
         LOG_DEBUG("Starting processing with seek_offset_us = %lld (%.3fs)", in.seek_offset_us, in.seek_offset_us / 1000000.0);
         int packet_count = 0;
-        bool audio_pts_aligned = false;  // Track if we've aligned audio PTS with video baseline
+        bool audio_pts_aligned = false; // Track if we've aligned audio PTS with video baseline
         while (true)
         {
             // Get packet from async demuxer (non-blocking I/O)
-            AVPacket* raw_pkt = async_demuxer.getPacket();
-            if (!raw_pkt) {
+            AVPacket *raw_pkt = async_demuxer.getPacket();
+            if (!raw_pkt)
+            {
                 // Check for EOF or error
-                if (async_demuxer.isEOF()) {
+                if (async_demuxer.isEOF())
+                {
                     break;
                 }
                 int err = async_demuxer.getError();
-                if (err != 0) {
+                if (err != 0)
+                {
                     char errbuf[AV_ERROR_MAX_STRING_SIZE];
                     av_make_error_string(errbuf, sizeof(errbuf), err);
                     throw std::runtime_error(std::string("Async demuxer error: ") + errbuf);
@@ -568,12 +614,14 @@ int run_pipeline(PipelineConfig cfg)
 
             // Establish global baseline from the first VIDEO packet when seeking to ensure A/V sync
             if (in.seek_offset_us > 0 && ts_manager.getGlobalBaseline() == AV_NOPTS_VALUE &&
-                pkt->stream_index == in.vstream && pkt->pts != AV_NOPTS_VALUE) {
+                pkt->stream_index == in.vstream && pkt->pts != AV_NOPTS_VALUE)
+            {
                 AVStream *stream = in.fmt->streams[pkt->stream_index];
                 ts_manager.establishGlobalBaseline(pkt.get(), stream->time_base);
 
                 // Align audio PTS with the newly established video baseline
-                if (out.audioConfig.enabled && !audio_pts_aligned) {
+                if (out.audioConfig.enabled && !audio_pts_aligned)
+                {
                     init_audio_pts_after_seek(in, out, ts_manager.getGlobalBaseline());
                     audio_pts_aligned = true;
                     LOG_DEBUG("Audio PTS aligned with video baseline at %.3fs", ts_manager.getGlobalBaseline() / 1000000.0);
@@ -610,7 +658,8 @@ int run_pipeline(PipelineConfig cfg)
                     }
 
                     // Output seeking: Drop frames until target reached (handled by TimestampManager)
-                    if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base)) {
+                    if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base))
+                    {
                         av_frame_unref(frame.get());
                         if (swframe)
                             av_frame_unref(swframe.get());
@@ -672,7 +721,8 @@ int run_pipeline(PipelineConfig cfg)
                         ff_check(ret, "receive audio frame");
 
                         // Update A/V drift monitoring
-                        if (audio_frame->pts != AV_NOPTS_VALUE) {
+                        if (audio_frame->pts != AV_NOPTS_VALUE)
+                        {
                             int64_t audio_pts_us = av_rescale_q(audio_frame->pts,
                                                                 in.ast->time_base,
                                                                 {1, AV_TIME_BASE});
@@ -698,7 +748,6 @@ int run_pipeline(PipelineConfig cfg)
                     // Fallback: copy audio packet without re-encoding
                     int out_index = out.input_to_output_map[pkt->stream_index];
 
-
                     if (out_index >= 0)
                     {
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
@@ -706,12 +755,14 @@ int run_pipeline(PipelineConfig cfg)
 
                         // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
                         // Default mode and FFmpeg+copyts use simple passthrough
-                        if (cfg.ffCompatible && !cfg.copyts) {
+                        if (cfg.ffCompatible && !cfg.copyts)
+                        {
                             // Custom mode: Use timestamp manager for advanced handling
                             ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
 
                             // Check if packet was invalidated (waiting for baseline)
-                            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+                            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE)
+                            {
                                 av_packet_unref(pkt.get());
                                 continue;
                             }
@@ -744,7 +795,8 @@ int run_pipeline(PipelineConfig cfg)
 
                     // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
                     // Default mode and FFmpeg+copyts use simple passthrough
-                    if (cfg.ffCompatible && !cfg.copyts) {
+                    if (cfg.ffCompatible && !cfg.copyts)
+                    {
                         // Custom mode: Use timestamp manager for advanced handling
                         ts_manager.adjustPacketTimestamps(pkt.get(), ist->time_base, pkt->stream_index);
                     }
@@ -808,36 +860,39 @@ int run_pipeline(PipelineConfig cfg)
             // Async demuxer statistics
             AsyncDemuxer::Stats demux_stats = async_demuxer.getStats();
             LOG_DEBUG("Demuxer stats: packets=%zu, queue_waits=%zu, queue_depth=%zu/%zu%s",
-                     demux_stats.total_reads, demux_stats.queue_full_waits,
-                     demux_stats.min_queue_depth != SIZE_MAX ? demux_stats.min_queue_depth : 0,
-                     demux_stats.max_queue_depth,
-                     demux_stats.queue_full_waits > 0 ? " (backpressure)" : "");
+                      demux_stats.total_reads, demux_stats.queue_full_waits,
+                      demux_stats.min_queue_depth != SIZE_MAX ? demux_stats.min_queue_depth : 0,
+                      demux_stats.max_queue_depth,
+                      demux_stats.queue_full_waits > 0 ? " (backpressure)" : "");
 
             // Report timestamp statistics
             TimestampManager::Stats ts_stats = ts_manager.getStats();
             if (ts_stats.dropped_frames > 0 || ts_stats.discontinuities > 0 ||
                 ts_stats.monotonicity_violations > 0 || ts_stats.negative_pts > 0 ||
-                ts_stats.av_drift_warnings > 0) {
+                ts_stats.av_drift_warnings > 0)
+            {
                 LOG_DEBUG("Timestamp stats: dropped=%d, discontinuities=%d, monotonic_fix=%d, neg_pts=%d, av_drift=%d (max=%.1fms)%s",
-                         ts_stats.dropped_frames, ts_stats.discontinuities,
-                         ts_stats.monotonicity_violations, ts_stats.negative_pts,
-                         ts_stats.av_drift_warnings, ts_stats.max_av_drift_ms,
-                         ts_stats.max_av_drift_ms > 500.0 ? " WARNING:HIGH_DRIFT" : "");
+                          ts_stats.dropped_frames, ts_stats.discontinuities,
+                          ts_stats.monotonicity_violations, ts_stats.negative_pts,
+                          ts_stats.av_drift_warnings, ts_stats.max_av_drift_ms,
+                          ts_stats.max_av_drift_ms > 500.0 ? " WARNING:HIGH_DRIFT" : "");
             }
 
             // Overall health assessment
             bool healthy = true;
             std::string warnings;
-            if (demux_stats.queue_full_waits > demux_stats.total_reads * 0.1) {
+            if (demux_stats.queue_full_waits > demux_stats.total_reads * 0.1)
+            {
                 warnings += "demux_backpressure ";
                 healthy = false;
             }
-            if (ts_stats.max_av_drift_ms > 500.0) {
+            if (ts_stats.max_av_drift_ms > 500.0)
+            {
                 warnings += "high_av_drift ";
                 healthy = false;
             }
             LOG_DEBUG("Pipeline health: %s%s", healthy ? "OK" : "WARN",
-                     warnings.empty() ? "" : (" - " + warnings).c_str());
+                      warnings.empty() ? "" : (" - " + warnings).c_str());
         }
         if (sws_to_argb)
             sws_freeContext(sws_to_argb);

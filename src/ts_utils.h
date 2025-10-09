@@ -1,6 +1,7 @@
 #pragma once
 
-extern "C" {
+extern "C"
+{
 #include <libavutil/avutil.h>
 #include <libavutil/rational.h>
 #include <libavformat/avformat.h>
@@ -49,15 +50,18 @@ static inline int64_t derive_copied_stream_pts(int64_t &stream_start_pts,
                                                int64_t seek_offset_us,
                                                AVRational stream_time_base)
 {
-    if (packet_pts == AV_NOPTS_VALUE) {
+    if (packet_pts == AV_NOPTS_VALUE)
+    {
         return AV_NOPTS_VALUE;
     }
 
     // Establish baseline from first packet
-    if (stream_start_pts == AV_NOPTS_VALUE) {
+    if (stream_start_pts == AV_NOPTS_VALUE)
+    {
         stream_start_pts = packet_pts;
         // When seeking, adjust the baseline to account for the seek offset
-        if (seek_offset_us > 0) {
+        if (seek_offset_us > 0)
+        {
             int64_t seek_offset_in_timebase = av_rescale_q(seek_offset_us, {1, AV_TIME_BASE}, stream_time_base);
             stream_start_pts -= seek_offset_in_timebase;
         }
@@ -72,7 +76,8 @@ static inline int64_t derive_global_baseline_pts(int64_t packet_pts,
                                                  int64_t global_min_pts_us,
                                                  AVRational stream_time_base)
 {
-    if (packet_pts == AV_NOPTS_VALUE || global_min_pts_us == AV_NOPTS_VALUE) {
+    if (packet_pts == AV_NOPTS_VALUE || global_min_pts_us == AV_NOPTS_VALUE)
+    {
         return packet_pts; // No adjustment if no baseline established
     }
 
@@ -98,7 +103,8 @@ static inline int64_t derive_copyts_pts(const AVFrame *decframe,
                          ? decframe->pts
                          : decframe->best_effort_timestamp;
 
-    if (in_pts == AV_NOPTS_VALUE) {
+    if (in_pts == AV_NOPTS_VALUE)
+    {
         return AV_NOPTS_VALUE;
     }
 
@@ -108,13 +114,15 @@ static inline int64_t derive_copyts_pts(const AVFrame *decframe,
     // Apply output timestamp offset if specified
     // NOTE: output_ts_offset SUBTRACTS from timestamps to shift timeline backward
     // Example: frame at 424s with offset 424 → output at 0s (424 - 424 = 0)
-    if (output_ts_offset_us != 0) {
+    if (output_ts_offset_us != 0)
+    {
         int64_t offset_in_out_tb = av_rescale_q(output_ts_offset_us, {1, AV_TIME_BASE}, out_time_base);
-        out_pts -= offset_in_out_tb;  // Subtract to shift timeline backward
+        out_pts -= offset_in_out_tb; // Subtract to shift timeline backward
 
         // Edge case: Prevent negative timestamps (can happen if offset > actual PTS)
         // FFmpeg clamps to 0 in this case
-        if (out_pts < 0) {
+        if (out_pts < 0)
+        {
             out_pts = 0;
         }
     }
@@ -124,11 +132,12 @@ static inline int64_t derive_copyts_pts(const AVFrame *decframe,
 
 // Derive output PTS for -copyts mode for copied packets (no re-encoding)
 static inline int64_t derive_copyts_packet_pts(int64_t packet_pts,
-                                                AVRational in_time_base,
-                                                AVRational out_time_base,
-                                                int64_t output_ts_offset_us = 0)
+                                               AVRational in_time_base,
+                                               AVRational out_time_base,
+                                               int64_t output_ts_offset_us = 0)
 {
-    if (packet_pts == AV_NOPTS_VALUE) {
+    if (packet_pts == AV_NOPTS_VALUE)
+    {
         return AV_NOPTS_VALUE;
     }
 
@@ -136,13 +145,15 @@ static inline int64_t derive_copyts_packet_pts(int64_t packet_pts,
     int64_t out_pts = av_rescale_q(packet_pts, in_time_base, out_time_base);
 
     // Apply output timestamp offset if specified (subtracts to shift timeline backward)
-    if (output_ts_offset_us != 0) {
+    if (output_ts_offset_us != 0)
+    {
         int64_t offset_in_out_tb = av_rescale_q(output_ts_offset_us, {1, AV_TIME_BASE}, out_time_base);
-        out_pts -= offset_in_out_tb;  // Subtract to shift timeline backward
+        out_pts -= offset_in_out_tb; // Subtract to shift timeline backward
 
         // Edge case: Prevent negative timestamps (can happen if offset > actual PTS)
         // FFmpeg clamps to 0 in this case
-        if (out_pts < 0) {
+        if (out_pts < 0)
+        {
             out_pts = 0;
         }
     }

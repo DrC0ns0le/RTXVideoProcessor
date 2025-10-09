@@ -274,7 +274,7 @@ int run_ffmpeg_passthrough(int argc, char **argv)
         command_line_buffer.data(),
         nullptr,
         nullptr,
-        TRUE,  // bInheritHandles = TRUE to inherit stdout/stderr/stdin
+        TRUE, // bInheritHandles = TRUE to inherit stdout/stderr/stdin
         0,
         nullptr,
         nullptr,

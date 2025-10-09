@@ -1,6 +1,7 @@
 #pragma once
 
-extern "C" {
+extern "C"
+{
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
@@ -17,16 +18,16 @@ struct InputOpenOptions
 {
     std::string fflags;
     bool preferP010ForHDR = false; // Request P010 output for HDR content
-    std::string seekTime; // Seek time in FFmpeg format (e.g., "00:09:06.671")
+    std::string seekTime;          // Seek time in FFmpeg format (e.g., "00:09:06.671")
 
     // Seek behavior flags (FFmpeg compatibility)
-    bool noAccurateSeek = false;   // Use AVSEEK_FLAG_ANY for fast seeking (-noaccurate_seek)
-    bool seek2any = false;         // Allow seeking to non-keyframes (-seek2any)
-    bool seekTimestamp = false;    // Use timestamp-based seeking (-seek_timestamp)
+    bool noAccurateSeek = false; // Use AVSEEK_FLAG_ANY for fast seeking (-noaccurate_seek)
+    bool seek2any = false;       // Allow seeking to non-keyframes (-seek2any)
+    bool seekTimestamp = false;  // Use timestamp-based seeking (-seek_timestamp)
 
     // Decoder error handling (FFmpeg compatibility)
-    bool enableErrorConcealment = true;  // Enable error concealment for incomplete frames (legacy default)
-    bool flushOnSeek = false;            // Flush decoder buffers after seeking (FFmpeg does NOT do this)
+    bool enableErrorConcealment = true; // Enable error concealment for incomplete frames (legacy default)
+    bool flushOnSeek = false;           // Flush decoder buffers after seeking (FFmpeg does NOT do this)
 };
 
 struct HlsMuxOptions
@@ -45,11 +46,12 @@ struct HlsMuxOptions
 };
 
 // FFmpeg-compatible timestamp handling modes
-enum class AvoidNegativeTs {
-    AUTO,       // FFmpeg default: auto (make_non_negative for MOV, make_zero for others)
-    MAKE_ZERO,  // Shift timestamps to start at zero
+enum class AvoidNegativeTs
+{
+    AUTO,              // FFmpeg default: auto (make_non_negative for MOV, make_zero for others)
+    MAKE_ZERO,         // Shift timestamps to start at zero
     MAKE_NON_NEGATIVE, // Only shift if negative
-    DISABLED    // Allow negative timestamps (may break some muxers)
+    DISABLED           // Allow negative timestamps (may break some muxers)
 };
 
 struct InputContext
@@ -81,11 +83,12 @@ struct AudioConfig
 };
 
 // Stream mapping decision for each input stream
-enum class StreamMapDecision {
-    EXCLUDE,           // Stream should not be included in output
-    COPY,              // Stream should be copied to output
-    PROCESS_VIDEO,     // Video stream to be processed (encoded)
-    PROCESS_AUDIO      // Audio stream to be processed (re-encoded)
+enum class StreamMapDecision
+{
+    EXCLUDE,       // Stream should not be included in output
+    COPY,          // Stream should be copied to output
+    PROCESS_VIDEO, // Video stream to be processed (encoded)
+    PROCESS_AUDIO  // Audio stream to be processed (re-encoded)
 };
 
 struct OutputContext

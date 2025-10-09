@@ -7,7 +7,8 @@
 #include <filesystem>
 #include <system_error>
 
-extern "C" {
+extern "C"
+{
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
@@ -23,7 +24,7 @@ bool endsWith(const std::string &str, const std::string &suffix)
 }
 
 // String utility: convert to lowercase
-std::string lowercase_copy(const std::string& s)
+std::string lowercase_copy(const std::string &s)
 {
     std::string result = s;
     std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c)
@@ -32,9 +33,10 @@ std::string lowercase_copy(const std::string& s)
 }
 
 // Check if output is a pipe/stdout
-bool is_pipe_output(const char* path)
+bool is_pipe_output(const char *path)
 {
-    if (!path) return false;
+    if (!path)
+        return false;
     return (std::strcmp(path, "-") == 0) ||
            (std::strcmp(path, "pipe:") == 0) ||
            (std::strcmp(path, "pipe:1") == 0) ||
@@ -42,7 +44,7 @@ bool is_pipe_output(const char* path)
 }
 
 // Check if HLS output will be used
-bool will_use_hls_output(const PipelineConfig& cfg)
+bool will_use_hls_output(const PipelineConfig &cfg)
 {
     const bool format_requests_hls = !cfg.outputFormatName.empty() && lowercase_copy(cfg.outputFormatName) == "hls";
 
@@ -171,9 +173,9 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
 }
 
 // Configure video encoder
-AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, OutputContext& out,
+AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, OutputContext &out,
                                      bool inputIsHDR, bool use_cuda_path, int dstW, int dstH,
-                                     const AVRational& fr, bool hls_enabled, bool mux_is_isobmff)
+                                     const AVRational &fr, bool hls_enabled, bool mux_is_isobmff)
 {
     LOG_DEBUG("Configuring HEVC encoder...");
     out.venc->codec_id = AV_CODEC_ID_HEVC;
@@ -184,13 +186,16 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     // - HLS: Use framerate-based timebase (already set in ffmpeg_utils.cpp as 1/fps)
     //        This matches vanilla FFmpeg behavior and ensures HLS muxer uses 1/24000
     // - Non-HLS: Use input stream timebase for -copyts compatibility (-enc_time_base -1)
-    if (!hls_enabled) {
+    if (!hls_enabled)
+    {
         // Non-HLS: Override to use input stream timebase
         out.venc->time_base = in.vst->time_base;
         out.vstream->time_base = out.venc->time_base;
         LOG_DEBUG("Non-HLS: Using input stream timebase %d/%d for encoder",
-                 out.venc->time_base.num, out.venc->time_base.den);
-    } else {
+                  out.venc->time_base.num, out.venc->time_base.den);
+    }
+    else
+    {
         // HLS: Keep the framerate-based timebase that was set in ffmpeg_utils.cpp
         // This ensures muxer will use 1/24000 (or similar) instead of 1/16000
         LOG_INFO("HLS: Using framerate-based encoder timebase %d/%d",
@@ -199,9 +204,12 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     out.venc->framerate = fr;
 
     bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
-    if (use_cuda_path) {
+    if (use_cuda_path)
+    {
         out.venc->pix_fmt = AV_PIX_FMT_CUDA;
-    } else {
+    }
+    else
+    {
         out.venc->pix_fmt = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
     }
 
@@ -209,7 +217,8 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     int gop_duration_sec = cfg.gop;
     int gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
 
-    if (hls_enabled && out.hlsOptions.hlsTime > 0) {
+    if (hls_enabled && out.hlsOptions.hlsTime > 0)
+    {
         gop_duration_sec = out.hlsOptions.hlsTime;
 
         // Calculate GOP size with proper rounding for fractional framerates
@@ -217,7 +226,8 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
         gop_size_frames = (int)round((double)gop_duration_sec * fr.num / fr.den);
 
         double fps = (double)fr.num / fr.den;
-        if (fps > 50 && gop_duration_sec > 2) {
+        if (fps > 50 && gop_duration_sec > 2)
+        {
             LOG_WARN("High frame rate (%.1f fps) with %d-sec segments may cause periodic slowdowns",
                      fps, gop_duration_sec);
             LOG_WARN("Consider using -hls_time 2 for better performance at high FPS");
@@ -233,29 +243,37 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
 
     // For HLS: Set minimum keyframe interval equal to GOP size
     // This matches FFmpeg's -keyint_min behavior and ensures strict GOP alignment
-    if (hls_enabled) {
+    if (hls_enabled)
+    {
         av_opt_set_int(out.venc->priv_data, "g", gop_size_frames, 0);
         // Note: NVENC doesn't have keyint_min, but strict_gop below achieves the same
     }
 
     // HDR color settings
-    if (outputHDR) {
-        if (inputIsHDR) {
+    if (outputHDR)
+    {
+        if (inputIsHDR)
+        {
             out.venc->color_trc = in.vst->codecpar->color_trc;
             out.venc->color_primaries = in.vst->codecpar->color_primaries;
             out.venc->colorspace = in.vst->codecpar->color_space;
-        } else {
+        }
+        else
+        {
             out.venc->color_trc = AVCOL_TRC_SMPTE2084;
             out.venc->color_primaries = AVCOL_PRI_BT2020;
             out.venc->colorspace = AVCOL_SPC_BT2020_NCL;
         }
-    } else {
+    }
+    else
+    {
         out.venc->color_trc = AVCOL_TRC_BT709;
         out.venc->color_primaries = AVCOL_PRI_BT709;
         out.venc->colorspace = AVCOL_SPC_BT709;
     }
 
-    if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff || hls_enabled) {
+    if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || !mux_is_isobmff || hls_enabled)
+    {
         out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
@@ -270,20 +288,25 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
     av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
 
-    if (hls_enabled) {
+    if (hls_enabled)
+    {
         av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
         av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
         LOG_INFO("Enabled forced-idr + strict_gop for HLS segment alignment (ensures I-frame at every segment boundary)");
     }
 
-    if (outputHDR) {
+    if (outputHDR)
+    {
         av_opt_set(out.venc->priv_data, "profile", "main10", 0);
-    } else {
+    }
+    else
+    {
         av_opt_set(out.venc->priv_data, "profile", "main", 0);
     }
 
     AVBufferRef *enc_hw_frames = nullptr;
-    if (use_cuda_path) {
+    if (use_cuda_path)
+    {
         enc_hw_frames = av_hwframe_ctx_alloc(in.hw_device_ctx);
         if (!enc_hw_frames)
             throw std::runtime_error("av_hwframe_ctx_alloc failed for encoder");
@@ -306,50 +329,66 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
 }
 
 // Configure stream metadata
-void configure_stream_metadata(InputContext& in, OutputContext& out, PipelineConfig& cfg,
+void configure_stream_metadata(InputContext &in, OutputContext &out, PipelineConfig &cfg,
                                bool inputIsHDR, bool mux_is_isobmff, bool hls_enabled)
 {
     bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
 
     ff_check(avcodec_parameters_from_context(out.vstream->codecpar, out.venc), "enc params to stream");
-    if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr) {
+    if (out.vstream->codecpar->extradata_size == 0 || out.vstream->codecpar->extradata == nullptr)
+    {
         throw std::runtime_error("HEVC encoder did not provide extradata; required for Matroska outputs");
     }
     LOG_DEBUG("Encoder extradata size: %d bytes", out.vstream->codecpar->extradata_size);
-    if (out.vstream->codecpar->extradata_size >= 4) {
+    if (out.vstream->codecpar->extradata_size >= 4)
+    {
         const uint8_t *ed = out.vstream->codecpar->extradata;
         LOG_DEBUG("Extradata head: %02X %02X %02X %02X", ed[0], ed[1], ed[2], ed[3]);
     }
 
-    if (out.vstream->codecpar) {
-        if (mux_is_isobmff) {
+    if (out.vstream->codecpar)
+    {
+        if (mux_is_isobmff)
+        {
             out.vstream->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
-        } else {
+        }
+        else
+        {
             out.vstream->codecpar->codec_tag = 0;
         }
         out.vstream->codecpar->color_range = AVCOL_RANGE_MPEG;
-        if (outputHDR) {
-            if (inputIsHDR) {
+        if (outputHDR)
+        {
+            if (inputIsHDR)
+            {
                 out.vstream->codecpar->color_trc = in.vst->codecpar->color_trc;
                 out.vstream->codecpar->color_primaries = in.vst->codecpar->color_primaries;
                 out.vstream->codecpar->color_space = in.vst->codecpar->color_space;
-            } else {
+            }
+            else
+            {
                 out.vstream->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
                 out.vstream->codecpar->color_primaries = AVCOL_PRI_BT2020;
                 out.vstream->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
             }
-        } else {
+        }
+        else
+        {
             out.vstream->codecpar->color_trc = AVCOL_TRC_BT709;
             out.vstream->codecpar->color_primaries = AVCOL_PRI_BT709;
             out.vstream->codecpar->color_space = AVCOL_SPC_BT709;
         }
     }
 
-    if (outputHDR && !hls_enabled) {
-        if (inputIsHDR) {
+    if (outputHDR && !hls_enabled)
+    {
+        if (inputIsHDR)
+        {
             LOG_INFO("Preserving HDR mastering metadata from input stream");
             add_mastering_and_cll(out.vstream, 4000);
-        } else {
+        }
+        else
+        {
             add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
         }
     }

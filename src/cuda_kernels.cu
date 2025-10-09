@@ -350,8 +350,8 @@ __global__ void k_p010_to_x2bgr10(const uint8_t *__restrict__ d_y, int pitchY,
     float V = (float)(V16 >> 6);
 
     // Limited range mapping for 10-bit (0-1023 range)
-    float Yp = (Y - 64.0f) / 876.0f;   // 10-bit: Y range 64-940 (876 levels)
-    float Uc = (U - 512.0f) / 896.0f;  // 10-bit: UV range 64-960 (896 levels), centered at 512
+    float Yp = (Y - 64.0f) / 876.0f;  // 10-bit: Y range 64-940 (876 levels)
+    float Uc = (U - 512.0f) / 896.0f; // 10-bit: UV range 64-960 (896 levels), centered at 512
     float Vc = (V - 512.0f) / 896.0f;
 
     float R, G, B;
@@ -375,16 +375,17 @@ __global__ void k_p010_to_x2bgr10(const uint8_t *__restrict__ d_y, int pitchY,
 // Kernel: P010 (10-bit YUV420) -> NV12 (8-bit YUV420)
 // Simple downsampling: take upper 8 bits of 10-bit data
 __global__ void k_p010_to_nv12(const uint8_t *__restrict__ d_yIn, int pitchYIn,
-                                const uint8_t *__restrict__ d_uvIn, int pitchUVIn,
-                                uint8_t *__restrict__ d_yOut, int pitchYOut,
-                                uint8_t *__restrict__ d_uvOut, int pitchUVOut,
-                                int w, int h)
+                               const uint8_t *__restrict__ d_uvIn, int pitchUVIn,
+                               uint8_t *__restrict__ d_yOut, int pitchYOut,
+                               uint8_t *__restrict__ d_uvOut, int pitchUVOut,
+                               int w, int h)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Process Y plane
-    if (x < w && y < h) {
+    if (x < w && y < h)
+    {
         const uint16_t *yIn = (const uint16_t *)d_yIn;
         uint16_t y16 = yIn[y * (pitchYIn / 2) + x];
         // P010: 10 bits in upper bits, shift right 2 to get upper 8 bits
@@ -395,7 +396,8 @@ __global__ void k_p010_to_nv12(const uint8_t *__restrict__ d_yIn, int pitchYIn,
     // Process UV plane (half resolution)
     int uvY = y / 2;
     int uvX = (x / 2) * 2; // Align to UV pair
-    if (uvX < w && uvY < h / 2 && (x % 2 == 0)) {
+    if (uvX < w && uvY < h / 2 && (x % 2 == 0))
+    {
         const uint16_t *uvIn = (const uint16_t *)d_uvIn;
         uint16_t u16 = uvIn[uvY * (pitchUVIn / 2) + uvX + 0];
         uint16_t v16 = uvIn[uvY * (pitchUVIn / 2) + uvX + 1];
@@ -429,8 +431,8 @@ void launch_p010_to_nv12(const uint8_t *d_yIn, int pitchYIn,
     dim3 block(32, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
     k_p010_to_nv12<<<grid, block, 0, stream>>>(d_yIn, pitchYIn, d_uvIn, pitchUVIn,
-                                                d_yOut, pitchYOut, d_uvOut, pitchUVOut,
-                                                w, h);
+                                               d_yOut, pitchYOut, d_uvOut, pitchUVOut,
+                                               w, h);
 }
 
 void launch_p010_to_x2bgr10(const uint8_t *d_y, int pitchY,

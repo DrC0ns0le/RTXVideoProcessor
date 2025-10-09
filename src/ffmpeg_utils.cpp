@@ -10,7 +10,8 @@
 #include <io.h>
 #endif
 
-extern "C" {
+extern "C"
+{
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/parseutils.h>
@@ -44,9 +45,9 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
 
     // Check if input is a network URL
     bool isNetworkInput = (std::strncmp(inPath, "http://", 7) == 0 ||
-                          std::strncmp(inPath, "https://", 8) == 0 ||
-                          std::strncmp(inPath, "rtmp://", 7) == 0 ||
-                          std::strncmp(inPath, "rtsp://", 7) == 0);
+                           std::strncmp(inPath, "https://", 8) == 0 ||
+                           std::strncmp(inPath, "rtmp://", 7) == 0 ||
+                           std::strncmp(inPath, "rtsp://", 7) == 0);
 
     // For network inputs, set some helpful options
     if (isNetworkInput)
@@ -133,8 +134,8 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
 
     // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
     // This is especially important after seeking where reference frames may not be available
-    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;  // Show all frames even if corrupted
-    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;  // Output potentially corrupted frames
+    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;     // Show all frames even if corrupted
+    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT; // Output potentially corrupted frames
     LOG_DEBUG("Decoder error concealment enabled");
 
     // Try to enable CUDA hardware decoding
@@ -278,9 +279,9 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     ff_check(avformat_alloc_output_context2(&out.fmt, nullptr, effectiveFormat, isPipe ? nullptr : outPath), "alloc output context");
     if (!out.fmt)
         throw std::runtime_error("Failed to allocate output format context");
-    
-    LOG_DEBUG("Output format context allocated successfully, muxer='%s'\n", 
-            out.fmt->oformat ? out.fmt->oformat->name : "unknown");
+
+    LOG_DEBUG("Output format context allocated successfully, muxer='%s'\n",
+              out.fmt->oformat ? out.fmt->oformat->name : "unknown");
 
     if (out.hlsOptions.enabled)
     {
@@ -331,11 +332,10 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             LOG_DEBUG("Set max_delay = %s\n", value.c_str());
         }
 
-
         // Only set custom hls_flags in non-FFmpeg-compatible mode
         // Vanilla FFmpeg uses default flags (0) unless explicitly specified
         std::string hlsFlags;
-        if (!out.hlsOptions.autoDiscontinuity)  // autoDiscontinuity = !ffCompatible
+        if (!out.hlsOptions.autoDiscontinuity) // autoDiscontinuity = !ffCompatible
         {
             // FFmpeg-compatible mode: Use minimal flags, let FFmpeg handle defaults
             if (out.hlsOptions.listSize > 0)
@@ -376,7 +376,8 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         // Debug: Print all HLS options that will be passed to the muxer
         LOG_DEBUG("Final HLS muxer options:\n");
         AVDictionaryEntry *entry = nullptr;
-        while ((entry = av_dict_get(muxOpts, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+        while ((entry = av_dict_get(muxOpts, "", entry, AV_DICT_IGNORE_SUFFIX)))
+        {
             LOG_DEBUG("  %s = %s\n", entry->key, entry->value);
         }
 
@@ -389,10 +390,12 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     }
 
     const AVCodec *encoder = avcodec_find_encoder_by_name("hevc_nvenc");
-    if (!encoder) {
+    if (!encoder)
+    {
         // Try software libx265 encoder instead of hardware encoders
         encoder = avcodec_find_encoder_by_name("libx265");
-        if (!encoder) {
+        if (!encoder)
+        {
             // Last resort: try any HEVC encoder (may select hardware encoders like hevc_d3d12va)
             encoder = avcodec_find_encoder(AV_CODEC_ID_HEVC);
         }
@@ -436,8 +439,8 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
 
     // Check if output is a pipe
     bool isPipeOutput = (std::strcmp(outPath, "-") == 0) ||
-                       (std::strcmp(outPath, "pipe:") == 0) ||
-                       (std::strcmp(outPath, "pipe:1") == 0);
+                        (std::strcmp(outPath, "pipe:") == 0) ||
+                        (std::strcmp(outPath, "pipe:1") == 0);
 
     // Create output streams based on decisions
     for (unsigned int i = 0; i < in.fmt->nb_streams; ++i)
@@ -507,7 +510,8 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         {
             ost->time_base = {1, ist->codecpar->sample_rate};
             // Track the first audio stream created (for audio passthrough/copy)
-            if (!out.astream) {
+            if (!out.astream)
+            {
                 out.astream = ost;
             }
         }
@@ -522,8 +526,10 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     // Log final stream mapping for debugging
     LOG_DEBUG("Stream mapping summary: %u input streams -> %u output streams",
               in.fmt->nb_streams, out.fmt->nb_streams);
-    for (unsigned int i = 0; i < out.input_to_output_map.size(); ++i) {
-        if (out.input_to_output_map[i] >= 0) {
+    for (unsigned int i = 0; i < out.input_to_output_map.size(); ++i)
+    {
+        if (out.input_to_output_map[i] >= 0)
+        {
             AVStream *ist = in.fmt->streams[i];
             const char *type_name = av_get_media_type_string(ist->codecpar->codec_type);
             LOG_DEBUG("  Input stream %u (%s) -> Output stream %d", i,
@@ -562,7 +568,6 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             av_dict_free(&avioOpts);
         ff_check(openErr, "open output file");
     }
-
 
     return true;
 }
@@ -649,7 +654,8 @@ static AVPixelFormat get_cuda_hw_format(AVCodecContext *, const AVPixelFormat *p
 // Attach HDR mastering metadata to codecpar coded_side_data and content light level.
 void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
 {
-    if (!st || !st->codecpar) return;
+    if (!st || !st->codecpar)
+        return;
 
     constexpr int kMinNit = 1;
     constexpr int kMaxNit = 10000; // HDR10 mastering metadata limit
@@ -673,7 +679,7 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
         mdm->white_point[0] = av_d2q(0.3127, 100000);
         mdm->white_point[1] = av_d2q(0.3290, 100000);
         // Luminance
-        mdm->min_luminance = av_make_q(50, 10000); // 0.005 cd/m²
+        mdm->min_luminance = av_make_q(50, 10000);                            // 0.005 cd/m²
         mdm->max_luminance = av_make_q(max_luminance * max_luminance, 10000); // 1000 cd/m² = 1000 * 1000 = 1000000
         mdm->has_luminance = 1;
         mdm->has_primaries = 1;
@@ -692,8 +698,10 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
 }
 
 // Helper: Check if stream mappings include audio streams
-static bool has_audio_in_mappings(const std::vector<std::string>& mappings) {
-    for (const auto& mapping : mappings) {
+static bool has_audio_in_mappings(const std::vector<std::string> &mappings)
+{
+    for (const auto &mapping : mappings)
+    {
         // Skip empty or exclusion mappings
         if (mapping.empty() || mapping[0] == '-')
             continue;
@@ -709,7 +717,8 @@ static bool has_audio_in_mappings(const std::vector<std::string>& mappings) {
             stream_part.pop_back();
 
         // Check for audio: stream index 1 or type specifier 'a'
-        if (stream_part == "1" || stream_part == "a") {
+        if (stream_part == "1" || stream_part == "a")
+        {
             return true;
         }
     }
@@ -738,39 +747,44 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
 
     out.audioConfig.enabled = hasAudioParams || hasAudioMapping;
 
-    if (out.audioConfig.enabled) {
+    if (out.audioConfig.enabled)
+    {
         LOG_INFO("Audio processing enabled with codec=%s, channels=%d, bitrate=%d, filter=%s",
                  params.codec.c_str(), params.channels, params.bitrate, params.filter.c_str());
     }
 }
 
-
 // Helper structure for parsing -map arguments
-struct StreamMapping {
-    bool exclude;           // true if mapping starts with '-'
-    int stream_index = -1;  // specific stream index (e.g., 0 from "0:0"), or -1 for type-based
+struct StreamMapping
+{
+    bool exclude;                                  // true if mapping starts with '-'
+    int stream_index = -1;                         // specific stream index (e.g., 0 from "0:0"), or -1 for type-based
     AVMediaType media_type = AVMEDIA_TYPE_UNKNOWN; // type specifier (v/a/s/d/t)
 };
 
-static StreamMapping parse_stream_mapping(const std::string& mapping) {
+static StreamMapping parse_stream_mapping(const std::string &mapping)
+{
     StreamMapping result{};
 
     std::string clean = mapping;
 
     // Check for exclusion prefix
     result.exclude = (!clean.empty() && clean[0] == '-');
-    if (result.exclude) {
+    if (result.exclude)
+    {
         clean = clean.substr(1);
     }
 
     // Remove optional suffix '?' if present (not used but needs to be stripped for parsing)
-    if (!clean.empty() && clean.back() == '?') {
+    if (!clean.empty() && clean.back() == '?')
+    {
         clean.pop_back();
     }
 
     // Parse "file:stream" format (we only support file 0)
     size_t colonPos = clean.find(':');
-    if (colonPos == std::string::npos) {
+    if (colonPos == std::string::npos)
+    {
         LOG_WARN("Invalid stream mapping format (missing ':'): %s", mapping.c_str());
         return result;
     }
@@ -778,26 +792,40 @@ static StreamMapping parse_stream_mapping(const std::string& mapping) {
     std::string file_part = clean.substr(0, colonPos);
     std::string stream_part = clean.substr(colonPos + 1);
 
-    if (file_part != "0") {
+    if (file_part != "0")
+    {
         LOG_WARN("Only file index 0 is supported: %s", mapping.c_str());
         return result;
     }
 
     // Parse stream specifier: can be index (0, 1, 2) or type (v, a, s, d, t)
-    if (!stream_part.empty() && std::isdigit(stream_part[0])) {
+    if (!stream_part.empty() && std::isdigit(stream_part[0]))
+    {
         // Numeric stream index
         result.stream_index = std::stoi(stream_part);
-    } else if (stream_part == "v") {
+    }
+    else if (stream_part == "v")
+    {
         result.media_type = AVMEDIA_TYPE_VIDEO;
-    } else if (stream_part == "a") {
+    }
+    else if (stream_part == "a")
+    {
         result.media_type = AVMEDIA_TYPE_AUDIO;
-    } else if (stream_part == "s") {
+    }
+    else if (stream_part == "s")
+    {
         result.media_type = AVMEDIA_TYPE_SUBTITLE;
-    } else if (stream_part == "d") {
+    }
+    else if (stream_part == "d")
+    {
         result.media_type = AVMEDIA_TYPE_DATA;
-    } else if (stream_part == "t") {
+    }
+    else if (stream_part == "t")
+    {
         result.media_type = AVMEDIA_TYPE_ATTACHMENT;
-    } else {
+    }
+    else
+    {
         LOG_WARN("Unknown stream specifier: %s", stream_part.c_str());
     }
 
@@ -807,9 +835,9 @@ static StreamMapping parse_stream_mapping(const std::string& mapping) {
 // Decide which streams should be included in output based on -map arguments
 // This is the SINGLE SOURCE OF TRUTH for all stream mapping decisions
 // Handles: inclusion, exclusion, copy vs process
-static void decide_stream_mappings(const std::vector<std::string>& mappings,
-                                    const InputContext& in,
-                                    OutputContext& out)
+static void decide_stream_mappings(const std::vector<std::string> &mappings,
+                                   const InputContext &in,
+                                   OutputContext &out)
 {
     unsigned int nb_streams = in.fmt->nb_streams;
 
@@ -818,55 +846,73 @@ static void decide_stream_mappings(const std::vector<std::string>& mappings,
 
     // Determine if audio should be re-encoded (not just copied)
     bool audio_needs_processing = out.audioConfig.enabled &&
-                                   !out.audioConfig.codec.empty() &&
-                                   out.audioConfig.codec != "copy";
+                                  !out.audioConfig.codec.empty() &&
+                                  out.audioConfig.codec != "copy";
 
     // Determine if we have explicit inclusions (non-exclusion -map directives)
     bool has_explicit_inclusions = false;
-    for (const auto& mapping : mappings) {
-        if (mapping.empty()) continue;
-        if (mapping[0] != '-') {  // Not an exclusion
+    for (const auto &mapping : mappings)
+    {
+        if (mapping.empty())
+            continue;
+        if (mapping[0] != '-')
+        { // Not an exclusion
             has_explicit_inclusions = true;
             break;
         }
     }
 
     // FFmpeg behavior: if NO explicit inclusions, include all streams by default
-    if (!has_explicit_inclusions) {
-        for (unsigned int i = 0; i < nb_streams; ++i) {
+    if (!has_explicit_inclusions)
+    {
+        for (unsigned int i = 0; i < nb_streams; ++i)
+        {
             out.stream_decisions[i] = StreamMapDecision::COPY;
         }
     }
 
     // Process all -map directives in order
-    for (const auto& mapping : mappings) {
-        if (mapping.empty()) continue;
+    for (const auto &mapping : mappings)
+    {
+        if (mapping.empty())
+            continue;
 
         StreamMapping parsed = parse_stream_mapping(mapping);
 
         // Apply the mapping
-        for (unsigned int i = 0; i < nb_streams; ++i) {
-            AVStream* stream = in.fmt->streams[i];
+        for (unsigned int i = 0; i < nb_streams; ++i)
+        {
+            AVStream *stream = in.fmt->streams[i];
             bool matches = false;
 
             // Check if this stream matches the mapping specifier
-            if (parsed.stream_index >= 0) {
+            if (parsed.stream_index >= 0)
+            {
                 // Index-based mapping
                 matches = (i == (unsigned int)parsed.stream_index);
-            } else if (parsed.media_type != AVMEDIA_TYPE_UNKNOWN) {
+            }
+            else if (parsed.media_type != AVMEDIA_TYPE_UNKNOWN)
+            {
                 // Type-based mapping
                 matches = (stream->codecpar->codec_type == parsed.media_type);
             }
 
-            if (matches) {
-                if (parsed.exclude) {
+            if (matches)
+            {
+                if (parsed.exclude)
+                {
                     out.stream_decisions[i] = StreamMapDecision::EXCLUDE;
-                } else {
+                }
+                else
+                {
                     // Decide between COPY and PROCESS based on stream type and config
                     AVMediaType codec_type = stream->codecpar->codec_type;
-                    if (codec_type == AVMEDIA_TYPE_AUDIO && audio_needs_processing) {
+                    if (codec_type == AVMEDIA_TYPE_AUDIO && audio_needs_processing)
+                    {
                         out.stream_decisions[i] = StreamMapDecision::PROCESS_AUDIO;
-                    } else {
+                    }
+                    else
+                    {
                         out.stream_decisions[i] = StreamMapDecision::COPY;
                     }
                 }
@@ -875,14 +921,24 @@ static void decide_stream_mappings(const std::vector<std::string>& mappings,
     }
 
     LOG_DEBUG("Stream mapping decisions:");
-    for (unsigned int i = 0; i < nb_streams; ++i) {
-        const char* type_name = av_get_media_type_string(in.fmt->streams[i]->codecpar->codec_type);
-        const char* decision_name = "UNKNOWN";
-        switch (out.stream_decisions[i]) {
-            case StreamMapDecision::EXCLUDE: decision_name = "EXCLUDE"; break;
-            case StreamMapDecision::COPY: decision_name = "COPY"; break;
-            case StreamMapDecision::PROCESS_VIDEO: decision_name = "PROCESS_VIDEO"; break;
-            case StreamMapDecision::PROCESS_AUDIO: decision_name = "PROCESS_AUDIO"; break;
+    for (unsigned int i = 0; i < nb_streams; ++i)
+    {
+        const char *type_name = av_get_media_type_string(in.fmt->streams[i]->codecpar->codec_type);
+        const char *decision_name = "UNKNOWN";
+        switch (out.stream_decisions[i])
+        {
+        case StreamMapDecision::EXCLUDE:
+            decision_name = "EXCLUDE";
+            break;
+        case StreamMapDecision::COPY:
+            decision_name = "COPY";
+            break;
+        case StreamMapDecision::PROCESS_VIDEO:
+            decision_name = "PROCESS_VIDEO";
+            break;
+        case StreamMapDecision::PROCESS_AUDIO:
+            decision_name = "PROCESS_AUDIO";
+            break;
         }
         LOG_DEBUG("  Stream %u (%s): %s", i, type_name ? type_name : "unknown", decision_name);
     }
@@ -897,25 +953,29 @@ bool apply_stream_mappings(const std::vector<std::string> &mappings, const Input
 
 bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 {
-    if (!out.audioConfig.enabled) {
+    if (!out.audioConfig.enabled)
+    {
         return true; // No audio processing needed
     }
 
     // Check if we have a valid input context
-    if (!in.fmt) {
+    if (!in.fmt)
+    {
         LOG_WARN("Invalid input format context for audio setup");
         return false;
     }
 
     // Find audio stream in input
     int audio_stream_idx = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (audio_stream_idx < 0) {
+    if (audio_stream_idx < 0)
+    {
         LOG_WARN("No audio stream found in input for audio encoding");
         return false;
     }
 
     // Validate that we have a valid audio stream
-    if (audio_stream_idx >= (int)in.fmt->nb_streams || !in.fmt->streams[audio_stream_idx]) {
+    if (audio_stream_idx >= (int)in.fmt->nb_streams || !in.fmt->streams[audio_stream_idx])
+    {
         LOG_WARN("Invalid audio stream index: %d", audio_stream_idx);
         return false;
     }
@@ -923,20 +983,24 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
     // Set up audio codec
     std::string codec = out.audioConfig.codec.empty() ? "aac" : out.audioConfig.codec;
     const AVCodec *audio_encoder = avcodec_find_encoder_by_name(codec.c_str());
-    if (!audio_encoder) {
-        if (!out.audioConfig.codec.empty()) {
+    if (!audio_encoder)
+    {
+        if (!out.audioConfig.codec.empty())
+        {
             LOG_WARN("Requested audio codec '%s' not found, falling back to AAC", codec.c_str());
         }
         audio_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
-        codec = "aac";  // Update for logging
+        codec = "aac"; // Update for logging
     }
-    if (!audio_encoder) {
+    if (!audio_encoder)
+    {
         LOG_WARN("Failed to find any audio encoder (tried: %s, aac)", out.audioConfig.codec.c_str());
         return false;
     }
 
     out.aenc = avcodec_alloc_context3(audio_encoder);
-    if (!out.aenc) {
+    if (!out.aenc)
+    {
         LOG_WARN("Failed to allocate audio encoder context");
         return false;
     }
@@ -947,46 +1011,61 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
     out.aenc->codec_type = AVMEDIA_TYPE_AUDIO;
 
     // Use configured sample rate if specified, otherwise use input sample rate
-    if (out.audioConfig.sampleRate > 0) {
+    if (out.audioConfig.sampleRate > 0)
+    {
         out.aenc->sample_rate = out.audioConfig.sampleRate;
-    } else {
+    }
+    else
+    {
         out.aenc->sample_rate = input_audio->codecpar->sample_rate;
     }
-    
+
     // Use new AVChannelLayout API instead of deprecated channels/channel_layout
-    if (out.audioConfig.channels > 0) {
+    if (out.audioConfig.channels > 0)
+    {
         av_channel_layout_default(&out.aenc->ch_layout, out.audioConfig.channels);
-    } else {
+    }
+    else
+    {
         // Copy the channel layout from input
         int ret = av_channel_layout_copy(&out.aenc->ch_layout, &input_audio->codecpar->ch_layout);
-        if (ret < 0) {
+        if (ret < 0)
+        {
             LOG_WARN("Failed to copy channel layout from input");
             return false;
         }
     }
-    
+
     out.aenc->bit_rate = (out.audioConfig.bitrate > 0) ? out.audioConfig.bitrate : 128000;
     out.aenc->time_base = {1, out.aenc->sample_rate};
 
     // Set sample format
-    if (audio_encoder->sample_fmts) {
+    if (audio_encoder->sample_fmts)
+    {
         out.aenc->sample_fmt = audio_encoder->sample_fmts[0];
-    } else {
+    }
+    else
+    {
         out.aenc->sample_fmt = AV_SAMPLE_FMT_FLTP;
     }
 
     // Set frame size if encoder requires it
-    if (audio_encoder->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) {
+    if (audio_encoder->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE)
+    {
         out.aenc->frame_size = 0; // Variable frame size
-    } else {
+    }
+    else
+    {
         // For AAC, frame size is typically 1024 samples
         out.aenc->frame_size = 1024;
     }
 
     // Create output audio stream (only if not already created during stream mapping)
-    if (!out.astream) {
+    if (!out.astream)
+    {
         out.astream = avformat_new_stream(out.fmt, nullptr);
-        if (!out.astream) {
+        if (!out.astream)
+        {
             LOG_WARN("Failed to create output audio stream");
             return false;
         }
@@ -994,7 +1073,8 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 
     // Open encoder
     int ret = avcodec_open2(out.aenc, audio_encoder, nullptr);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_make_error_string(errbuf, sizeof(errbuf), ret);
         LOG_WARN("Failed to open audio encoder: %s", errbuf);
@@ -1003,7 +1083,8 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 
     // Copy encoder parameters to stream
     ret = avcodec_parameters_from_context(out.astream->codecpar, out.aenc);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to copy audio encoder parameters to stream");
         return false;
     }
@@ -1017,7 +1098,8 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 
     // Set up audio resampler for format conversion
     out.swr_ctx = swr_alloc();
-    if (!out.swr_ctx) {
+    if (!out.swr_ctx)
+    {
         LOG_WARN("Failed to allocate resampler context");
         return false;
     }
@@ -1032,7 +1114,8 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
     av_opt_set_sample_fmt(out.swr_ctx, "out_sample_fmt", out.aenc->sample_fmt, 0);
 
     ret = swr_init(out.swr_ctx);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to initialize resampler");
         swr_free(&out.swr_ctx);
         return false;
@@ -1040,7 +1123,8 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 
     // Create audio FIFO for buffering samples to create fixed-size frames
     out.audio_fifo = av_audio_fifo_alloc(out.aenc->sample_fmt, out.aenc->ch_layout.nb_channels, out.aenc->frame_size * 2);
-    if (!out.audio_fifo) {
+    if (!out.audio_fifo)
+    {
         LOG_WARN("Failed to allocate audio FIFO");
         swr_free(&out.swr_ctx);
         return false;
@@ -1051,12 +1135,14 @@ bool setup_audio_encoder(const InputContext &in, OutputContext &out)
 
 bool setup_audio_filter(const InputContext &in, OutputContext &out)
 {
-    if (!out.audioConfig.enabled || out.audioConfig.filter.empty() || !out.aenc || in.astream < 0) {
+    if (!out.audioConfig.enabled || out.audioConfig.filter.empty() || !out.aenc || in.astream < 0)
+    {
         return true; // No filtering needed
     }
 
     // Additional validation
-    if (!in.fmt || in.astream >= (int)in.fmt->nb_streams || !in.fmt->streams[in.astream]) {
+    if (!in.fmt || in.astream >= (int)in.fmt->nb_streams || !in.fmt->streams[in.astream])
+    {
         LOG_WARN("Invalid audio stream for filter setup");
         return false;
     }
@@ -1069,13 +1155,15 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
     AVFilterInOut *outputs = avfilter_inout_alloc();
     AVFilterInOut *inputs = avfilter_inout_alloc();
 
-    if (!outputs || !inputs || !abuffersrc || !abuffersink) {
+    if (!outputs || !inputs || !abuffersrc || !abuffersink)
+    {
         LOG_WARN("Failed to allocate audio filter components");
         return false;
     }
 
     out.filter_graph = avfilter_graph_alloc();
-    if (!out.filter_graph) {
+    if (!out.filter_graph)
+    {
         LOG_WARN("Failed to allocate audio filter graph");
         avfilter_inout_free(&inputs);
         avfilter_inout_free(&outputs);
@@ -1084,10 +1172,10 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
 
     // Create buffer source with new channel layout API
     AVStream *input_audio = in.fmt->streams[in.astream];
-    
+
     // Get channel layout description for the input
     av_channel_layout_describe(&input_audio->codecpar->ch_layout, ch_layout_str, sizeof(ch_layout_str));
-    
+
     snprintf(args, sizeof(args),
              "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
              input_audio->time_base.num, input_audio->time_base.den,
@@ -1097,7 +1185,8 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
 
     ret = avfilter_graph_create_filter(&out.buffersrc_ctx, abuffersrc, "in",
                                        args, nullptr, out.filter_graph);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to create audio buffer source");
         goto cleanup;
     }
@@ -1105,7 +1194,8 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
     // Create buffer sink
     ret = avfilter_graph_create_filter(&out.buffersink_ctx, abuffersink, "out",
                                        nullptr, nullptr, out.filter_graph);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to create audio buffer sink");
         goto cleanup;
     }
@@ -1127,13 +1217,15 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
     // Parse and configure the filter graph
     ret = avfilter_graph_parse_ptr(out.filter_graph, out.audioConfig.filter.c_str(),
                                    &inputs, &outputs, nullptr);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to parse audio filter graph: %s", out.audioConfig.filter.c_str());
         goto cleanup;
     }
 
     ret = avfilter_graph_config(out.filter_graph, nullptr);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         LOG_WARN("Failed to configure audio filter graph");
         goto cleanup;
     }
@@ -1143,7 +1235,8 @@ bool setup_audio_filter(const InputContext &in, OutputContext &out)
     return true;
 
 cleanup:
-    if (out.filter_graph) {
+    if (out.filter_graph)
+    {
         avfilter_graph_free(&out.filter_graph);
         out.filter_graph = nullptr;
     }
@@ -1154,7 +1247,8 @@ cleanup:
 
 bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet)
 {
-    if (!input_frame || !out.aenc || !output_packet) {
+    if (!input_frame || !out.aenc || !output_packet)
+    {
         return false;
     }
 
@@ -1162,7 +1256,8 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
     AVFrame *processed_frame = input_frame;
 
     // Handle first audio frame after seeking to establish baseline
-    if (out.a_start_pts == AV_NOPTS_VALUE && input_frame->pts != AV_NOPTS_VALUE) {
+    if (out.a_start_pts == AV_NOPTS_VALUE && input_frame->pts != AV_NOPTS_VALUE)
+    {
         out.a_start_pts = input_frame->pts;
         // If we have a seek offset, we need to account for it
         // The next_audio_pts should represent the output time from seek point
@@ -1174,7 +1269,8 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
     {
         // Send frame to filter
         ret = av_buffersrc_add_frame_flags(out.buffersrc_ctx, input_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
-        if (ret < 0) {
+        if (ret < 0)
+        {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, sizeof(errbuf), ret);
             LOG_WARN("Failed to send frame to audio filter: %s", errbuf);
@@ -1183,23 +1279,31 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
 
         // Get filtered frame
         AVFrame *filtered_frame = av_frame_alloc();
-        if (!filtered_frame) {
+        if (!filtered_frame)
+        {
             LOG_WARN("Failed to allocate filtered frame");
             return false;
         }
 
         ret = av_buffersink_get_frame_flags(out.buffersink_ctx, filtered_frame, 0);
-        if (ret >= 0) {
+        if (ret >= 0)
+        {
             processed_frame = filtered_frame;
-        } else if (ret == AVERROR(EAGAIN)) {
+        }
+        else if (ret == AVERROR(EAGAIN))
+        {
             // No frame available yet, this is normal for filters that buffer frames
             av_frame_free(&filtered_frame);
             return true;
-        } else if (ret == AVERROR_EOF) {
+        }
+        else if (ret == AVERROR_EOF)
+        {
             // End of stream reached
             av_frame_free(&filtered_frame);
             return false;
-        } else {
+        }
+        else
+        {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, sizeof(errbuf), ret);
             LOG_WARN("Failed to get frame from audio filter: %s", errbuf);
@@ -1213,11 +1317,12 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
     if (out.swr_ctx)
     {
         resampled_frame = av_frame_alloc();
-        if (!resampled_frame) {
-            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+        if (!resampled_frame)
+        {
+            if (processed_frame != input_frame)
+                av_frame_free(&processed_frame);
             return false;
         }
-    
 
         // Set up output frame properties
         resampled_frame->format = out.aenc->sample_fmt;
@@ -1229,21 +1334,25 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         resampled_frame->nb_samples = max_out_samples;
 
         ret = av_frame_get_buffer(resampled_frame, 0);
-        if (ret < 0) {
+        if (ret < 0)
+        {
             LOG_WARN("Failed to allocate resampled frame buffer");
             av_frame_free(&resampled_frame);
-            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            if (processed_frame != input_frame)
+                av_frame_free(&processed_frame);
             return false;
         }
 
         // Resample
         int samples_out = swr_convert(out.swr_ctx,
-                                    resampled_frame->data, resampled_frame->nb_samples,
-                                    (const uint8_t**)processed_frame->data, processed_frame->nb_samples);
-        if (samples_out < 0) {
+                                      resampled_frame->data, resampled_frame->nb_samples,
+                                      (const uint8_t **)processed_frame->data, processed_frame->nb_samples);
+        if (samples_out < 0)
+        {
             LOG_WARN("Failed to resample audio frame");
             av_frame_free(&resampled_frame);
-            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            if (processed_frame != input_frame)
+                av_frame_free(&processed_frame);
             return false;
         }
 
@@ -1251,27 +1360,34 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         resampled_frame->pts = processed_frame->pts;
 
         // Clean up intermediate frame
-        if (processed_frame != input_frame) av_frame_free(&processed_frame);
+        if (processed_frame != input_frame)
+            av_frame_free(&processed_frame);
         processed_frame = resampled_frame;
     }
 
     // Add samples to FIFO
-    if (out.audio_fifo) {
-        ret = av_audio_fifo_write(out.audio_fifo, (void**)processed_frame->data, processed_frame->nb_samples);
-        if (ret < 0) {
+    if (out.audio_fifo)
+    {
+        ret = av_audio_fifo_write(out.audio_fifo, (void **)processed_frame->data, processed_frame->nb_samples);
+        if (ret < 0)
+        {
             LOG_WARN("Failed to write samples to audio FIFO");
-            if (processed_frame != input_frame) av_frame_free(&processed_frame);
+            if (processed_frame != input_frame)
+                av_frame_free(&processed_frame);
             return false;
         }
     }
 
     // Clean up processed frame
-    if (processed_frame != input_frame) av_frame_free(&processed_frame);
+    if (processed_frame != input_frame)
+        av_frame_free(&processed_frame);
 
     // Try to encode frames while we have enough samples
-    while (out.audio_fifo && av_audio_fifo_size(out.audio_fifo) >= out.aenc->frame_size) {
+    while (out.audio_fifo && av_audio_fifo_size(out.audio_fifo) >= out.aenc->frame_size)
+    {
         AVFrame *encoder_frame = av_frame_alloc();
-        if (!encoder_frame) {
+        if (!encoder_frame)
+        {
             return false;
         }
 
@@ -1281,14 +1397,16 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         encoder_frame->nb_samples = out.aenc->frame_size;
 
         ret = av_frame_get_buffer(encoder_frame, 0);
-        if (ret < 0) {
+        if (ret < 0)
+        {
             av_frame_free(&encoder_frame);
             return false;
         }
 
         // Read samples from FIFO
-        ret = av_audio_fifo_read(out.audio_fifo, (void**)encoder_frame->data, out.aenc->frame_size);
-        if (ret < out.aenc->frame_size) {
+        ret = av_audio_fifo_read(out.audio_fifo, (void **)encoder_frame->data, out.aenc->frame_size);
+        if (ret < out.aenc->frame_size)
+        {
             av_frame_free(&encoder_frame);
             break;
         }
@@ -1300,7 +1418,8 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         ret = avcodec_send_frame(out.aenc, encoder_frame);
         av_frame_free(&encoder_frame);
 
-        if (ret < 0) {
+        if (ret < 0)
+        {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, sizeof(errbuf), ret);
             LOG_WARN("Failed to send frame to audio encoder: %s", errbuf);
@@ -1308,12 +1427,15 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         }
 
         // Get encoded packets
-        while (true) {
+        while (true)
+        {
             ret = avcodec_receive_packet(out.aenc, output_packet);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            {
                 break;
             }
-            if (ret < 0) {
+            if (ret < 0)
+            {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE];
                 av_make_error_string(errbuf, sizeof(errbuf), ret);
                 LOG_WARN("Failed to receive encoded audio packet: %s", errbuf);
@@ -1324,7 +1446,8 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
             output_packet->stream_index = out.astream->index;
 
             // Ensure timestamps are set properly
-            if (output_packet->pts == AV_NOPTS_VALUE) {
+            if (output_packet->pts == AV_NOPTS_VALUE)
+            {
                 // Generate timestamps if encoder didn't set them
                 output_packet->pts = out.next_audio_pts;
                 output_packet->dts = out.next_audio_pts;
@@ -1337,13 +1460,15 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
 
             // Ensure DTS monotonicity for muxer compliance
             if (out.last_audio_dts != AV_NOPTS_VALUE && output_packet->dts != AV_NOPTS_VALUE &&
-                output_packet->dts <= out.last_audio_dts) {
+                output_packet->dts <= out.last_audio_dts)
+            {
                 output_packet->dts = out.last_audio_dts + 1;
             }
 
             // Basic validation: ensure PTS >= DTS (required by muxers)
             if (output_packet->dts != AV_NOPTS_VALUE && output_packet->pts != AV_NOPTS_VALUE &&
-                output_packet->pts < output_packet->dts) {
+                output_packet->pts < output_packet->dts)
+            {
                 LOG_WARN("Audio packet PTS < DTS, adjusting PTS to match DTS");
                 output_packet->pts = output_packet->dts;
             }
@@ -1359,18 +1484,22 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
 
 void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us)
 {
-    if (!out.audioConfig.enabled || !out.aenc) {
+    if (!out.audioConfig.enabled || !out.aenc)
+    {
         return;
     }
 
     // Initialize audio PTS tracking to align with video timeline
     // Both video and audio use the same baseline (global_baseline_us)
     // Audio should start from 0 (relative to baseline), just like video
-    if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE) {
+    if (in.seek_offset_us > 0 && global_baseline_pts_us != AV_NOPTS_VALUE)
+    {
         // Start from 0 to match video (video: first_frame - baseline, audio: start at 0)
         out.next_audio_pts = 0;
         LOG_DEBUG("Audio PTS initialized to 0 (baseline at %.3fs)", global_baseline_pts_us / 1000000.0);
-    } else {
+    }
+    else
+    {
         out.next_audio_pts = 0;
     }
 

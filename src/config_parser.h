@@ -56,24 +56,24 @@ struct PipelineConfig
     std::string audioFilter;
 
     // Seek options
-    std::string seekTime;          // Input seeking (-ss before -i)
-    std::string outputSeekTime;    // Output seeking (-ss after -i)
-    std::string outputTsOffset;    // Output timestamp offset (-output_ts_offset)
-    bool copyts = false;           // Preserve original timestamps (-copyts)
-    bool noAccurateSeek = false;   // Fast seek to nearest keyframe (-noaccurate_seek)
-    bool seek2any = false;         // Allow seeking to non-keyframes (-seek2any)
-    bool seekTimestamp = false;    // Use timestamp-based seeking (-seek_timestamp)
+    std::string seekTime;        // Input seeking (-ss before -i)
+    std::string outputSeekTime;  // Output seeking (-ss after -i)
+    std::string outputTsOffset;  // Output timestamp offset (-output_ts_offset)
+    bool copyts = false;         // Preserve original timestamps (-copyts)
+    bool noAccurateSeek = false; // Fast seek to nearest keyframe (-noaccurate_seek)
+    bool seek2any = false;       // Allow seeking to non-keyframes (-seek2any)
+    bool seekTimestamp = false;  // Use timestamp-based seeking (-seek_timestamp)
 
     // Timestamp handling options (FFmpeg compatibility)
-    std::string avoidNegativeTs = "auto";  // FFmpeg -avoid_negative_ts (auto/make_zero/make_non_negative/disabled)
-    bool startAtZero = false;              // FFmpeg -start_at_zero
+    std::string avoidNegativeTs = "auto"; // FFmpeg -avoid_negative_ts (auto/make_zero/make_non_negative/disabled)
+    bool startAtZero = false;             // FFmpeg -start_at_zero
 
     // Muxer options (essential - affect output structure/playback)
-    std::string movflags;          // User-specified movflags (-movflags)
-    int64_t fragDuration = 0;      // Fragment duration in microseconds (-frag_duration)
-    int fragmentIndex = -1;        // Fragment index number (-fragment_index)
-    int useEditlist = -1;          // Use edit list in MP4 (-use_editlist)
-    int maxMuxingQueueSize = -1;   // Max muxing queue size (-max_muxing_queue_size)
+    std::string movflags;        // User-specified movflags (-movflags)
+    int64_t fragDuration = 0;    // Fragment duration in microseconds (-frag_duration)
+    int fragmentIndex = -1;      // Fragment index number (-fragment_index)
+    int useEditlist = -1;        // Use edit list in MP4 (-use_editlist)
+    int maxMuxingQueueSize = -1; // Max muxing queue size (-max_muxing_queue_size)
 };
 
 // Print usage/help information
