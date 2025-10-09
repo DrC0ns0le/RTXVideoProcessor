@@ -180,15 +180,23 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
     out.venc->width = dstW;
     out.venc->height = dstH;
 
-    // Vanilla FFmpeg behavior: Use input stream timebase for encoder
-    // This matches -enc_time_base -1 (use decoder timebase)
-    out.venc->time_base = in.vst->time_base;
+    // Encoder timebase configuration:
+    // - HLS: Use framerate-based timebase (already set in ffmpeg_utils.cpp as 1/fps)
+    //        This matches vanilla FFmpeg behavior and ensures HLS muxer uses 1/24000
+    // - Non-HLS: Use input stream timebase for -copyts compatibility (-enc_time_base -1)
+    if (!hls_enabled) {
+        // Non-HLS: Override to use input stream timebase
+        out.venc->time_base = in.vst->time_base;
+        out.vstream->time_base = out.venc->time_base;
+        LOG_DEBUG("Non-HLS: Using input stream timebase %d/%d for encoder",
+                 out.venc->time_base.num, out.venc->time_base.den);
+    } else {
+        // HLS: Keep the framerate-based timebase that was set in ffmpeg_utils.cpp
+        // This ensures muxer will use 1/24000 (or similar) instead of 1/16000
+        LOG_INFO("HLS: Using framerate-based encoder timebase %d/%d",
+                 out.venc->time_base.num, out.venc->time_base.den);
+    }
     out.venc->framerate = fr;
-
-    // CRITICAL: Update stream timebase to match encoder timebase
-    // This prevents av_packet_rescale_ts() from doing unnecessary conversions
-    // that introduce rounding errors over time (causing video freezes in Chrome)
-    out.vstream->time_base = out.venc->time_base;
 
     bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
     if (use_cuda_path) {
@@ -199,8 +207,14 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
 
     // For HLS, align GOP with segment duration
     int gop_duration_sec = cfg.gop;
+    int gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
+
     if (hls_enabled && out.hlsOptions.hlsTime > 0) {
         gop_duration_sec = out.hlsOptions.hlsTime;
+
+        // Calculate GOP size with proper rounding for fractional framerates
+        // For 23.976fps (24000/1001): 3 * 24000 / 1001 = 71.928 → round to 72
+        gop_size_frames = (int)round((double)gop_duration_sec * fr.num / fr.den);
 
         double fps = (double)fr.num / fr.den;
         if (fps > 50 && gop_duration_sec > 2) {
@@ -210,11 +224,19 @@ AVBufferRef* configure_video_encoder(PipelineConfig& cfg, InputContext& in, Outp
         }
 
         LOG_INFO("Aligning GOP size (%d sec = %d frames) with HLS segment duration",
-                 gop_duration_sec, gop_duration_sec * fr.num / std::max(1, fr.den));
+                 gop_duration_sec, gop_size_frames);
     }
-    out.venc->gop_size = gop_duration_sec * fr.num / std::max(1, fr.den);
+
+    out.venc->gop_size = gop_size_frames;
     out.venc->max_b_frames = cfg.bframes;
     out.venc->color_range = AVCOL_RANGE_MPEG;
+
+    // For HLS: Set minimum keyframe interval equal to GOP size
+    // This matches FFmpeg's -keyint_min behavior and ensures strict GOP alignment
+    if (hls_enabled) {
+        av_opt_set_int(out.venc->priv_data, "g", gop_size_frames, 0);
+        // Note: NVENC doesn't have keyint_min, but strict_gop below achieves the same
+    }
 
     // HDR color settings
     if (outputHDR) {

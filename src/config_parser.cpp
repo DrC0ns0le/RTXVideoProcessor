@@ -94,7 +94,7 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 0\n");
-    fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21\n");
+    fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 22\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
     fprintf(stderr, "  -hls_time <seconds>            Set target segment duration (default 4)\n");
@@ -455,6 +455,63 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->maxMuxingQueueSize = std::stoi(argv[++i]);
         }
+        // RTX VSR flags
+        else if (arg == "--no-vsr")
+        {
+            cfg->rtxCfg.enableVSR = false;
+        }
+        else if (arg == "--vsr-quality")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--vsr-quality requires an argument\n");
+                exit(1);
+            }
+            cfg->rtxCfg.vsrQuality = std::stoi(argv[++i]);
+        }
+        // RTX THDR flags
+        else if (arg == "--no-thdr")
+        {
+            if (!cfg->rtxCfg.enableVSR)
+                LOG_WARN("Both VSR & THDR are disabled, bypassing RTX evaluate");
+            cfg->rtxCfg.enableTHDR = false;
+        }
+        else if (arg == "--thdr-contrast")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--thdr-contrast requires an argument\n");
+                exit(1);
+            }
+            cfg->rtxCfg.thdrContrast = std::stoi(argv[++i]);
+        }
+        else if (arg == "--thdr-saturation")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--thdr-saturation requires an argument\n");
+                exit(1);
+            }
+            cfg->rtxCfg.thdrSaturation = std::stoi(argv[++i]);
+        }
+        else if (arg == "--thdr-middle-gray")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--thdr-middle-gray requires an argument\n");
+                exit(1);
+            }
+            cfg->rtxCfg.thdrMiddleGray = std::stoi(argv[++i]);
+        }
+        else if (arg == "--thdr-max-luminance")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--thdr-max-luminance requires an argument\n");
+                exit(1);
+            }
+            cfg->rtxCfg.thdrMaxLuminance = std::stoi(argv[++i]);
+        }
         // Detect output path: file extensions or pipe/stdout
         if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv") ||
             arg == "-" || arg == "pipe:" || arg == "pipe:1")
@@ -806,22 +863,29 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->rc = "constqp";
     cfg->gop = 3;  // 3 seconds GOP for HLS compatibility
     cfg->bframes = 0;
-    cfg->qp = 21;
+    cfg->qp = 22;
     cfg->targetBitrateMultiplier = 2;
 
     // Determine parsing mode: simple (input output [opts]) vs FFmpeg-compatible (-i input -f format output)
-    int i = 1;
-    if (std::string(argv[i]).find(".mp4") == std::string::npos &&
-        std::string(argv[i]).find(".mkv") == std::string::npos &&
-        argc > 5)
+    // Simple mode: first arg is input file (positional)
+    // FFmpeg mode: uses -i flag for input
+    bool uses_input_flag = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-i") == 0) {
+            uses_input_flag = true;
+            break;
+        }
+    }
+
+    if (uses_input_flag)
     {
-        // FFmpeg-compatible mode
+        // FFmpeg-compatible mode (uses -i flag)
         cfg->ffCompatible = true;
         parse_compatibility_mode(argc, argv, cfg);
     }
     else
     {
-        // Simple mode
+        // Simple mode (positional input/output)
         parse_simple_mode(argc, argv, cfg);
     }
 }

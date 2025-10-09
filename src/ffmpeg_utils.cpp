@@ -332,19 +332,29 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         }
 
 
+        // Only set custom hls_flags in non-FFmpeg-compatible mode
+        // Vanilla FFmpeg uses default flags (0) unless explicitly specified
         std::string hlsFlags;
-        if (out.hlsOptions.segmentType == "fmp4")
+        if (!out.hlsOptions.autoDiscontinuity)  // autoDiscontinuity = !ffCompatible
         {
-            // Enhanced flags for better browser compatibility with fMP4 segments
-            // append_list: Create playlist immediately after header
-            hlsFlags = "+append_list";
+            // FFmpeg-compatible mode: Use minimal flags, let FFmpeg handle defaults
+            if (out.hlsOptions.listSize > 0)
+                hlsFlags = "+delete_segments";
         }
         else
         {
-            hlsFlags = "split_by_time+append_list";
+            // Legacy mode: Use custom flags for enhanced compatibility
+            if (out.hlsOptions.segmentType == "fmp4")
+            {
+                hlsFlags = "+append_list";
+            }
+            else
+            {
+                hlsFlags = "split_by_time+append_list";
+            }
+            if (out.hlsOptions.listSize > 0)
+                hlsFlags += "+delete_segments";
         }
-        if (out.hlsOptions.listSize > 0)
-            hlsFlags += "+delete_segments";
         if (!hlsFlags.empty())
         {
             av_dict_set(&muxOpts, "hls_flags", hlsFlags.c_str(), 0);
