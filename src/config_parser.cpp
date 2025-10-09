@@ -68,6 +68,7 @@ static bool is_pipe_output(const char *path)
 
 void print_help(const char *argv0)
 {
+    fprintf(stderr, "RTXVideoProcessor build %s\n", BUILD_VERSION);
     fprintf(stderr, "Usage: %s input output.{mp4|mkv|m3u8|-} [options]\n", argv0);
     fprintf(stderr, "\nInput can be:\n");
     fprintf(stderr, "  - Local file: input.mp4, input.mkv\n");

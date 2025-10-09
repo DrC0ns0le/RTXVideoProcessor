@@ -24,6 +24,11 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Version from build timestamp
+string(TIMESTAMP BUILD_VERSION "%Y.%m.%d.%H%M" UTC)
+add_compile_definitions(BUILD_VERSION="${BUILD_VERSION}")
+message(STATUS "Build version: ${BUILD_VERSION}")
+
 # Build configuration options
 option(USE_STATIC_FFMPEG "Link FFmpeg statically (requires vcpkg or static FFmpeg build)" OFF)
 
