@@ -56,9 +56,10 @@ static std::string lowercase_copy(std::string s)
 }
 
 // Helper function: check if output is a pipe/stdout
-static bool is_pipe_output(const char* path)
+static bool is_pipe_output(const char *path)
 {
-    if (!path) return false;
+    if (!path)
+        return false;
     return (std::strcmp(path, "-") == 0) ||
            (std::strcmp(path, "pipe:") == 0) ||
            (std::strcmp(path, "pipe:1") == 0) ||
@@ -93,7 +94,7 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p4\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3\n");
-    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 0\n");
+    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 22\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
@@ -356,9 +357,12 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             // Determine if this is input seeking or output seeking based on context
             // If we haven't seen -i yet, it's input seeking
             // If we have seen -i, it's output seeking
-            if (cfg->inputPath == nullptr) {
+            if (cfg->inputPath == nullptr)
+            {
                 cfg->seekTime = argv[++i];
-            } else {
+            }
+            else
+            {
                 cfg->outputSeekTime = argv[++i];
             }
         }
@@ -861,8 +865,8 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->tune = "hq";
     cfg->preset = "p4";
     cfg->rc = "constqp";
-    cfg->gop = 3;  // 3 seconds GOP for HLS compatibility
-    cfg->bframes = 0;
+    cfg->gop = 3; // 3 seconds GOP for HLS compatibility
+    cfg->bframes = 2;
     cfg->qp = 22;
     cfg->targetBitrateMultiplier = 2;
 
@@ -870,8 +874,10 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     // Simple mode: first arg is input file (positional)
     // FFmpeg mode: uses -i flag for input
     bool uses_input_flag = false;
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-i") == 0) {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-i") == 0)
+        {
             uses_input_flag = true;
             break;
         }

@@ -1,7 +1,19 @@
 build
+build-static
 SDKs
 *.mp4
 *.mkv
 sdk.md
 .vscode/*
 .claude/*
+*.log
+
+# NVIDIA proprietary DLLs (cannot be redistributed)
+nvngx_vsr.dll
+nvngx_truehdr.dll
+nvngx_*.dll
+
+# FFmpeg DLLs (for dynamic builds)
+av*.dll
+sw*.dll
+postproc*.dll

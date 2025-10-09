@@ -24,6 +24,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Build configuration options
+option(USE_STATIC_FFMPEG "Link FFmpeg statically (requires vcpkg or static FFmpeg build)" OFF)
+
 # CUDA (Toolkit 12.x)
 find_package(CUDAToolkit REQUIRED)
 
@@ -33,12 +36,26 @@ set(FFMPEG_FOUND FALSE)
 
 # Try vcpkg/CMake package first
 find_package(FFMPEG QUIET COMPONENTS avformat avcodec avfilter avutil swscale swresample)
+if(FFMPEG_FOUND)
+  message(STATUS "Found FFmpeg via FFMPEG package (INCLUDE_DIRS: ${FFMPEG_INCLUDE_DIRS})")
+endif()
+
 if(NOT FFMPEG_FOUND)
   # Try individual find_package for vcpkg FFmpeg
   find_package(ffmpeg QUIET CONFIG)
   if(ffmpeg_FOUND)
     set(FFMPEG_FOUND TRUE)
-    message(STATUS "Found FFmpeg via vcpkg")
+    message(STATUS "Found FFmpeg via vcpkg CONFIG")
+    # Get include directories from vcpkg
+    if(DEFINED VCPKG_INSTALLED_DIR)
+      set(FFMPEG_INCLUDE_DIRS "${VCPKG_INSTALLED_DIR}/include")
+    elseif(CMAKE_TOOLCHAIN_FILE)
+      get_filename_component(_vcpkg_root "${CMAKE_TOOLCHAIN_FILE}" DIRECTORY)
+      get_filename_component(_vcpkg_root "${_vcpkg_root}" DIRECTORY)
+      get_filename_component(_vcpkg_root "${_vcpkg_root}" DIRECTORY)
+      set(FFMPEG_INCLUDE_DIRS "${_vcpkg_root}/installed/${VCPKG_TARGET_TRIPLET}/include")
+    endif()
+    message(STATUS "FFmpeg include dirs: ${FFMPEG_INCLUDE_DIRS}")
   endif()
 endif()
 
@@ -156,15 +173,27 @@ target_include_directories(RTXVideoProcessor PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# FFmpeg includes (vcpkg handles automatically, manual needs explicit path)
-if(NOT ffmpeg_FOUND AND FFMPEG_INCLUDE_DIR)
+# FFmpeg includes
+if(FFMPEG_INCLUDE_DIRS)
+  target_include_directories(RTXVideoProcessor PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  message(STATUS "Added FFmpeg includes: ${FFMPEG_INCLUDE_DIRS}")
+elseif(FFMPEG_INCLUDE_DIR)
   target_include_directories(RTXVideoProcessor PRIVATE ${FFMPEG_INCLUDE_DIR})
+  message(STATUS "Added FFmpeg includes: ${FFMPEG_INCLUDE_DIR}")
 endif()
 
 
 # Link libraries
-# FFmpeg (vcpkg provides targets, manual uses absolute paths)
-if(ffmpeg_FOUND)
+# FFmpeg - use FFMPEG_LIBRARIES if available (from FFMPEG package), ffmpeg:: targets (from ffmpeg CONFIG), or manual libs
+if(FFMPEG_LIBRARIES)
+  # FFMPEG package found (provides FFMPEG_LIBRARIES variable)
+  target_link_libraries(RTXVideoProcessor PRIVATE ${FFMPEG_LIBRARIES})
+  if(FFMPEG_LIBRARY_DIRS)
+    target_link_directories(RTXVideoProcessor PRIVATE ${FFMPEG_LIBRARY_DIRS})
+  endif()
+  message(STATUS "Linking FFmpeg libraries: ${FFMPEG_LIBRARIES}")
+elseif(ffmpeg_FOUND)
+  # ffmpeg CONFIG package found (provides ffmpeg:: targets)
   target_link_libraries(RTXVideoProcessor PRIVATE
     ffmpeg::avformat
     ffmpeg::avcodec
@@ -173,7 +202,9 @@ if(ffmpeg_FOUND)
     ffmpeg::swscale
     ffmpeg::swresample
   )
+  message(STATUS "Linking FFmpeg via ffmpeg:: targets")
 else()
+  # Manual FFmpeg installation
   target_link_libraries(RTXVideoProcessor PRIVATE
     ${FFMPEG_AVFORMAT_LIB}
     ${FFMPEG_AVCODEC_LIB}
@@ -181,6 +212,21 @@ else()
     ${FFMPEG_AVUTIL_LIB}
     ${FFMPEG_SWSCALE_LIB}
     ${FFMPEG_SWRESAMPLE_LIB}
+  )
+  message(STATUS "Linking FFmpeg via manual libraries")
+endif()
+
+# When linking FFmpeg statically, we need additional system libraries
+# These are required by FFmpeg's internal codecs and protocols
+if(WIN32)
+  target_link_libraries(RTXVideoProcessor PRIVATE
+    # Media Foundation (for hardware acceleration and codecs)
+    mfplat mfuuid strmiids
+    # Windows multimedia
+    winmm
+    # OpenSSL/crypto dependencies (if FFmpeg built with SSL support)
+    # Uncomment if your FFmpeg build includes SSL/TLS support:
+    # crypt32
   )
 endif()
 
@@ -210,23 +256,41 @@ if(MSVC)
   set_target_properties(RTXVideoProcessor PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 endif()
 
-# Post-build: Copy RTX Video SDK DLLs
+# Post-build: Copy RTX Video SDK DLLs (these must remain as DLLs)
 foreach(dll_name nvngx_truehdr.dll nvngx_vsr.dll)
   set(dll_path "${RTX_VIDEO_SDK_BIN}/${dll_name}")
   if(EXISTS ${dll_path})
     add_custom_command(TARGET RTXVideoProcessor POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll_path}" "$<TARGET_FILE_DIR:RTXVideoProcessor>/"
-      COMMENT "Copying ${dll_name}"
+      COMMENT "Copying ${dll_name} (required RTX SDK runtime)"
     )
   else()
     message(WARNING "RTX DLL not found: ${dll_path}")
   endif()
 endforeach()
 
-# Post-build: Reminder for FFmpeg DLLs
-if(NOT ffmpeg_FOUND AND FFMPEG_ROOT)
+# Post-build: Production deployment reminder
+if(USE_STATIC_FFMPEG OR ffmpeg_FOUND)
   add_custom_command(TARGET RTXVideoProcessor POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E echo "Note: Copy FFmpeg runtime DLLs from ${FFMPEG_ROOT}/bin if needed."
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================="
+    COMMAND ${CMAKE_COMMAND} -E echo "Build complete! Production deployment requires:"
+    COMMAND ${CMAKE_COMMAND} -E echo "  1. RTXVideoProcessor.exe"
+    COMMAND ${CMAKE_COMMAND} -E echo "  2. nvngx_truehdr.dll (copied automatically)"
+    COMMAND ${CMAKE_COMMAND} -E echo "  3. nvngx_vsr.dll (copied automatically)"
+    COMMAND ${CMAKE_COMMAND} -E echo "FFmpeg: Statically linked (no DLLs needed)"
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================="
+  )
+else()
+  add_custom_command(TARGET RTXVideoProcessor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================="
+    COMMAND ${CMAKE_COMMAND} -E echo "Build complete! Production deployment requires:"
+    COMMAND ${CMAKE_COMMAND} -E echo "  1. RTXVideoProcessor.exe"
+    COMMAND ${CMAKE_COMMAND} -E echo "  2. nvngx_truehdr.dll (copied automatically)"
+    COMMAND ${CMAKE_COMMAND} -E echo "  3. nvngx_vsr.dll (copied automatically)"
+    COMMAND ${CMAKE_COMMAND} -E echo "  4. FFmpeg DLLs from ${FFMPEG_ROOT}/bin (DYNAMIC)"
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================="
+    COMMAND ${CMAKE_COMMAND} -E echo "For static build, use: cmake -DUSE_STATIC_FFMPEG=ON"
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================="
   )
 endif()
 

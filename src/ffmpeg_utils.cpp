@@ -389,10 +389,16 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     }
 
     const AVCodec *encoder = avcodec_find_encoder_by_name("hevc_nvenc");
+    if (!encoder) {
+        // Try software libx265 encoder instead of hardware encoders
+        encoder = avcodec_find_encoder_by_name("libx265");
+        if (!encoder) {
+            // Last resort: try any HEVC encoder (may select hardware encoders like hevc_d3d12va)
+            encoder = avcodec_find_encoder(AV_CODEC_ID_HEVC);
+        }
+    }
     if (!encoder)
-        encoder = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-    if (!encoder)
-        throw std::runtime_error("Failed to find HEVC encoder (hevc_nvenc/AV_CODEC_ID_HEVC)");
+        throw std::runtime_error("Failed to find HEVC encoder (hevc_nvenc/libx265/AV_CODEC_ID_HEVC)");
 
     out.venc = avcodec_alloc_context3(encoder);
     if (!out.venc)

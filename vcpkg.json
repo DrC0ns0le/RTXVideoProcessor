@@ -1,0 +1,20 @@
+{
+  "name": "rtxvideoprocessor",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "avfilter",
+        "avdevice",
+        "swresample",
+        "swscale",
+        "nvcodec"
+      ]
+    }
+  ],
+  "builtin-baseline": "b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01"
+}

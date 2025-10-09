@@ -281,22 +281,83 @@ ffmpeg.exe -i input.avi output.mov                        # Passthrough (unsuppo
 
 
 ## Prerequisites
-- **Windows 11 x64** with an NVIDIA RTX 4070 (or newer recommended).
-- **CUDA Toolkit 12.8** installed and on the PATH.
-- **NVIDIA RTX Video SDK** headers and libraries, with `NV_RTX_VIDEO_SDK` pointing to the SDK root.
-- **NVIDIA Video Codec SDK** (NVENC/NVDEC) with `NV_VIDEO_CODEC_SDK` pointing to the SDK root.
-- **FFmpeg** prebuilts at `C:\ffmpeg` providing `include/`, `lib/`, and `bin/`. Ensure DLLs are accessible at runtime.
-- **NVIDIA driver** recent enough to expose RTX Video SDK features and HDR-capable CUDA 10:10:10:2 arrays.
+
+### For Building from Source
+- **Windows 11 x64** with an NVIDIA RTX 4070 (or newer recommended)
+- **CUDA Toolkit 12.8** installed and on the PATH
+- **NVIDIA RTX Video SDK** headers and libraries, with `NV_RTX_VIDEO_SDK` environment variable pointing to the SDK root
+- **NVIDIA Video Codec SDK** (NVENC/NVDEC) with `NV_VIDEO_CODEC_SDK` environment variable pointing to the SDK root
+- **FFmpeg** (for dynamic builds): prebuilts at `C:\ffmpeg` providing `include/`, `lib/`, and `bin/`
+- **vcpkg** (for static builds): integrated with Visual Studio or standalone
+- **NVIDIA driver** 546.01 or newer (required for RTX Video SDK features and HDR support)
+
+### For Running Pre-built Binaries
+- **Windows 11 x64**
+- **NVIDIA RTX 40-series GPU** (or newer) with driver 546.01+
+- **NVIDIA RTX Video SDK runtime DLLs** (see [Runtime Dependencies](#runtime-dependencies) below)
+
+## Runtime Dependencies
+
+RTXVideoProcessor requires the following NVIDIA proprietary DLLs to run:
+
+- `nvngx_vsr.dll` - RTX Video Super Resolution runtime
+- `nvngx_truehdr.dll` - RTX TrueHDR runtime
+
+### How to Obtain NVIDIA DLLs
+
+⚠️ **These DLLs are proprietary NVIDIA software and cannot be redistributed with this project.**
+
+To obtain the required DLLs:
+
+1. **Download the NVIDIA RTX Video SDK** from the official NVIDIA Developer portal:
+   - Visit: https://developer.nvidia.com/rtx-video-sdk
+   - Register/sign in with an NVIDIA Developer account (free)
+   - Download the SDK package for Windows
+
+2. **Extract the DLLs** from the SDK package:
+   - After extraction, navigate to: `RTX_Video_SDK/bin/Windows/x64/rel/`
+   - Locate `nvngx_vsr.dll` and `nvngx_truehdr.dll`
+
+3. **Place the DLLs** in the same directory as `RTXVideoProcessor.exe`:
+   ```
+   RTXVideoProcessor.exe
+   nvngx_vsr.dll          ← Copy from SDK
+   nvngx_truehdr.dll      ← Copy from SDK
+   ```
+
+**Note**: Pre-built releases include the main executable but **NOT** the NVIDIA DLLs. You must obtain these separately from NVIDIA as described above.
 
 ## Build
-```
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+### Dynamic Build (Requires FFmpeg DLLs at Runtime)
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DFFMPEG_ROOT=C:/ffmpeg
 cmake --build build --config Release -j
 ```
-The resulting binary will be at `build/Release/RTXVideoProcessor.exe`. Copy FFmpeg runtime DLLs next to the executable if they are not on your PATH:
-```
+
+The resulting binary will be at `build/Release/RTXVideoProcessor.exe`. You'll need to ensure FFmpeg DLLs are accessible:
+```bash
+# Option 1: Copy FFmpeg DLLs to the executable directory
 copy C:\ffmpeg\bin\*.dll build\Release\
+
+# Option 2: Add C:\ffmpeg\bin to your system PATH
 ```
+
+### Static Build (Standalone Executable, No FFmpeg DLLs Required)
+```bash
+# Configure with vcpkg for static FFmpeg libraries
+cmake -B build-static ^
+  -DUSE_STATIC_FFMPEG=ON ^
+  -DCMAKE_TOOLCHAIN_FILE="C:/Program Files/Microsoft Visual Studio/2022/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake" ^
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static
+
+# Build
+cmake --build build-static --config Release -j
+```
+
+The resulting binary will be at `build-static/Release/RTXVideoProcessor.exe` (~21 MB).
+
+**Static builds are self-contained** and don't require FFmpeg DLLs, but still need the NVIDIA RTX Video SDK DLLs (`nvngx_vsr.dll` and `nvngx_truehdr.dll`) as described in [Runtime Dependencies](#runtime-dependencies).
 
 ## Troubleshooting
 - **CUDA negotiation** If CUDA initialization fails, verify the GPU driver, confirm the Video Codec SDK DLLs are present, and try `--cpu` to validate the rest of the pipeline.
@@ -317,7 +378,57 @@ copy C:\ffmpeg\bin\*.dll build\Release\
 ## Contributing
 I welcome any contributions to this project. Any feedback, bug reports, or feature requests are greatly appreciated. Please open an issue or submit a pull request.
 
-## License
-TBC
+## License & Redistribution
+
+### Project License
+This project's source code is released under the **MIT License** (see [LICENSE](LICENSE) file).
+
+You are free to use, modify, and distribute the source code according to the terms of the MIT License.
+
+### Third-Party Components & Redistribution Notice
+
+⚠️ **Important**: This project uses proprietary NVIDIA components that have separate licensing terms.
+
+#### NVIDIA RTX Video SDK Components
+
+This project uses the NVIDIA RTX Video SDK (NGX runtime) for RTX Video Super Resolution and TrueHDR features. The following NVIDIA components are **proprietary software owned by NVIDIA Corporation**:
+
+- `nvngx_vsr.dll` - NVIDIA RTX Video Super Resolution
+- `nvngx_truehdr.dll` - NVIDIA RTX TrueHDR
+
+**Redistribution Restrictions**:
+- These DLLs are **NOT included** in this repository or in binary releases
+- These DLLs **CANNOT be redistributed** without NVIDIA's explicit permission
+- Users must obtain these components directly from NVIDIA via the [RTX Video SDK](https://developer.nvidia.com/rtx-video-sdk)
+- These components are subject to the NVIDIA RTX Video SDK End User License Agreement
+
+**For Commercial Use**: If you plan to distribute this software commercially with the NVIDIA RTX Video SDK components, you must:
+1. Contact NVIDIA via their SW-notification process
+2. Obtain appropriate licensing/permission from NVIDIA
+3. Comply with NVIDIA's redistribution requirements
+
+#### Other Dependencies
+
+- **FFmpeg**: This project uses FFmpeg libraries (LGPL 2.1+ or GPL 2+ depending on build configuration)
+  - Static builds include FFmpeg code statically linked (LGPL 2.1 compliance requires providing source code and build instructions)
+  - Dynamic builds link to FFmpeg DLLs at runtime (no redistribution concerns)
+  - FFmpeg source code and licensing: https://ffmpeg.org/legal.html
+
+- **NVIDIA Video Codec SDK**: Hardware video encode/decode interface (subject to NVIDIA Video Codec SDK license)
+- **CUDA**: CUDA runtime libraries (subject to NVIDIA CUDA EULA)
+
+### Summary
+
+**What you can do**:
+- Use this project's source code under the MIT License
+- Build and use the software for personal or commercial purposes
+- Modify and distribute the source code
+
+**What you cannot do** (without NVIDIA's permission):
+- Redistribute NVIDIA's proprietary DLLs (`nvngx_vsr.dll`, `nvngx_truehdr.dll`)
+- Include NVIDIA SDK binaries in derivative works or binary releases
+- Distribute commercial products with embedded NVIDIA RTX components without NVIDIA approval
+
+**Disclaimer**: This project is provided "as-is" without warranty of any kind. The author is not responsible for any third-party licensing requirements. Users are responsible for ensuring compliance with all applicable licenses, including NVIDIA's SDK licenses.
 
 
