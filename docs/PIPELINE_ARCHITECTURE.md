@@ -80,8 +80,8 @@ RTX processing is **independent of operating mode** and controlled by command-li
 
 - **`--no-vsr`**: Disables Video Super Resolution (enabled by default)
 - **`--no-thdr`**: Disables TrueHDR tone mapping (enabled by default)
-- **Auto-disable**: VSR automatically disables for inputs ≥1080p (src/input_config.cpp:62-72)
-- **Auto-disable**: THDR automatically disables for HDR inputs to preserve HDR metadata (src/input_config.cpp:35-41)
+- **Auto-disable**: VSR automatically disables for inputs >1440p (>2560x1440 or >1440x2560) (src/input_config.cpp:66-80)
+- **Auto-disable**: THDR automatically disables for HDR inputs to preserve HDR metadata (src/input_config.cpp:27-64)
 
 **Both Simple Mode and FFmpeg-Compatible Mode support RTX processing**. The mode only affects argument parsing syntax, not RTX capabilities.
 
@@ -461,29 +461,27 @@ if (!cfg.inputPath || !cfg.outputPath) {
 
 ### Step 1.3: Initialize Libraries
 
-**Location**: main.cpp:897-908
+**Location**: main.cpp:256-260
 
 ```cpp
 // Initialize logger
-setLogLevel(cfg.logLevel);
+Logger::instance().setVerbose(cfg.verbose || cfg.debug);
+Logger::instance().setDebug(cfg.debug);
 
 // No av_register_all() needed in FFmpeg 4+
-LOG_VERBOSE("FFmpeg libraries initialized");
+LOG_VERBOSE("Starting video processing pipeline");
 
-// Initialize CUDA if not CPU-only
-if (!cfg.cpuOnly) {
-    cudaError_t err = cudaSetDevice(0);
-    if (err != cudaSuccess) {
-        LOG_WARN("CUDA initialization failed, falling back to CPU");
-        cfg.cpuOnly = true;
-    }
-}
+// Note: CUDA initialization happens later during RTX processor setup (main.cpp:445-448)
+// This allows for graceful fallback to CPU if GPU initialization fails
 ```
 
 **Initialized Components**:
 - Logger system
 - FFmpeg libraries (automatic in FFmpeg 4+)
-- CUDA device (if available)
+
+**CUDA Initialization** (deferred to RTX processor setup):
+- Location: main.cpp:445-448 via `initialize_rtx_processor()`
+- Allows graceful CPU fallback without aborting early
 
 ---
 
@@ -921,45 +919,125 @@ Establish global baseline [lines 579-583]
 
 ### Step 4.3: Video Processing
 
-**Two paths based on mode**:
+**Unified Processing Architecture using IProcessor Abstraction**:
 
-#### Path A: With RTX Processing (VSR + TrueHDR)
+**Location**: main.cpp:456-469 (processor initialization), main.cpp:669-675 (processing)
 
-**Condition**: `!useDefaultMode` (main.cpp:585)
-
-> **Note**: RTX processing is skipped when output requires frame-accurate timing (HLS, seeking, stream mapping) or when explicitly disabled with `-default`
+The pipeline uses a unified `IProcessor` interface that abstracts away GPU vs CPU processing details:
 
 ```cpp
-// GPU processing with RTX features
-processor->process(frame.get());
-    ↓
-rtx_processor.cpp:
-    ├─ Download frame from GPU [if CUDA format]
-    ├─ Convert colorspace (BT.2020 → BT.709 if needed)
-    ├─ Apply RTX Video Super Resolution
-    ├─ Apply TrueHDR tone mapping
-    ├─ Pack to P010/NV12
-    └─ Upload to GPU encoder
-```
-
-#### Path B: Without RTX Processing (Direct Encoding)
-
-**Condition**: `useDefaultMode` (main.cpp:597)
-
-```cpp
-AVFrame *decframe = frame.get();
-
-// Transfer from GPU to CPU if needed
-if (in.hw_device_ctx && decframe->format == AV_PIX_FMT_CUDA) {
-    FramePtr sw_frame(av_frame_alloc(), av_frame_free_single);
-    ff_check(av_hwframe_transfer_data(sw_frame.get(), decframe, 0),
-             "transfer from GPU");
-    decframe = sw_frame.get();
+// Processor selection (main.cpp:456-469)
+std::unique_ptr<IProcessor> processor;
+if (use_cuda_path) {
+    // GPU path: CUDA frames stay on GPU through entire pipeline
+    processor = std::make_unique<GpuProcessor>(rtx, cuda_pool,
+                                               in.vdec->colorspace, outputHDR);
+} else {
+    // CPU path: Software processing with RTX
+    auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width,
+                                                  in.vdec->height, dstW, dstH);
+    RTXProcessConfig cpuConfig = cfg.rtxCfg;
+    cpuConfig.enableTHDR = outputHDR;
+    cpuProc->setConfig(cpuConfig);
+    processor = std::move(cpuProc);
 }
 
-// Process frame directly (no RTX processing)
-processFrameDefault(decframe);
+// Unified processing call (main.cpp:671)
+AVFrame *outFrame = nullptr;
+if (!processor->process(decframe, outFrame)) {
+    throw std::runtime_error("Processor failed to produce output frame");
+}
 ```
+
+**Processing Paths**:
+
+#### GPU Path (`GpuProcessor`)
+```cpp
+GpuProcessor::process():
+    ├─ Frame already on GPU (AV_PIX_FMT_CUDA)
+    ├─ Apply RTX Video Super Resolution (if enabled)
+    ├─ Apply TrueHDR tone mapping (if enabled)
+    ├─ Convert colorspace (BT.709/BT.2020 as needed)
+    ├─ Pack to P010LE/NV12 for encoder
+    └─ Return CUDA frame (stays on GPU for NVENC)
+```
+
+#### CPU Path (`CpuProcessor`)
+```cpp
+CpuProcessor::process():
+    ├─ Transfer from GPU to CPU (if needed)
+    ├─ Convert to RGBA for RTX processing
+    ├─ Apply RTX Video Super Resolution (if enabled)
+    ├─ Apply TrueHDR tone mapping (if enabled)
+    ├─ Convert to P010LE/NV12 for software encoder
+    └─ Return CPU frame
+```
+
+**Key Insight**: Both paths apply RTX processing. The difference is where processing occurs (GPU vs CPU), not whether it occurs.
+
+#### CUDA Colorspace Conversion Kernels
+
+**Location**: src/cuda_kernels.cu, src/cuda_kernels.h
+
+The pipeline uses custom CUDA kernels to bridge the gap between RTX SDK output formats (ABGR10/BGRA8) and FFmpeg encoder input formats (P010/NV12). These kernels handle colorspace conversion and format transformation entirely on the GPU, avoiding expensive GPU→CPU→GPU transfers.
+
+**Implemented Kernels**:
+
+1. **NV12 → BGRA8** (cuda_kernels.cu:286-422)
+   - Converts 8-bit YUV 4:2:0 to 8-bit RGBA
+   - Used for: GPU path when preparing decoded NV12 frames for RTX processing
+   - Colorspace: Configurable BT.709 or BT.2020 YUV→RGB matrix
+   - Range: Limited range YUV → Full range RGB
+
+2. **ABGR10 → P010** (cuda_kernels.cu:13-105)
+   - Converts 10-bit packed RGB (X2BGR10LE) to 10-bit YUV 4:2:0 (P010)
+   - Used for: GPU path when converting RTX THDR output to encoder input
+   - Colorspace: Configurable BT.709 or BT.2020 RGB→YUV matrix
+   - Range: Full range RGB → Limited range YUV (Y: 64-940, UV: 64-960 in 10-bit)
+   - Optimization: Processes 2×2 pixel blocks for chroma subsampling
+
+3. **BGRA8 → P010** (cuda_kernels.cu:107-189)
+   - Converts 8-bit RGBA to 10-bit YUV 4:2:0 (P010)
+   - Used for: GPU path when upconverting 8-bit RTX output to 10-bit HDR encoder
+   - Colorspace: Configurable BT.709 or BT.2020
+   - Range: Full range RGB → Limited range YUV
+
+4. **BGRA8 → NV12** (cuda_kernels.cu:191-266)
+   - Converts 8-bit RGBA to 8-bit YUV 4:2:0 (NV12)
+   - Used for: GPU path when preparing 8-bit RTX output for SDR encoder
+   - Colorspace: Configurable BT.709 or BT.2020
+   - Range: Full range RGB → Limited range YUV (Y: 16-235, UV: 16-240)
+
+5. **P010 → NV12** (cuda_kernels.cu:375-436)
+   - Converts 10-bit YUV 4:2:0 to 8-bit YUV 4:2:0
+   - Used for: GPU path when downsampling HDR content to SDR
+   - Method: Simple bit-shift (takes upper 8 bits of 10-bit data)
+
+6. **P010 → X2BGR10LE** (cuda_kernels.cu:326-448)
+   - Converts 10-bit YUV 4:2:0 (P010) to 10-bit packed RGB
+   - Used for: GPU path when preparing P010 decoded frames for RTX processing
+   - Colorspace: Configurable BT.709 or BT.2020 YUV→RGB matrix
+   - Range: Limited range YUV → Full range RGB
+
+**Technical Details**:
+
+- **Grid Configuration**: Kernels use 16×16 or 32×16 thread blocks
+- **Memory Access**: Optimized pitched memory access for proper alignment
+- **Chroma Subsampling**: RGB→YUV kernels process 2×2 pixel blocks to compute averaged chroma values
+- **Limited Range Encoding**: Proper compliance with ITU-R BT.709/2020 limited range specifications
+  - 10-bit Y: 64-940 (876 levels)
+  - 10-bit UV: 64-960 (896 levels), centered at 512
+  - 8-bit Y: 16-235 (219 levels)
+  - 8-bit UV: 16-240 (224 levels), centered at 128
+
+**Why Custom Kernels?**
+
+The RTX Video SDK outputs in ABGR10 (for THDR) or BGRA8 (for VSR-only) formats, which are not directly compatible with NVENC's expected P010/NV12 inputs. FFmpeg's `libswscale` cannot handle these conversions on GPU, so custom CUDA kernels are essential to:
+
+1. Maintain the entire pipeline on GPU (avoid expensive transfers)
+2. Support both BT.709 and BT.2020 colorspaces
+3. Properly handle limited range YUV encoding
+4. Optimize chroma subsampling for 4:2:0 formats
 
 ### Step 4.4: Video Encoding and Writing
 
@@ -1194,20 +1272,28 @@ close_input(in);    // Frees decoder, demuxer
        │ avcodec_receive_frame()
        ▼
 ┌──────────────────────────┐
-│ AVFrame (YUV, GPU)       │
+│ AVFrame (YUV, GPU/CPU)   │
 └──────┬───────────────────┘
        │
-       ├─ With RTX ────────────┐
-       │ (if !useDefaultMode)   ▼
+       ├─ GPU Path ────────────┐
+       │ (use_cuda_path)        ▼
        │              ┌────────────────────┐
-       │              │ RTX Processor      │
-       │              │ - VSR upscaling    │
-       │              │ - TrueHDR mapping  │
-       │              │ - Colorspace conv  │
+       │              │ GpuProcessor       │
+       │              │ - VSR (GPU)        │
+       │              │ - THDR (GPU)       │
+       │              │ - Colorspace (GPU) │
        │              └────────┬───────────┘
        │                       │
-       └─ Without RTX ─────────┤
-         (if useDefaultMode)   ▼
+       └─ CPU Path ────────────┤
+         (!use_cuda_path)      ▼
+                    ┌──────────────────────┐
+                    │ CpuProcessor         │
+                    │ - VSR (CPU+RTX)      │
+                    │ - THDR (CPU+RTX)     │
+                    │ - Colorspace (CPU)   │
+                    └──────┬───────────────┘
+                           │
+                           ▼
                     ┌──────────────────────┐
                     │ AVFrame (processed)  │
                     └──────┬───────────────┘
@@ -1443,11 +1529,36 @@ if (ret < 0) {
 
 **Benefit**: Zero-copy pipeline when fully GPU-accelerated
 
-### 2. Frame Pool (RTX mode)
+### 2. Frame Pool (GPU mode)
 
 **File**: src/frame_pool.h
 
-Reuses AVFrame allocations to avoid repeated malloc/free
+**Location**: Initialized in output_config.cpp:318
+
+The CUDA frame pool pre-allocates and reuses encoder frames to avoid repeated GPU memory allocation overhead during encoding.
+
+**Configuration**:
+- **Pool Size**: 64 frames (output_config.cpp:318: `fctx->initial_pool_size = 64`)
+- **Strategy**: Round-robin allocation with `acquire()` method
+- **Frame Format**: AV_PIX_FMT_CUDA with sw_format P010LE (HDR) or NV12 (SDR)
+
+**Implementation** (frame_pool.h:65-78):
+```cpp
+AVFrame *acquire() {
+    FramePtr &slot = m_frames[m_index];
+    m_index = (m_index + 1) % m_frames.size();  // Round-robin
+    av_frame_unref(slot.get());                 // Clear previous data
+    av_hwframe_get_buffer(m_hw_frames_ctx, slot.get(), 0);  // Get fresh buffer
+    return slot.get();
+}
+```
+
+**Rationale for 64 frames**:
+- Provides sufficient buffering for B-frames (max_b_frames can be up to 4)
+- Accommodates encoder lookahead and reordering
+- Balances GPU memory usage vs allocation frequency
+- Typical B-frame pyramid: I-frame + 4 B-frames + lookahead = ~10-15 frames active
+- 64 frames provides 4x safety margin for high-throughput scenarios
 
 ### 3. Interleaved Writing
 
@@ -1468,6 +1579,135 @@ FIFO Buffer
   ↓
 Output: Fixed-size encoder frames (e.g., 1024 samples for AAC)
 ```
+
+### 5. NVENC Encoder Optimizations
+
+**Location**: src/output_config.cpp:176-329
+
+The pipeline enables several NVENC-specific optimizations that are not explicitly documented in user-facing docs:
+
+#### Temporal Adaptive Quantization (Temporal AQ)
+
+**Code**: output_config.cpp:289
+```cpp
+av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+```
+
+**What it does**:
+- Analyzes temporal (across frames) motion and complexity
+- Dynamically adjusts quantization parameters based on temporal redundancy
+- Allocates more bits to complex/high-motion areas, fewer to static regions
+- **Result**: Better perceptual quality at same bitrate, especially for motion
+
+**Always enabled**: This optimization is applied to all encodes (both HDR and SDR)
+
+#### GOP Alignment for HLS (output_config.cpp:216-238)
+
+For HLS outputs, GOP size is automatically aligned to segment duration:
+
+```cpp
+if (hls_enabled && out.hlsOptions.hlsTime > 0) {
+    gop_duration_sec = out.hlsOptions.hlsTime;
+    gop_size_frames = (int)round((double)gop_duration_sec * fr.num / fr.den);
+
+    // For 23.976fps with 3-sec segments: 3 * 24000 / 1001 = 72 frames
+}
+```
+
+Combined with forced IDR and strict GOP:
+```cpp
+av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
+av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
+```
+
+**Benefit**: Ensures every HLS segment starts with an I-frame for seamless seeking
+
+#### Encoder Timebase Strategy (output_config.cpp:186-203)
+
+**HLS mode**: Uses framerate-based timebase (1/fps) for muxer compatibility
+```cpp
+// Already set in ffmpeg_utils.cpp as 1/fps
+LOG_INFO("HLS: Using framerate-based encoder timebase %d/%d",
+         out.venc->time_base.num, out.venc->time_base.den);
+```
+
+**Non-HLS mode**: Uses input stream timebase for `-copyts` compatibility
+```cpp
+out.venc->time_base = in.vst->time_base;
+LOG_DEBUG("Non-HLS: Using input stream timebase %d/%d for encoder",
+          out.venc->time_base.num, out.venc->time_base.den);
+```
+
+**Why this matters**: FFmpeg's HLS muxer expects specific timebase formats to generate correct segment durations
+
+### 6. TimestampManager Performance Optimizations
+
+**Location**: src/timestamp_manager.h
+
+The timestamp manager uses several performance optimization techniques:
+
+#### Function Pointer Strategy (timestamp_manager.h:22)
+
+**Technique**: Pre-computes mode-dependent behavior flags to avoid branches in hot path
+
+```cpp
+// Constructor pre-computes const flags (line 58)
+const bool needs_baseline_wait_ = (config.input_seek_us > 0 && config.mode == Mode::NORMAL);
+const int64_t frame_duration_us_ = av_rescale_q(1, av_inv_q(config.expected_frame_rate), {1, AV_TIME_BASE});
+```
+
+**Benefit**: Mode checks become simple const bool comparisons instead of enum switches
+
+#### Pre-computed Frame Duration (timestamp_manager.h:58, 246)
+
+Instead of computing frame duration on every monotonicity fix:
+```cpp
+// One-time calculation in constructor
+frame_duration_us_ = av_rescale_q(1, av_inv_q(config.expected_frame_rate), {1, AV_TIME_BASE});
+
+// Fast lookup during processing (line 445)
+int64_t frame_duration = av_rescale_q(1, av_inv_q(cfg_.expected_frame_rate), out_tb);
+```
+
+**Benefit**: Eliminates repeated av_rescale_q() calls in tight encode loop
+
+#### Elimination of Redundant Timebase Conversions (timestamp_manager.h:19)
+
+For copied streams in NORMAL mode with seeking:
+```cpp
+// Convert to microseconds once, adjust, convert back once (lines 381-394)
+int64_t pts_us = av_rescale_q(pkt->pts, in_tb, {1, AV_TIME_BASE});
+int64_t adjusted_us = pts_us - global_baseline_us_;
+pkt->pts = av_rescale_q(adjusted_us, {1, AV_TIME_BASE}, in_tb);
+```
+
+Instead of multiple rescale operations per timestamp field
+
+### 7. CpuProcessor Dynamic Configuration
+
+**Location**: src/processor.h:169-194
+
+The `CpuProcessor` class supports runtime THDR configuration via `setConfig()` method:
+
+**Use case**: Allows changing HDR output settings after processor initialization
+
+```cpp
+// Initial setup (main.cpp:518-522)
+auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width,
+                                              in.vdec->height, dstW, dstH);
+RTXProcessConfig cpuConfig = cfg.rtxCfg;
+cpuConfig.enableTHDR = outputHDR;
+cpuProc->setConfig(cpuConfig);
+```
+
+**What setConfig() does** (processor.h:169-194):
+1. Rebuilds SwsContext for colorspace conversion based on new THDR setting
+2. Reallocates output frame buffer in correct format (P010LE for HDR, NV12 for SDR)
+3. Updates colorspace details (BT.2020 vs BT.709)
+
+**Current usage**: Called once during initialization. Could theoretically support mid-stream HDR toggling if needed for adaptive streaming scenarios.
+
+**Note**: GpuProcessor does not have `setConfig()` - its HDR mode is determined at construction and immutable.
 
 ---
 

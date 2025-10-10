@@ -170,7 +170,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - Can be manually disabled with `--no-thdr`
 
 - **NVENC**
-  - Uses Main10 profile, constant QP 22, preset `p4`, tune `hq`
+  - Uses Main10 profile, constant QP 22, preset `p7`, tune `hq`
   - GOP length: `3 × fps` frames
   - B-frames: 2 (default)
   - Bitrate: `input_bitrate × 5` (fallback: 25 Mbps if unknown)

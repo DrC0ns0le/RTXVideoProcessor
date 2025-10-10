@@ -380,7 +380,7 @@ void configure_stream_metadata(InputContext &in, OutputContext &out, PipelineCon
         }
     }
 
-    if (outputHDR && !hls_enabled)
+    if (outputHDR)
     {
         if (inputIsHDR)
         {
