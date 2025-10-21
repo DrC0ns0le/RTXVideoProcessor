@@ -390,6 +390,29 @@ parseArguments(argc, argv)
 Returns: Config object with all settings
 ```
 
+**Configuration Sources** (src/config_parser.cpp:947-970):
+
+The configuration system supports three levels of precedence (highest to lowest):
+1. **Command-line arguments**: Explicit flags like `--nvenc-qp 21`
+2. **Environment variables**: System environment vars like `RTX_NVENC_QP=21`
+3. **Default values**: Built-in defaults
+
+**Supported Environment Variables**:
+- `RTX_NO_VSR=1`: Disable Video Super Resolution (default: enabled)
+- `RTX_VSR_QUALITY`: VSR quality level 1-4 (default: 4)
+- `RTX_NO_THDR=1`: Disable TrueHDR tone mapping (default: enabled)
+- `RTX_THDR_CONTRAST`: THDR contrast 0-200 (default: 115)
+- `RTX_THDR_SATURATION`: THDR saturation 0-200 (default: 75)
+- `RTX_THDR_MIDDLE_GRAY`: THDR middle gray 0-100 (default: 30)
+- `RTX_THDR_MAX_LUMINANCE`: THDR max luminance in nits (default: 1000)
+- `RTX_NVENC_TUNE`: NVENC tune preset (default: "hq")
+- `RTX_NVENC_PRESET`: NVENC encoding preset (default: "p7")
+- `RTX_NVENC_RC`: NVENC rate control mode (default: "constqp")
+- `RTX_NVENC_GOP`: GOP length in seconds (default: 3)
+- `RTX_NVENC_BFRAMES`: Max B-frames (default: 2)
+- `RTX_NVENC_QP`: Constant QP value (default: 21)
+- `RTX_NVENC_BITRATE_MULTIPLIER`: Bitrate multiplier (default: 2)
+
 **Key Configuration Fields**:
 ```cpp
 struct Config {
@@ -412,6 +435,7 @@ struct Config {
 
     // Seeking
     std::string seekTime;
+    std::string duration;  // NEW: -t option support
     bool seek2any;
     bool seekTimestamp;
 
@@ -422,7 +446,7 @@ struct Config {
 
     // Output format
     std::string outputFormat;
-    HLS options (hlsTime, segmentType, etc.)
+    HLS options (hlsTime, segmentType, hlsFlags, hlsSegmentOptions, etc.)
 };
 ```
 
@@ -514,8 +538,10 @@ ffmpeg_utils.cpp:28
     │
     │   Compose seek flags: [line 84-98]
     │   ├─ Base: AVSEEK_FLAG_BACKWARD
-    │   ├─ If -seek2any: add AVSEEK_FLAG_ANY
+    │   ├─ If -noaccurate_seek OR -seek2any: add AVSEEK_FLAG_ANY
+    │   │   └─ Enables fast seeking to non-keyframes (inaccurate)
     │   └─ If -seek_timestamp: add AVSEEK_FLAG_FRAME
+    │       └─ Prefer timestamp-based seeking over byte-based
     │
     │   avformat_seek_file(in.fmt, ..., seek_flags) [line 100]
     │
@@ -529,7 +555,8 @@ ffmpeg_utils.cpp:28
     │   in.vdec = avcodec_alloc_context3(decoder) [line 126]
     │   avcodec_parameters_to_context(in.vdec, in.vst->codecpar) [line 130]
     │
-    │   Enable error concealment (if !ffCompatible): [line 136-138]
+    │   Enable error concealment (if options->enableErrorConcealment): [line 128-138]
+    │   ├─ Only enabled when requested (controlled by !ffCompatible mode)
     │   ├─ in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL
     │   └─ in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT
     │
@@ -651,16 +678,23 @@ ffmpeg_utils.cpp:251
     │   ├─ hls_playlist_type
     │   ├─ hls_list_size
     │   ├─ max_delay
+    │   ├─ hls_flags (user-specified via -hls_flags, or auto-computed)
+    │   ├─ hls_segment_options (user-specified via -hls_segment_options)
     │   │
-    │   Compute hls_flags based on mode: [lines 338-362]
-    │   ├─ If !autoDiscontinuity (FFmpeg mode):
+    │   Compute hls_flags based on mode: [lines 332-375]
+    │   ├─ If user specified -hls_flags:
+    │   │   └─ Use user-provided flags directly (highest priority)
+    │   ├─ Else if !autoDiscontinuity (FFmpeg mode):
     │   │   └─ Minimal flags, let FFmpeg handle defaults
-    │   └─ Else (Legacy mode):
+    │   └─ Else (Simple mode):
     │       ├─ fmp4: "+append_list"
     │       └─ mpegts: "split_by_time+append_list"
     │   │
-    │   If seeking + autoDiscontinuity: [lines 366-374]
+    │   If seeking + autoDiscontinuity: [lines 369-375]
     │   └─ Add "+discont_start" flag
+    │   │
+    │   Apply user hls_segment_options (if specified): [lines 379-383]
+    │   └─ Pass options to segment muxer (e.g., movflags=+frag_discont for fMP4+hls.js)
     │
     ├─ Step 3.2.3: Setup Video Encoder
     │   [lines 391-405]
@@ -799,30 +833,47 @@ input_config.cpp:65
 
 **Location**: main.cpp:435-471
 
+**Design Philosophy**:
+
+The timestamp manager follows FFmpeg 8's timestamp handling model:
+- Set AVFrame->pts correctly, let FFmpeg handle the rest
+- Encoder generates DTS automatically based on frame reordering
+- Muxer applies output_ts_offset via AVFormatContext->output_ts_offset
+- Muxer validates monotonicity and DTS <= PTS constraints
+- Minimal manual intervention in timestamp flow
+
 ```cpp
 TimestampManager::Config ts_config;
 ts_config.mode = cfg.copyts ? TimestampManager::Mode::COPYTS
                              : TimestampManager::Mode::NORMAL;
-ts_config.input_seek_us = in.seek_offset_us;
-ts_config.avoid_negative_ts = out.avoidNegativeTs;
-ts_config.start_at_zero = out.startAtZero;
-ts_config.enforce_monotonicity = !cfg.ffCompatible;
-ts_config.expected_frame_rate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
+ts_config.input_seek_us = in.seek_offset_us;          // Input seeking offset (-ss)
+ts_config.output_seek_target_us = /* if specified */; // Output seeking target
+ts_config.start_at_zero = cfg.startAtZero;            // -start_at_zero flag
 
 TimestampManager ts_manager(ts_config);
+```
+
+**Configuration Structure** (src/timestamp_manager.h:32-38):
+```cpp
+struct Config {
+    Mode mode = Mode::NORMAL;
+    int64_t input_seek_us = 0;         // Input seeking offset (-ss)
+    int64_t output_seek_target_us = 0; // Output seeking target (frame dropping)
+    bool start_at_zero = false;        // -start_at_zero flag
+};
 ```
 
 **Timestamp Modes**:
 ```
 NORMAL mode:
-    ├─ Establishes baseline from first frame
-    ├─ Outputs zero-based timestamps
-    └─ Accounts for seek offset
+    ├─ Establishes baseline from first frame PTS
+    ├─ Outputs zero-based timestamps (relative to baseline)
+    └─ Clamps negative PTS to zero
 
 COPYTS mode:
-    ├─ Preserves original timestamps
-    ├─ Optionally shifts with -start_at_zero
-    └─ Applies output_ts_offset if specified
+    ├─ Preserves original input timestamps
+    ├─ Optionally shifts with -start_at_zero (subtracts first frame PTS)
+    └─ Clamps negative PTS to zero
 ```
 
 ---
@@ -1043,17 +1094,19 @@ The RTX Video SDK outputs in ABGR10 (for THDR) or BGRA8 (for VSR-only) formats, 
 
 **Location**: main.cpp:614-667
 
-```cpp
-// Derive timestamps for encoder
-TimestampManager::TimestampPair ts =
-    ts_manager.deriveVideoTimestamps(
-        decframe,
-        in.vst->time_base,
-        out.venc->time_base
-    );
+**Timestamp Derivation** (src/timestamp_manager.h:46-68):
 
-decframe->pts = ts.pts;
-// Note: DTS handled by encoder
+```cpp
+// Derive PTS for encoder
+// Returns single PTS value - encoder generates DTS automatically
+int64_t pts = ts_manager.deriveVideoPTS(
+    decframe,
+    in.vst->time_base,
+    out.venc->time_base
+);
+
+decframe->pts = pts;
+// DTS is handled entirely by encoder (no manual assignment needed)
 
 // Send to encoder
 encode_and_write(out.venc, out.vstream, out.fmt, out,
@@ -1067,15 +1120,16 @@ avcodec_send_frame(enc, frame)
 while (avcodec_receive_packet(enc, opkt) == 0) {
     ├─ Set stream_index
     ├─ Rescale timestamps to stream timebase
-    ├─ Enforce DTS monotonicity [lines 136-141]
-    │   └─ If DTS <= last_video_dts: DTS = last_video_dts + 1
-    ├─ Validate PTS >= DTS [lines 144-147]
-    │   └─ If PTS < DTS: PTS = DTS
-    ├─ Write packet
+    ├─ Write packet (encoder/muxer validate timestamps internally)
     │   av_interleaved_write_frame(ofmt, opkt)
     └─ av_packet_unref(opkt)
 }
 ```
+
+**Timestamp Handling**:
+- Encoder generates valid DTS automatically based on frame reordering
+- Muxer validates PTS >= DTS and monotonicity constraints
+- No manual timestamp adjustments needed in pipeline code
 
 ### Step 4.5: Audio Processing
 
@@ -1108,10 +1162,12 @@ while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
             └─ While FIFO has enough samples:
                 ├─ Read encoder->frame_size samples
                 ├─ Set PTS = next_audio_pts
+                ├─ Advance next_audio_pts immediately
+                │   └─ Prevents duplicate PTS when encoder buffers (EAGAIN)
                 ├─ avcodec_send_frame()
                 ├─ avcodec_receive_packet()
                 ├─ Rescale timestamps
-                ├─ Enforce DTS monotonicity
+                ├─ Encoder generates DTS automatically
                 └─ Return packet for writing
 
     // Write audio packet
@@ -1125,9 +1181,14 @@ while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
 
 **Location**: main.cpp:712-717
 
+**Packet Timestamp Handling** (src/timestamp_manager.h:121-135):
+
 ```cpp
-// Adjust timestamps for copied stream
-ts_manager.adjustPacketTimestamps(pkt.get(), in.ast->time_base, in.astream);
+// Rescale timestamps from input to output timebase
+AVStream *out_stream = out.fmt->streams[out_stream_idx];
+ts_manager.rescalePacketTimestamps(pkt.get(),
+                                   in.ast->time_base,
+                                   out_stream->time_base);
 
 // Remap stream index
 int out_stream_idx = out.input_to_output_map[pkt->stream_index];
@@ -1136,6 +1197,8 @@ pkt->stream_index = out_stream_idx;
 // Write directly
 av_interleaved_write_frame(out.fmt, pkt.get());
 ```
+
+**Note**: The timestamp manager performs simple timebase rescaling. The muxer handles output_ts_offset and monotonicity validation automatically.
 
 ### Step 4.6: Other Stream Copy
 
@@ -1146,10 +1209,12 @@ av_interleaved_write_frame(out.fmt, pkt.get());
 int out_stream_idx = out.input_to_output_map[pkt->stream_index];
 
 if (out_stream_idx >= 0) {
-    // Adjust timestamps
-    ts_manager.adjustPacketTimestamps(pkt.get(),
-                                      in.fmt->streams[pkt->stream_index]->time_base,
-                                      pkt->stream_index);
+    // Rescale timestamps
+    AVStream *in_stream = in.fmt->streams[pkt->stream_index];
+    AVStream *out_stream = out.fmt->streams[out_stream_idx];
+    ts_manager.rescalePacketTimestamps(pkt.get(),
+                                       in_stream->time_base,
+                                       out_stream->time_base);
 
     // Remap and write
     pkt->stream_index = out_stream_idx;
@@ -1213,14 +1278,13 @@ if (ret < 0) {
 
 **Location**: main.cpp:847-854
 
+**Processing Statistics** (src/timestamp_manager.h:137-139):
+
 ```cpp
-// Print statistics
-ts_manager.dumpState();
-auto stats = ts_manager.getStats();
+// Print processing statistics
 LOG_INFO("Processing complete:");
-LOG_INFO("  Dropped frames: %d", stats.dropped_frames);
-LOG_INFO("  Discontinuities: %d", stats.discontinuities);
-LOG_INFO("  Monotonicity fixes: %d", stats.monotonicity_violations);
+LOG_INFO("  Total frames: %lld", ts_manager.getFrameCount());
+LOG_INFO("  Dropped frames (output seek): %d", ts_manager.getDroppedFrames());
 
 // Cleanup (RAII handles most)
 close_output(out);  // Frees encoder, filter, resampler
@@ -1444,18 +1508,24 @@ close_input(in);    // Frees decoder, demuxer
 
 ### Error Concealment Strategy
 
-**Location**: FFmpeg decoder flags (ffmpeg_utils.cpp:136-138)
+**Location**: FFmpeg decoder flags (ffmpeg_utils.cpp:128-138)
 
 ```cpp
-// Enable error concealment (if !ffCompatible)
-in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
-in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
+// Enable error concealment (if requested via options)
+// FFmpeg default: decoder drops corrupted frames automatically
+// With these flags: decoder outputs corrupted frames (may cause green frames after seeking)
+if (options && options->enableErrorConcealment) {
+    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;     // Show all frames even if corrupted
+    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT; // Output potentially corrupted frames
+    LOG_DEBUG("Decoder error concealment enabled");
+}
 ```
 
 **Behavior**:
-- **Legacy mode**: Shows frames with artifacts instead of dropping
-- **FFmpeg mode**: Strict - may drop frames with errors
-- **Use case**: Seeking to non-keyframes (`-seek2any 1`)
+- **Simple mode** (enableErrorConcealment=true): Shows frames with artifacts instead of dropping
+- **FFmpeg-Compatible mode** (enableErrorConcealment=false): Strict FFmpeg behavior - decoder drops corrupted frames automatically
+- **Use case**: Seeking to non-keyframes (`-seek2any 1`) where reference frames may be missing
+- **Trade-off**: May show green/corrupted frames briefly vs. potential frame drops
 
 ### Decoder Error Handling (main.cpp:517-527)
 
@@ -1751,11 +1821,12 @@ Look for this log output from `decide_stream_mappings()`:
 
 At the end of processing:
 ```
-[DEBUG] === TimestampManager State ===
-[DEBUG]   Mode: NORMAL
-[DEBUG]   Dropped frames: 0
-[DEBUG]   Monotonicity violations: 0
+[INFO] Processing complete:
+[INFO]   Total frames: 1234
+[INFO]   Dropped frames (output seek): 0
 ```
+
+The timestamp manager tracks minimal statistics. Detailed timestamp validation (discontinuities, monotonicity, DTS constraints) is handled by FFmpeg's encoder and muxer.
 
 ### Check HLS Options
 
@@ -1769,6 +1840,14 @@ At the end of processing:
 ---
 
 ## Version History
+
+- **v2.0** (2025-01-21): Architecture documentation update
+  - Timestamp manager documentation reflects FFmpeg 8 compatibility model
+  - Environment variable configuration support
+  - HLS advanced options (`-hls_flags`, `-hls_segment_options`)
+  - Duration limiting (`-t` option)
+  - Conditional error concealment
+  - Inaccurate seeking support (`-noaccurate_seek`)
 
 - **v1.0** (2025-01-09): Initial complete pipeline documentation
   - Full end-to-end code paths

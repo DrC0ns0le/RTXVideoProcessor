@@ -153,6 +153,17 @@ int64_t setup_progress_tracking(const InputContext &in, const AVRational &fr)
             duration_sec = static_cast<double>(in.fmt->duration) / AV_TIME_BASE;
         }
 
+        // Account for input seeking: subtract seek offset from total duration
+        if (in.seek_offset_us > 0)
+        {
+            double seek_offset_sec = in.seek_offset_us / 1000000.0;
+            duration_sec -= seek_offset_sec;
+            if (duration_sec < 0.0)
+            {
+                duration_sec = 0.0;
+            }
+        }
+
         if (duration_sec > 0.0 && fr.num > 0 && fr.den > 0)
         {
             total_frames = static_cast<int64_t>(duration_sec * av_q2d(fr) + 0.5);

@@ -3,7 +3,8 @@
 #include <string>
 #include <vector>
 
-struct AudioParameters {
+struct AudioParameters
+{
     std::string codec;
     int channels = -1;
     int bitrate = -1;

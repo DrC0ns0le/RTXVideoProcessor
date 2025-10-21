@@ -169,6 +169,9 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     else
         hlsOpts.playlistType = cfg->hlsPlaylistType;
 
+    hlsOpts.customFlags = cfg->hlsFlags;
+    hlsOpts.segmentOptions = cfg->hlsSegmentOptions;
+
     out->hlsOptions = hlsOpts;
 }
 

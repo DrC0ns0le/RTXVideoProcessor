@@ -70,7 +70,6 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     // Seek to start time if specified (equivalent to FFmpeg -ss option)
     if (options && !options->seekTime.empty())
     {
-        // Parse seek time and seek to the position with AVSEEK_FLAG_ANY (noaccurate_seek behavior)
         int64_t seek_target = 0;
         int ret = av_parse_time(&seek_target, options->seekTime.c_str(), 1);
         if (ret < 0)
@@ -78,25 +77,20 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
             throw std::runtime_error("Invalid seek time format: " + options->seekTime);
         }
 
-        // Store the seek offset for A/V sync correction
         in.seek_offset_us = seek_target;
 
-        // Choose seeking strategy based on options (FFmpeg-compliant behavior)
         int seek_flags = AVSEEK_FLAG_BACKWARD;
 
-        // Apply -seek2any: Allow seeking to non-keyframes
-        if (options && options->seek2any)
+        // Apply -noaccurate_seek or -seek2any: Allow seeking to non-keyframes
+        // This enables fast seeking by using AVSEEK_FLAG_ANY
+        if (options->noAccurateSeek || options->seek2any)
         {
             seek_flags |= AVSEEK_FLAG_ANY;
-            LOG_DEBUG("Non-keyframe seeking enabled (-seek2any): AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY\n");
+            LOG_DEBUG("Fast/inaccurate seeking enabled: AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY");
         }
 
-        // Apply -seek_timestamp: Prefer timestamp-based seeking over byte-based
-        if (options && options->seekTimestamp)
-        {
+        if (options->seekTimestamp)
             seek_flags |= AVSEEK_FLAG_FRAME;
-            LOG_DEBUG("Timestamp-based seeking enabled (-seek_timestamp): added AVSEEK_FLAG_FRAME\n");
-        }
 
         ret = avformat_seek_file(in.fmt, -1, INT64_MIN, seek_target, INT64_MAX, seek_flags);
         if (ret < 0)
@@ -104,7 +98,6 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, sizeof(errbuf), ret);
             LOG_WARN("Failed to seek to time %s: %s", options->seekTime.c_str(), errbuf);
-            // Don't throw error, just continue from the beginning
             in.seek_offset_us = 0;
         }
         else
@@ -132,11 +125,15 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
     in.vdec->pkt_timebase = in.vst->time_base;
     in.vdec->framerate = av_guess_frame_rate(in.fmt, in.vst, nullptr);
 
-    // Enable error concealment for HEVC/H.264 to handle missing reference frames gracefully
-    // This is especially important after seeking where reference frames may not be available
-    in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;     // Show all frames even if corrupted
-    in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT; // Output potentially corrupted frames
-    LOG_DEBUG("Decoder error concealment enabled");
+    // Enable error concealment if requested
+    // FFmpeg default: decoder drops corrupted frames automatically
+    // With these flags: decoder outputs corrupted frames (may cause green frames after seeking)
+    if (options && options->enableErrorConcealment)
+    {
+        in.vdec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;     // Show all frames even if corrupted
+        in.vdec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT; // Output potentially corrupted frames
+        LOG_DEBUG("Decoder error concealment enabled");
+    }
 
     // Try to enable CUDA hardware decoding
     err = av_hwdevice_ctx_create(&in.hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -332,10 +329,15 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             LOG_DEBUG("Set max_delay = %s\n", value.c_str());
         }
 
-        // Only set custom hls_flags in non-FFmpeg-compatible mode
-        // Vanilla FFmpeg uses default flags (0) unless explicitly specified
+        // Set hls_flags: user-specified flags take precedence over automatic flags
         std::string hlsFlags;
-        if (!out.hlsOptions.autoDiscontinuity) // autoDiscontinuity = !ffCompatible
+        if (!out.hlsOptions.customFlags.empty())
+        {
+            // User explicitly specified hls_flags via -hls_flags option
+            hlsFlags = out.hlsOptions.customFlags;
+            LOG_DEBUG("Using user-specified hls_flags = %s\n", hlsFlags.c_str());
+        }
+        else if (!out.hlsOptions.autoDiscontinuity) // autoDiscontinuity = !ffCompatible
         {
             // FFmpeg-compatible mode: Use minimal flags, let FFmpeg handle defaults
             if (out.hlsOptions.listSize > 0)
@@ -371,6 +373,14 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
             // This tells HLS players that this is a new starting point
             av_dict_set(&muxOpts, "hls_flags", "+discont_start", AV_DICT_APPEND);
             LOG_DEBUG("Added discont_start to hls_flags for seek\n");
+        }
+
+        // Apply user-specified segment options (e.g., movflags=+frag_discont for fMP4)
+        // This is required for proper hls.js playback with fMP4 segments
+        if (!out.hlsOptions.segmentOptions.empty())
+        {
+            av_dict_set(&muxOpts, "hls_segment_options", out.hlsOptions.segmentOptions.c_str(), 0);
+            LOG_DEBUG("Set hls_segment_options = %s\n", out.hlsOptions.segmentOptions.c_str());
         }
 
         // Debug: Print all HLS options that will be passed to the muxer
@@ -617,7 +627,6 @@ void close_output(OutputContext &out)
     out.vstream = nullptr;
     out.astream = nullptr;
     out.next_audio_pts = 0;
-    out.last_audio_dts = AV_NOPTS_VALUE;
     out.a_start_pts = AV_NOPTS_VALUE;
     out.stream_decisions.clear();
     out.input_to_output_map.clear();
@@ -1414,6 +1423,14 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         // Set proper timestamp for the encoder frame
         encoder_frame->pts = out.next_audio_pts;
 
+        // CRITICAL: Advance PTS counter immediately after assignment to prevent duplicate timestamps
+        // The encoder may buffer frames (EAGAIN) before producing packets, so if we wait until
+        // receiving a packet to increment, multiple encoder frames can end up with the same PTS.
+        // This causes duplicate audio timestamps in fMP4 segments, breaking hls.js playback with
+        // BUFFER_APPENDING errors showing undefined start/end times.
+        int64_t frame_pts = out.next_audio_pts;
+        out.next_audio_pts += out.aenc->frame_size;
+
         // Encode frame
         ret = avcodec_send_frame(out.aenc, encoder_frame);
         av_frame_free(&encoder_frame);
@@ -1448,33 +1465,17 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
             // Ensure timestamps are set properly
             if (output_packet->pts == AV_NOPTS_VALUE)
             {
-                // Generate timestamps if encoder didn't set them
-                output_packet->pts = out.next_audio_pts;
-                output_packet->dts = out.next_audio_pts;
+                // Generate timestamps if encoder didn't set them (use the frame's PTS that we assigned)
+                output_packet->pts = frame_pts;
+                output_packet->dts = frame_pts;
             }
-
-            // Advance timestamp counter
-            out.next_audio_pts += out.aenc->frame_size;
 
             av_packet_rescale_ts(output_packet, out.aenc->time_base, out.astream->time_base);
 
-            // Ensure DTS monotonicity for muxer compliance
-            if (out.last_audio_dts != AV_NOPTS_VALUE && output_packet->dts != AV_NOPTS_VALUE &&
-                output_packet->dts <= out.last_audio_dts)
-            {
-                output_packet->dts = out.last_audio_dts + 1;
-            }
-
-            // Basic validation: ensure PTS >= DTS (required by muxers)
-            if (output_packet->dts != AV_NOPTS_VALUE && output_packet->pts != AV_NOPTS_VALUE &&
-                output_packet->pts < output_packet->dts)
-            {
-                LOG_WARN("Audio packet PTS < DTS, adjusting PTS to match DTS");
-                output_packet->pts = output_packet->dts;
-            }
-
-            // Update last DTS for monitoring
-            out.last_audio_dts = output_packet->dts;
+            // FFmpeg 8 compatibility: Trust encoder and muxer for DTS handling
+            // - Encoder generates DTS from PTS automatically
+            // - Muxer (av_interleaved_write_frame) validates monotonicity and DTS <= PTS
+            // - No manual intervention needed
             return true; // Packet ready
         }
     }

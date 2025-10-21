@@ -44,6 +44,8 @@ struct PipelineConfig
     std::string hlsSegmentFilename;
     std::string hlsPlaylistType;
     int hlsListSize = -1;
+    std::string hlsFlags;          // HLS muxer flags (e.g., "independent_segments", "delete_segments")
+    std::string hlsSegmentOptions; // Options to pass to segment muxer (e.g., "movflags=+frag_discont")
 
     // Stream mapping options
     std::vector<std::string> streamMaps;
@@ -55,8 +57,9 @@ struct PipelineConfig
     int audioSampleRate = -1;
     std::string audioFilter;
 
-    // Seek options
+    // Seek and duration options
     std::string seekTime;        // Input seeking (-ss before -i)
+    std::string duration;        // Duration limit (-t)
     std::string outputSeekTime;  // Output seeking (-ss after -i)
     std::string outputTsOffset;  // Output timestamp offset (-output_ts_offset)
     bool copyts = false;         // Preserve original timestamps (-copyts)

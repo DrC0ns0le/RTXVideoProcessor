@@ -55,6 +55,45 @@ static std::string lowercase_copy(std::string s)
     return s;
 }
 
+// Helper function: get environment variable as string
+static const char *get_env_var(const char *name)
+{
+    return std::getenv(name);
+}
+
+// Helper function: get environment variable as integer with default
+static int get_env_int(const char *name, int default_value)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return default_value;
+    try
+    {
+        return std::stoi(value);
+    }
+    catch (...)
+    {
+        fprintf(stderr, "Warning: Invalid integer value for %s: %s (using default: %d)\n", name, value, default_value);
+        return default_value;
+    }
+}
+
+// Helper function: get environment variable as boolean (1/true/yes = true, 0/false/no = false)
+static bool get_env_bool(const char *name, bool default_value)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return default_value;
+    std::string lower = lowercase_copy(value);
+    if (lower == "1" || lower == "true" || lower == "yes")
+        return true;
+    if (lower == "0" || lower == "false" || lower == "no")
+        return false;
+    fprintf(stderr, "Warning: Invalid boolean value for %s: %s (using default: %s)\n",
+            name, value, default_value ? "true" : "false");
+    return default_value;
+}
+
 // Helper function: check if output is a pipe/stdout
 static bool is_pipe_output(const char *path)
 {
@@ -82,30 +121,33 @@ void print_help(const char *argv0)
     fprintf(stderr, "  -d, --debug Enable debug logging\n");
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
     fprintf(stderr, "\nVSR options:\n");
-    fprintf(stderr, "  --no-vsr      Disable VSR\n");
-    fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4\n");
+    fprintf(stderr, "  --no-vsr      Disable VSR (env: RTX_NO_VSR=1)\n");
+    fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
     fprintf(stderr, "\nTHDR options:\n");
-    fprintf(stderr, "  --no-thdr     Disable THDR\n");
-    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115\n");
-    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75\n");
-    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30\n");
-    fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000\n");
+    fprintf(stderr, "  --no-thdr     Disable THDR (env: RTX_NO_THDR=1)\n");
+    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115 (env: RTX_THDR_CONTRAST)\n");
+    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75 (env: RTX_THDR_SATURATION)\n");
+    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30 (env: RTX_THDR_MIDDLE_GRAY)\n");
+    fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000 (env: RTX_THDR_MAX_LUMINANCE)\n");
     fprintf(stderr, "\nNVENC options:\n");
-    fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq\n");
-    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7\n");
-    fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp\n");
-    fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3\n");
-    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2\n");
-    fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 22\n");
-    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2\n");
+    fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
+    fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7 (env: RTX_NVENC_PRESET)\n");
+    fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp (env: RTX_NVENC_RC)\n");
+    fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3 (env: RTX_NVENC_GOP)\n");
+    fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2 (env: RTX_NVENC_BFRAMES)\n");
+    fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21 (env: RTX_NVENC_QP)\n");
+    fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2 (env: RTX_NVENC_BITRATE_MULTIPLIER)\n");
+    fprintf(stderr, "\nEnvironment variables can be used to set defaults. Command-line flags override environment variables.\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
-    fprintf(stderr, "  -hls_time <seconds>            Set target segment duration (default 4)\n");
+    fprintf(stderr, "  -hls_time <seconds>             Set target segment duration (default 4)\n");
     fprintf(stderr, "  -hls_segment_type <mpegts|fmp4> Select segment container (default fmp4)\n");
     fprintf(stderr, "  -hls_segment_filename <pattern> Segment naming pattern (auto-generated)\n");
     fprintf(stderr, "  -hls_fmp4_init_filename <file>  Initialization segment path for fMP4\n");
     fprintf(stderr, "  -start_number <n>               Starting segment number (default 0)\n");
     fprintf(stderr, "  -hls_playlist_type <type>       Playlist type (event, vod, live)\n");
     fprintf(stderr, "  -hls_list_size <count>          Playlist size (0 = keep all segments)\n");
+    fprintf(stderr, "  -hls_flags <flags>              HLS muxer flags (e.g., independent_segments, delete_segments)\n");
+    fprintf(stderr, "  -hls_segment_options <opts>     Options to pass to segment muxer (e.g., movflags=+frag_discont)\n");
 }
 
 // Parse arguments in FFmpeg-compatible mode (-i input -f format output)
@@ -264,6 +306,24 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "-hls_flags")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_flags requires a value\n");
+                exit(1);
+            }
+            cfg->hlsFlags = argv[++i];
+        }
+        else if (arg == "-hls_segment_options")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-hls_segment_options requires a value\n");
+                exit(1);
+            }
+            cfg->hlsSegmentOptions = argv[++i];
+        }
         else if (arg == "-map")
         {
             if (i + 1 >= argc)
@@ -366,6 +426,15 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             {
                 cfg->outputSeekTime = argv[++i];
             }
+        }
+        else if (arg == "-t")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-t requires a time value\n");
+                exit(1);
+            }
+            cfg->duration = argv[++i];
         }
         else if (arg == "-copyts")
         {
@@ -668,6 +737,32 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "-hls_flags")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsFlags = argv[++i];
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_flags\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-hls_segment_options")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->hlsSegmentOptions = argv[++i];
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -hls_segment_options\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
         else if (arg == "-max_delay")
         {
             if (i + 1 < argc)
@@ -852,24 +947,28 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
         exit(1);
     }
 
-    // Set default values
-    cfg->rtxCfg.enableVSR = true;
+    // Set default values (with environment variable overrides)
+    // Command-line flags will override these
+    cfg->rtxCfg.enableVSR = !get_env_bool("RTX_NO_VSR", false);
     cfg->rtxCfg.scaleFactor = 2;
-    cfg->rtxCfg.vsrQuality = 4;
+    cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
-    cfg->rtxCfg.enableTHDR = true;
-    cfg->rtxCfg.thdrContrast = 115;
-    cfg->rtxCfg.thdrSaturation = 75;
-    cfg->rtxCfg.thdrMiddleGray = 30;
-    cfg->rtxCfg.thdrMaxLuminance = 1000;
+    cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);
+    cfg->rtxCfg.thdrContrast = get_env_int("RTX_THDR_CONTRAST", 115);
+    cfg->rtxCfg.thdrSaturation = get_env_int("RTX_THDR_SATURATION", 75);
+    cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 30);
+    cfg->rtxCfg.thdrMaxLuminance = get_env_int("RTX_THDR_MAX_LUMINANCE", 1000);
 
-    cfg->tune = "hq";
-    cfg->preset = "p7";
-    cfg->rc = "constqp";
-    cfg->gop = 3; // 3 seconds GOP for HLS compatibility
-    cfg->bframes = 2;
-    cfg->qp = 22;
-    cfg->targetBitrateMultiplier = 2;
+    const char *env_tune = get_env_var("RTX_NVENC_TUNE");
+    cfg->tune = env_tune ? env_tune : "hq";
+    const char *env_preset = get_env_var("RTX_NVENC_PRESET");
+    cfg->preset = env_preset ? env_preset : "p7";
+    const char *env_rc = get_env_var("RTX_NVENC_RC");
+    cfg->rc = env_rc ? env_rc : "constqp";
+    cfg->gop = get_env_int("RTX_NVENC_GOP", 3);
+    cfg->bframes = get_env_int("RTX_NVENC_BFRAMES", 2);
+    cfg->qp = get_env_int("RTX_NVENC_QP", 21);
+    cfg->targetBitrateMultiplier = get_env_int("RTX_NVENC_BITRATE_MULTIPLIER", 2);
 
     // Determine parsing mode: simple (input output [opts]) vs FFmpeg-compatible (-i input -f format output)
     // Simple mode: first arg is input file (positional)

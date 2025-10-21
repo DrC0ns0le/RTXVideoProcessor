@@ -43,6 +43,8 @@ struct HlsMuxOptions
     std::string playlistType;
     int listSize = -1;
     bool autoDiscontinuity = true; // Automatically mark discontinuity on seek (legacy default, FFmpeg doesn't do this)
+    std::string customFlags;       // User-specified HLS flags via -hls_flags (e.g., "independent_segments")
+    std::string segmentOptions;    // Options to pass to segment muxer via hls_segment_options (e.g., "movflags=+frag_discont")
 };
 
 // FFmpeg-compatible timestamp handling modes
@@ -113,11 +115,7 @@ struct OutputContext
     // Audio buffering for fixed frame sizes
     AVAudioFifo *audio_fifo = nullptr;
     int64_t next_audio_pts = 0;
-    int64_t last_audio_dts = AV_NOPTS_VALUE;
     int64_t a_start_pts = AV_NOPTS_VALUE; // First audio PTS for baseline
-
-    // Video DTS tracking for monotonicity enforcement
-    int64_t last_video_dts = AV_NOPTS_VALUE;
 
     // Stream mapping: final decision for each input stream
     std::vector<StreamMapDecision> stream_decisions;
@@ -125,8 +123,4 @@ struct OutputContext
     std::vector<int> input_to_output_map;
     HlsMuxOptions hlsOptions;
     AVDictionary *muxOptions = nullptr;
-
-    // FFmpeg-compatible timestamp options
-    AvoidNegativeTs avoidNegativeTs = AvoidNegativeTs::AUTO;
-    bool startAtZero = false;
 };

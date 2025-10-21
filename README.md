@@ -100,7 +100,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`)
 - **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 1)
 - **`--nvenc-bframes <int>`**: Maximum B-frame count (default 2)
-- **`--nvenc-qp <int>`**: Constant QP (default 22 when `constqp` is active)
+- **`--nvenc-qp <int>`**: Constant QP (default 21 when `constqp` is active)
 - **`--nvenc-bitrate-multiplier <int>`**: Bitrate multiplier (default 5×, fallback 25 Mbps)
 
 ### FFmpeg-Compatible Mode Only
@@ -170,7 +170,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - Can be manually disabled with `--no-thdr`
 
 - **NVENC**
-  - Uses Main10 profile, constant QP 22, preset `p7`, tune `hq`
+  - Uses Main10 profile, constant QP 21, preset `p7`, tune `hq`
   - GOP length: `3 × fps` frames
   - B-frames: 2 (default)
   - Bitrate: `input_bitrate × 5` (fallback: 25 Mbps if unknown)
