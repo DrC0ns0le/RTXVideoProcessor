@@ -312,6 +312,20 @@ int run_pipeline(PipelineConfig cfg)
         inputOpts.seekTimestamp = cfg.seekTimestamp;
         // FFmpeg compatibility: Disable non-standard behaviors
         inputOpts.enableErrorConcealment = !cfg.ffCompatible; // FFmpeg doesn't enable error concealment by default
+
+        // COPYTS + noaccurate_seek edge case:
+        // When using COPYTS mode with inaccurate seeking, dropped frames create PTS gaps.
+        // NORMAL mode handles this via baseline adjustment, but COPYTS preserves original PTS.
+        // Enable error concealment to output all frames (even corrupted) and prevent PTS gaps.
+        if (cfg.copyts && !cfg.seekTime.empty() && (cfg.noAccurateSeek || cfg.seek2any))
+        {
+            if (!inputOpts.enableErrorConcealment)
+            {
+                LOG_INFO("Enabling error concealment for COPYTS+noaccurate_seek (prevents PTS gaps from dropped frames)");
+                inputOpts.enableErrorConcealment = true;
+            }
+        }
+
         inputOpts.flushOnSeek = false;                        // FFmpeg never flushes decoder on seek
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
@@ -509,6 +523,14 @@ int run_pipeline(PipelineConfig cfg)
         ts_config.input_seek_us = in.seek_offset_us;
         ts_config.start_at_zero = cfg.startAtZero;
 
+        // Configure CFR mode if -vsync cfr is specified
+        if (cfg.vsync == "cfr" || cfg.vsync == "0")
+        {
+            ts_config.vsync_cfr = true;
+            ts_config.cfr_frame_rate = fr;
+            LOG_INFO("CFR mode enabled: constant frame rate at %d/%d fps", fr.num, fr.den);
+        }
+
         // Parse output seeking time (optional frame dropping - could use muxer's -t duration instead)
         if (!cfg.outputSeekTime.empty())
         {
@@ -632,6 +654,22 @@ int run_pipeline(PipelineConfig cfg)
 
                     AVFrame *decframe = frame.get();
 
+                    // Accurate seeking: Discard frames before seek target (only if accurate seek is enabled)
+                    // When seeking to a timestamp, avformat_seek_file() seeks to the nearest keyframe BEFORE the target.
+                    // The decoder then outputs all frames from that keyframe onwards.
+                    // FFmpeg's default behavior (accurate_seek) is to decode but discard frames before the target.
+                    // Respect user's -noaccurate_seek flag - don't discard if they disabled accurate seeking.
+                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && decframe->pts != AV_NOPTS_VALUE)
+                    {
+                        int64_t frame_time_us = av_rescale_q(decframe->pts, in.vst->time_base, {1, AV_TIME_BASE});
+                        if (frame_time_us < in.seek_offset_us)
+                        {
+                            // Frame is before seek target - discard it (accurate seeking behavior)
+                            av_frame_unref(frame.get());
+                            continue;
+                        }
+                    }
+
                     // Duration limit: Stop processing when we've reached the requested duration
                     if (duration_us > 0 && decframe->pts != AV_NOPTS_VALUE)
                     {
@@ -714,6 +752,19 @@ int run_pipeline(PipelineConfig cfg)
                             break;
                         ff_check(ret, "receive audio frame");
 
+                        // Accurate seeking: Discard audio frames before seek target (only if accurate seek enabled)
+                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && audio_frame->pts != AV_NOPTS_VALUE)
+                        {
+                            AVStream *ast = in.fmt->streams[in.astream];
+                            int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
+                            if (frame_time_us < in.seek_offset_us)
+                            {
+                                // Audio frame is before seek target - discard it
+                                av_frame_unref(audio_frame.get());
+                                continue;
+                            }
+                        }
+
                         // Use the helper function to process audio
                         if (process_audio_frame(audio_frame.get(), out, opkt.get()))
                         {
@@ -737,6 +788,18 @@ int run_pipeline(PipelineConfig cfg)
                     {
                         AVStream *ist = in.fmt->streams[pkt->stream_index];
                         AVStream *ost = out.fmt->streams[out_index];
+
+                        // Accurate seeking: Discard audio packets before seek target (only if accurate seek enabled)
+                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && pkt->pts != AV_NOPTS_VALUE)
+                        {
+                            int64_t pkt_time_us = av_rescale_q(pkt->pts, ist->time_base, {1, AV_TIME_BASE});
+                            if (pkt_time_us < in.seek_offset_us)
+                            {
+                                // Audio packet is before seek target - discard it
+                                av_packet_unref(pkt.get());
+                                continue;
+                            }
+                        }
 
                         // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
                         // Default mode and FFmpeg+copyts use simple passthrough

@@ -35,6 +35,8 @@ public:
         int64_t input_seek_us = 0;         // Input seeking offset (-ss)
         int64_t output_seek_target_us = 0; // Output seeking target (frame dropping)
         bool start_at_zero = false;        // -start_at_zero flag
+        bool vsync_cfr = false;            // CFR mode: generate timestamps at constant frame rate
+        AVRational cfr_frame_rate = {0, 1}; // Frame rate for CFR mode
     };
 
     explicit TimestampManager(const Config &config) : cfg_(config)
@@ -55,6 +57,21 @@ public:
                            AVRational in_time_base,
                            AVRational out_time_base)
     {
+        // CFR mode: generate constant frame rate timestamps
+        if (cfg_.vsync_cfr)
+        {
+            // Calculate PTS directly from frame counter to avoid rounding error accumulation
+            // Convert frame_counter (in frame units) to output timebase
+            // This ensures perfect timing: frame N has PTS = N * (1/fps) in output timebase
+            //
+            // Example: 24fps, frame 24 should be at exactly 1 second
+            //   av_rescale_q(24, {1, 24}, {1, 16000}) = 16000 (exact)
+            //   vs. 24 * 666 = 15984 (accumulated error from integer division)
+            int64_t cfr_pts = av_rescale_q(frame_counter_, av_inv_q(cfg_.cfr_frame_rate), out_time_base);
+            frame_counter_++;
+            return cfr_pts;
+        }
+
         // Get input PTS
         int64_t in_pts = (frame->pts != AV_NOPTS_VALUE)
                              ? frame->pts
@@ -200,26 +217,38 @@ private:
      */
     int64_t deriveNormalPTS(int64_t in_pts, AVRational in_tb, AVRational out_tb)
     {
-        // Establish baseline from first frame
+        // Establish baseline
         // FFmpeg behavior: output timestamps always start at 0 (without -copyts)
         if (video_baseline_pts_ == AV_NOPTS_VALUE)
         {
-            video_baseline_pts_ = in_pts;
-            LOG_DEBUG("Video baseline established from first frame: %lld (input timebase)", video_baseline_pts_);
+            // When seeking is used, use the seek target as baseline to ensure A/V sync
+            // This is critical because:
+            // - With accurate_seek: first frame IS the target (baseline = first frame = target) ✓
+            // - With noaccurate_seek: first frame is BEFORE target (baseline must be target for A/V sync) ✓
+            if (cfg_.input_seek_us > 0)
+            {
+                video_baseline_pts_ = av_rescale_q(cfg_.input_seek_us, {1, AV_TIME_BASE}, in_tb);
+                LOG_DEBUG("Video baseline set from seek target: %lld us -> %lld (input timebase)",
+                         cfg_.input_seek_us, video_baseline_pts_);
+            }
+            else
+            {
+                video_baseline_pts_ = in_pts;
+                LOG_DEBUG("Video baseline established from first frame: %lld (input timebase)", video_baseline_pts_);
+            }
         }
 
         // Calculate relative PTS (zero-based output)
-        // Example: if first frame is at 60s, baseline=60s, so output PTS starts at 0
         int64_t relative_pts = in_pts - video_baseline_pts_;
 
         // Rescale to output timebase
         int64_t out_pts = av_rescale_q_rnd(relative_pts, in_tb, out_tb, AV_ROUND_NEAR_INF);
 
         // FFmpeg behavior: clamp negative timestamps to zero
-        // This can happen if frames arrive out of order or decoder issues
+        // This can happen with noaccurate_seek when first frame is before seek target
         if (out_pts < 0)
         {
-            LOG_DEBUG("Negative PTS %lld in NORMAL mode, clamping to 0", out_pts);
+            LOG_DEBUG("Negative PTS %lld in NORMAL mode (frame before seek target), clamping to 0", out_pts);
             out_pts = 0;
         }
 

@@ -55,6 +55,16 @@ bool configure_input_hdr_detection(PipelineConfig &cfg, InputContext &in)
         inputOpts.seek2any = cfg.seek2any;
         inputOpts.seekTimestamp = cfg.seekTimestamp;
         inputOpts.enableErrorConcealment = !cfg.ffCompatible;
+
+        // COPYTS + noaccurate_seek: Enable error concealment to prevent PTS gaps
+        if (cfg.copyts && !cfg.seekTime.empty() && (cfg.noAccurateSeek || cfg.seek2any))
+        {
+            if (!inputOpts.enableErrorConcealment)
+            {
+                inputOpts.enableErrorConcealment = true;
+            }
+        }
+
         inputOpts.flushOnSeek = false;
         open_input(cfg.inputPath, in, &inputOpts);
         LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");

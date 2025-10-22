@@ -138,6 +138,9 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21 (env: RTX_NVENC_QP)\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2 (env: RTX_NVENC_BITRATE_MULTIPLIER)\n");
     fprintf(stderr, "\nEnvironment variables can be used to set defaults. Command-line flags override environment variables.\n");
+    fprintf(stderr, "\nInput/Demuxer options:\n");
+    fprintf(stderr, "  -fflags <flags>                 Format flags (e.g., +genpts to generate PTS, +igndts to ignore DTS)\n");
+    fprintf(stderr, "  -seek_timestamp <0|1>           Use timestamp-based seeking (AVSEEK_FLAG_FRAME)\n");
     fprintf(stderr, "\nHLS options (detected automatically for .m3u8 outputs):\n");
     fprintf(stderr, "  -hls_time <seconds>             Set target segment duration (default 4)\n");
     fprintf(stderr, "  -hls_segment_type <mpegts|fmp4> Select segment container (default fmp4)\n");
@@ -148,6 +151,8 @@ void print_help(const char *argv0)
     fprintf(stderr, "  -hls_list_size <count>          Playlist size (0 = keep all segments)\n");
     fprintf(stderr, "  -hls_flags <flags>              HLS muxer flags (e.g., independent_segments, delete_segments)\n");
     fprintf(stderr, "  -hls_segment_options <opts>     Options to pass to segment muxer (e.g., movflags=+frag_discont)\n");
+    fprintf(stderr, "\nFFmpeg timestamp options:\n");
+    fprintf(stderr, "  -vsync cfr                      Enable constant frame rate mode (evenly spaced timestamps)\n");
 }
 
 // Parse arguments in FFmpeg-compatible mode (-i input -f format output)
@@ -452,6 +457,23 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
             cfg->avoidNegativeTs = argv[++i];
+        }
+        else if (arg == "-vsync")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-vsync requires a value\n");
+                fprintf(stderr, "Supported modes: cfr (constant frame rate)\n");
+                exit(1);
+            }
+            cfg->vsync = argv[++i];
+            // Validate supported modes
+            if (cfg->vsync != "cfr" && cfg->vsync != "0")
+            {
+                fprintf(stderr, "Unsupported -vsync mode: %s\n", cfg->vsync.c_str());
+                fprintf(stderr, "Only 'cfr' is currently supported\n");
+                exit(1);
+            }
         }
         else if (arg == "-output_ts_offset")
         {

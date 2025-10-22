@@ -70,6 +70,7 @@ struct PipelineConfig
     // Timestamp handling options (FFmpeg compatibility)
     std::string avoidNegativeTs = "auto"; // FFmpeg -avoid_negative_ts (auto/make_zero/make_non_negative/disabled)
     bool startAtZero = false;             // FFmpeg -start_at_zero
+    std::string vsync;                    // FFmpeg -vsync (passthrough/cfr/vfr/drop/auto) - default: auto
 
     // Muxer options (essential - affect output structure/playback)
     std::string movflags;        // User-specified movflags (-movflags)

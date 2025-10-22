@@ -860,13 +860,15 @@ struct Config {
     int64_t input_seek_us = 0;         // Input seeking offset (-ss)
     int64_t output_seek_target_us = 0; // Output seeking target (frame dropping)
     bool start_at_zero = false;        // -start_at_zero flag
+    bool vsync_cfr = false;            // CFR mode: generate timestamps at constant frame rate
+    AVRational cfr_frame_rate = {0, 1}; // Frame rate for CFR mode
 };
 ```
 
 **Timestamp Modes**:
 ```
 NORMAL mode:
-    ├─ Establishes baseline from first frame PTS
+    ├─ Establishes baseline from first frame PTS (or seek target if seeking)
     ├─ Outputs zero-based timestamps (relative to baseline)
     └─ Clamps negative PTS to zero
 
@@ -874,6 +876,11 @@ COPYTS mode:
     ├─ Preserves original input timestamps
     ├─ Optionally shifts with -start_at_zero (subtracts first frame PTS)
     └─ Clamps negative PTS to zero
+
+CFR mode (-vsync cfr):
+    ├─ Generates constant frame rate timestamps
+    ├─ PTS = frame_counter * (1/fps) in output timebase
+    └─ Useful for fixing variable frame rate issues
 ```
 
 ---
@@ -957,13 +964,17 @@ while (true) {
 ```
 avcodec_receive_frame()
     ↓
+Accurate seeking: Discard frames before seek target [main.cpp:657-671]
+    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+        └─ If frame_time_us < in.seek_offset_us: drop frame
+            ↓
 Check for output seeking [lines 573-577]
     └─ ts_manager.shouldDropFrameForOutputSeek()
         └─ If before target: drop frame
             ↓
 Establish global baseline [lines 579-583]
     └─ ts_manager.establishGlobalBaseline()
-        └─ Sets baseline from first frame PTS
+        └─ Sets baseline from first frame PTS (or seek target if seeking)
             ↓
 [Proceeds to Step 4.3]
 ```
@@ -1108,6 +1119,10 @@ int64_t pts = ts_manager.deriveVideoPTS(
 decframe->pts = pts;
 // DTS is handled entirely by encoder (no manual assignment needed)
 
+// CFR mode: timestamps are generated at constant frame rate
+// NORMAL mode: zero-based timestamps relative to baseline (or seek target)
+// COPYTS mode: preserves original timestamps
+
 // Send to encoder
 encode_and_write(out.venc, out.vstream, out.fmt, out,
                  decframe, opkt, "encode video");
@@ -1143,6 +1158,10 @@ while (avcodec_receive_packet(enc, opkt) == 0) {
 // Decode audio packet
 ret = avcodec_send_packet(in.adec, pkt.get());
 while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
+
+    // Accurate seeking: Discard audio frames before seek target [main.cpp:755-767]
+    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+        └─ If frame_time_us < in.seek_offset_us: drop frame
 
     // Process through filter and encoder
     process_audio_frame(aframe.get(), out, opkt.get())
@@ -1184,6 +1203,10 @@ while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
 **Packet Timestamp Handling** (src/timestamp_manager.h:121-135):
 
 ```cpp
+// Accurate seeking: Discard audio packets before seek target [main.cpp:792-804]
+└─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+    └─ If pkt_time_us < in.seek_offset_us: drop packet
+
 // Rescale timestamps from input to output timebase
 AVStream *out_stream = out.fmt->streams[out_stream_idx];
 ts_manager.rescalePacketTimestamps(pkt.get(),
@@ -1524,6 +1547,10 @@ if (options && options->enableErrorConcealment) {
 **Behavior**:
 - **Simple mode** (enableErrorConcealment=true): Shows frames with artifacts instead of dropping
 - **FFmpeg-Compatible mode** (enableErrorConcealment=false): Strict FFmpeg behavior - decoder drops corrupted frames automatically
+- **Special case** (COPYTS + noaccurate_seek): Error concealment is force-enabled to prevent PTS gaps
+  - Location: main.cpp:315-325, input_config.cpp:58-67
+  - Reason: Inaccurate seeking with COPYTS preserves original PTS values, but dropped frames create gaps
+  - Solution: Output all frames (even corrupted) to maintain continuous PTS sequence
 - **Use case**: Seeking to non-keyframes (`-seek2any 1`) where reference frames may be missing
 - **Trade-off**: May show green/corrupted frames briefly vs. potential frame drops
 
@@ -1716,6 +1743,26 @@ LOG_DEBUG("Non-HLS: Using input stream timebase %d/%d for encoder",
 
 The timestamp manager uses several performance optimization techniques:
 
+#### CFR Mode Performance (timestamp_manager.h:60-72)
+
+**Technique**: Direct PTS calculation from frame counter to avoid rounding error accumulation
+
+```cpp
+// CFR mode: generate constant frame rate timestamps
+if (cfg_.vsync_cfr) {
+    // Calculate PTS directly from frame counter to avoid rounding error accumulation
+    // Convert frame_counter (in frame units) to output timebase
+    // Example: 24fps, frame 24 should be at exactly 1 second
+    //   av_rescale_q(24, {1, 24}, {1, 16000}) = 16000 (exact)
+    //   vs. 24 * 666 = 15984 (accumulated error from integer division)
+    int64_t cfr_pts = av_rescale_q(frame_counter_, av_inv_q(cfg_.cfr_frame_rate), out_time_base);
+    frame_counter_++;
+    return cfr_pts;
+}
+```
+
+**Benefit**: Perfect timing without accumulated rounding errors from incremental PTS calculation
+
 #### Function Pointer Strategy (timestamp_manager.h:22)
 
 **Technique**: Pre-computes mode-dependent behavior flags to avoid branches in hot path
@@ -1752,6 +1799,34 @@ pkt->pts = av_rescale_q(adjusted_us, {1, AV_TIME_BASE}, in_tb);
 ```
 
 Instead of multiple rescale operations per timestamp field
+
+#### Improved Baseline PTS Calculation for Seeking (timestamp_manager.h:220-241)
+
+**Problem**: With `-noaccurate_seek`, first decoded frame may be BEFORE the seek target (e.g., seek to 10s, first frame at 8s)
+
+**Old behavior**: Baseline = first frame PTS (8s)
+- Result: Output starts at 0s but represents content from 8s-10s
+- Issue: Audio/video desync because audio uses seek target as baseline
+
+**New behavior**: Baseline = seek target when seeking is active (10s)
+- First frame at 8s: PTS = 8s - 10s = -2s → clamped to 0s (dropped or shown briefly)
+- First frame at 10s: PTS = 10s - 10s = 0s ✓
+- Result: Perfect A/V sync regardless of accurate_seek setting
+
+```cpp
+// Establish baseline (timestamp_manager.h:220-241)
+if (video_baseline_pts_ == AV_NOPTS_VALUE) {
+    if (cfg_.input_seek_us > 0) {
+        // Use seek target as baseline for A/V sync
+        video_baseline_pts_ = av_rescale_q(cfg_.input_seek_us, {1, AV_TIME_BASE}, in_tb);
+    } else {
+        // No seeking: use first frame
+        video_baseline_pts_ = in_pts;
+    }
+}
+```
+
+**Benefit**: Ensures A/V synchronization with both accurate and inaccurate seeking modes
 
 ### 7. CpuProcessor Dynamic Configuration
 

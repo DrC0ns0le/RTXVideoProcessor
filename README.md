@@ -126,6 +126,11 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-ar <rate>`**: Audio sample rate
 - **`-af <filter>`**: Audio filter chain
 
+**Input/Demuxer Options**
+- **`-fflags <flags>`**: Format flags for input demuxer (e.g., `+genpts` to generate missing PTS)
+  - Must be specified before `-i` in FFmpeg-compatible mode
+  - Common flags: `+genpts` (generate presentation timestamps), `+igndts` (ignore DTS)
+
 **Seeking & Timestamps**
 - **`-ss <time>`**: Seek to position (before `-i` for input seek, after for output seek)
 - **`-t <duration>`**: Limit output duration
@@ -135,7 +140,12 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-output_ts_offset <time>`**: Add offset to output timestamps
 - **`-noaccurate_seek`**: Fast seek to nearest keyframe
 - **`-seek2any <0|1>`**: Allow seeking to non-keyframes (may cause artifacts)
-- **`-seek_timestamp <0|1>`**: Prefer timestamp-based seeking
+- **`-seek_timestamp <0|1>`**: Use timestamp-based seeking (AVSEEK_FLAG_FRAME)
+  - When enabled (1), seeks by frame timestamps instead of byte positions
+  - Works in combination with `-ss` seeking option
+- **`-vsync <mode>`**: Video synchronization mode
+  - `cfr`: Constant frame rate - generates evenly spaced timestamps
+  - Useful for fixing variable frame rate issues or ensuring consistent playback timing
 
 **HLS Streaming**
 - **`-format hls`**: Enable HLS output (output must be `.m3u8`)
@@ -154,7 +164,6 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-use_editlist <0|1>`**: Use MP4 edit lists
 - **`-max_muxing_queue_size <packets>`**: Maximum muxing queue size
 - **`-max_delay <microseconds>`**: Maximum muxing delay
-- **`-fflags <flags>`**: Format flags (e.g., `+genpts`)
 
 ## Notes on Default Configuration
 
@@ -243,6 +252,9 @@ RTXVideoProcessor.exe -i input.mp4 -ss 00:01:00 -t 30 output.mp4
 
 # Preserve original timestamps
 RTXVideoProcessor.exe -i input.mp4 -copyts -avoid_negative_ts disabled output.mp4
+
+# Force constant frame rate (fix VFR issues)
+RTXVideoProcessor.exe -i input.mp4 -vsync cfr output.mp4
 
 # HLS streaming output (fMP4 segments)
 RTXVideoProcessor.exe -i input.mp4 -format hls -hls_time 6 \
