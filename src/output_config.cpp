@@ -1,8 +1,7 @@
 #include "output_config.h"
 #include "logger.h"
+#include "utils.h"
 
-#include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -13,23 +12,6 @@ extern "C"
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/mastering_display_metadata.h>
-}
-
-// String utility: check if string ends with suffix
-bool endsWith(const std::string &str, const std::string &suffix)
-{
-    if (suffix.size() > str.size())
-        return false;
-    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-// String utility: convert to lowercase
-std::string lowercase_copy(const std::string &s)
-{
-    std::string result = s;
-    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c)
-                   { return static_cast<char>(std::tolower(c)); });
-    return result;
 }
 
 // Check if output is a pipe/stdout
@@ -171,6 +153,19 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
 
     hlsOpts.customFlags = cfg->hlsFlags;
     hlsOpts.segmentOptions = cfg->hlsSegmentOptions;
+
+    // HLS fMP4 + copyts + avoid_negative_ts disabled requires segment muxer override
+    // Segment muxers inherit avoid_negative_ts=disabled, causing large timestamps in tfdt boxes
+    // With synchronized A/V timestamps (audio now uses copyts too), we still need normalization
+    // to prevent hls.js from rejecting tfdt values
+    if (useFmp4 && cfg->copyts && cfg->avoidNegativeTs == "disabled")
+    {
+        if (!hlsOpts.segmentOptions.empty())
+            hlsOpts.segmentOptions += ":avoid_negative_ts=make_zero";
+        else
+            hlsOpts.segmentOptions = "avoid_negative_ts=make_zero";
+        LOG_INFO("HLS: Injected avoid_negative_ts=make_zero into segment options for tfdt normalization");
+    }
 
     out->hlsOptions = hlsOpts;
 }

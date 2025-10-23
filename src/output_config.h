@@ -4,10 +4,6 @@
 #include "ffmpeg_utils.h"
 #include <string>
 
-// String utility functions
-bool endsWith(const std::string &str, const std::string &suffix);
-std::string lowercase_copy(const std::string &s);
-
 // Output detection helpers
 bool is_pipe_output(const char *path);
 bool will_use_hls_output(const PipelineConfig &cfg);

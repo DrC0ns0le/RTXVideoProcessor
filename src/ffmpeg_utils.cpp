@@ -380,7 +380,11 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         if (!out.hlsOptions.segmentOptions.empty())
         {
             av_dict_set(&muxOpts, "hls_segment_options", out.hlsOptions.segmentOptions.c_str(), 0);
-            LOG_DEBUG("Set hls_segment_options = %s\n", out.hlsOptions.segmentOptions.c_str());
+            LOG_INFO("HLS: Applied segment options: %s (passed to individual segment muxers)\n", out.hlsOptions.segmentOptions.c_str());
+        }
+        else if (out.hlsOptions.segmentType == "fmp4")
+        {
+            LOG_INFO("HLS: No custom segment options specified. Using default movflags (+frag_discont+frag_keyframe) from main muxer.\n");
         }
 
         // Debug: Print all HLS options that will be passed to the muxer
@@ -1268,9 +1272,20 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
     if (out.a_start_pts == AV_NOPTS_VALUE && input_frame->pts != AV_NOPTS_VALUE)
     {
         out.a_start_pts = input_frame->pts;
-        // If we have a seek offset, we need to account for it
-        // The next_audio_pts should represent the output time from seek point
-        // So we keep the already calculated next_audio_pts from init_audio_pts_after_seek
+
+        // COPYTS mode: Initialize next_audio_pts from input timestamps to maintain A/V sync
+        // This ensures audio timestamps match video timeline (e.g., both start at 24s)
+        // Required for proper HLS tfdt calculation: tfdt = cluster[0].dts - start_dts
+        if (out.audioConfig.copyts)
+        {
+            // Rescale input PTS to output timebase
+            int64_t rescaled_pts = av_rescale_q(input_frame->pts,
+                                                 input_frame->time_base,
+                                                 out.aenc->time_base);
+            out.next_audio_pts = rescaled_pts;
+            LOG_DEBUG("COPYTS: Initialized audio PTS from first frame: %lld (input) -> %lld (output timebase)",
+                      input_frame->pts, rescaled_pts);
+        }
     }
 
     // Apply audio filter if configured

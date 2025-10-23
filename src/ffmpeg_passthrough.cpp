@@ -1,4 +1,5 @@
 #include "ffmpeg_passthrough.h"
+#include "utils.h"
 
 #include <string>
 #include <vector>
@@ -7,7 +8,6 @@
 #include <cerrno>
 #include <filesystem>
 #include <system_error>
-#include <algorithm>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -19,14 +19,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
-
-// Helper function to check if a string ends with a suffix
-static bool endsWith(const std::string &str, const std::string &suffix)
-{
-    if (suffix.size() > str.size())
-        return false;
-    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
 
 #ifdef _WIN32
 // Find ffmpeg.exe on the system PATH

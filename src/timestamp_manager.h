@@ -37,6 +37,7 @@ public:
         bool start_at_zero = false;        // -start_at_zero flag
         bool vsync_cfr = false;            // CFR mode: generate timestamps at constant frame rate
         AVRational cfr_frame_rate = {0, 1}; // Frame rate for CFR mode
+        bool clamp_negative_copyts = true; // If false, allow negative PTS in COPYTS (avoid_negative_ts=disabled)
     };
 
     explicit TimestampManager(const Config &config) : cfg_(config)
@@ -201,8 +202,8 @@ private:
             out_pts -= copyts_baseline_pts_;
         }
 
-        // Clamp negative timestamps to zero
-        if (out_pts < 0)
+        // Clamp negative timestamps only if requested
+        if (out_pts < 0 && cfg_.clamp_negative_copyts)
         {
             LOG_DEBUG("Negative PTS %lld in COPYTS mode, clamping to 0", out_pts);
             out_pts = 0;

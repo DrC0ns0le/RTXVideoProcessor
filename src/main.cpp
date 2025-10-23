@@ -63,6 +63,7 @@ extern "C"
 #include "config_parser.h"
 #include "input_config.h"
 #include "output_config.h"
+#include "utils.h"
 
 // Compatibility for older FFmpeg versions
 #ifndef AV_FRAME_FLAG_KEY
@@ -116,36 +117,39 @@ static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, 
                                                   FramePtr &bgra_frame, FramePtr &p010_frame,
                                                   const InputContext &in, const OutputContext &out)
 {
-    // Initialize CUDA frame pool if using CUDA path
     if (use_cuda_path)
     {
+        // Initialize CUDA frame pool for GPU path
         const int POOL_SIZE = 8; // Adjust based on your needs
         cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
     }
+    else
+    {
+        // Allocate CPU resources only when using CPU path
+        // CpuProcessor manages its own internal buffers, but these are needed for the main pipeline
+        p010_frame->format = AV_PIX_FMT_P010LE;
+        p010_frame->width = dstW;
+        p010_frame->height = dstH;
+        ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
 
-    // Prepare CPU fallback buffers and sws_to_p010 even if CUDA path is enabled, to allow on-the-fly fallback
-    p010_frame->format = AV_PIX_FMT_P010LE;
-    p010_frame->width = dstW;
-    p010_frame->height = dstH;
-    ff_check(av_frame_get_buffer(p010_frame.get(), 32), "alloc p010");
+        // CPU path colorspace for RGB(A)->P010
+        sws_to_p010 = sws_getContext(
+            dstW, dstH, AV_PIX_FMT_X2BGR10LE,
+            dstW, dstH, AV_PIX_FMT_P010LE,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_to_p010)
+            throw std::runtime_error("sws_to_p010 alloc failed");
+        const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
+        sws_setColorspaceDetails(sws_to_p010,
+                                 coeffs_bt2020, 1,
+                                 coeffs_bt2020, 0,
+                                 0, 1 << 16, 1 << 16);
 
-    // CPU path colorspace for RGB(A)->P010
-    sws_to_p010 = sws_getContext(
-        dstW, dstH, AV_PIX_FMT_X2BGR10LE,
-        dstW, dstH, AV_PIX_FMT_P010LE,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_to_p010)
-        throw std::runtime_error("sws_to_p010 alloc failed");
-    const int *coeffs_bt2020 = sws_getCoefficients(SWS_CS_BT2020);
-    sws_setColorspaceDetails(sws_to_p010,
-                             coeffs_bt2020, 1,
-                             coeffs_bt2020, 0,
-                             0, 1 << 16, 1 << 16);
-
-    bgra_frame->format = AV_PIX_FMT_RGBA;
-    bgra_frame->width = in.vdec->width;
-    bgra_frame->height = in.vdec->height;
-    ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
+        bgra_frame->format = AV_PIX_FMT_RGBA;
+        bgra_frame->width = in.vdec->width;
+        bgra_frame->height = in.vdec->height;
+        ff_check(av_frame_get_buffer(bgra_frame.get(), 32), "alloc bgra");
+    }
 }
 
 // Helper function for RTX processor initialization
@@ -345,6 +349,7 @@ int run_pipeline(PipelineConfig cfg)
         {
             out.audioConfig.enabled = true;
             out.audioConfig.codec = cfg.audioCodec.empty() ? "aac" : cfg.audioCodec;
+            out.audioConfig.copyts = cfg.copyts; // Pass copyts mode to audio encoder
         }
 
         LOG_DEBUG("Opening output...");
@@ -373,8 +378,6 @@ int run_pipeline(PipelineConfig cfg)
         std::string progress_bar(50, ' ');
 
         // Prepare sws contexts (created on first decoded frame when actual format is known)
-        SwsContext *sws_to_argb = nullptr;
-        int last_src_format = AV_PIX_FMT_NONE;
 
         // A2R10G10B10 -> P010 for NVENC
         // In this pipeline, the RTX output maps to A2R10G10B10; prefer doing P010 conversion on GPU when possible.
@@ -417,10 +420,6 @@ int run_pipeline(PipelineConfig cfg)
 
         initialize_frame_buffers_and_contexts(use_cuda_path, dstW, dstH, cuda_pool, sws_to_p010,
                                               bgra_frame, p010_frame, in, out);
-
-        // Frame buffering for handling processing spikes
-        std::queue<std::pair<AVFrame *, int64_t>> frame_buffer; // frame and output_pts pairs
-        const int MAX_BUFFER_SIZE = 4;
 
         // Stage 10: Write muxer header
         bool isPipeOutput = is_pipe_output(cfg.outputPath);
@@ -522,6 +521,16 @@ int run_pipeline(PipelineConfig cfg)
         ts_config.mode = cfg.copyts ? TimestampManager::Mode::COPYTS : TimestampManager::Mode::NORMAL;
         ts_config.input_seek_us = in.seek_offset_us;
         ts_config.start_at_zero = cfg.startAtZero;
+        // Respect -avoid_negative_ts for COPYTS: if disabled, don't clamp negatives
+        // Valid values: "auto", "make_zero", "make_non_negative", "disabled"
+        if (cfg.copyts && !cfg.avoidNegativeTs.empty())
+        {
+            std::string ant = lowercase_copy(cfg.avoidNegativeTs);
+            if (ant == "disabled")
+            {
+                ts_config.clamp_negative_copyts = false;
+            }
+        }
 
         // Configure CFR mode if -vsync cfr is specified
         if (cfg.vsync == "cfr" || cfg.vsync == "0")
@@ -766,6 +775,11 @@ int run_pipeline(PipelineConfig cfg)
                         }
 
                         // Use the helper function to process audio
+                        // Ensure frame has correct source time_base for timestamp rescaling in process_audio_frame()
+                        if (in.astream >= 0 && in.fmt && in.astream < (int)in.fmt->nb_streams && in.fmt->streams[in.astream])
+                        {
+                            audio_frame->time_base = in.fmt->streams[in.astream]->time_base;
+                        }
                         if (process_audio_frame(audio_frame.get(), out, opkt.get()))
                         {
                             // If we got a packet, write it
@@ -910,9 +924,8 @@ int run_pipeline(PipelineConfig cfg)
             LOG_DEBUG("Pipeline health: %s%s", healthy ? "OK" : "WARN",
                       warnings.empty() ? "" : (" - " + warnings).c_str());
         }
-        if (sws_to_argb)
-            sws_freeContext(sws_to_argb);
-        sws_freeContext(sws_to_p010);
+        if (sws_to_p010)
+            sws_freeContext(sws_to_p010);
         // Ensure all CUDA operations complete before cleanup
         if (use_cuda_path)
         {

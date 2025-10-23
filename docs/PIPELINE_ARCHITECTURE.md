@@ -507,6 +507,11 @@ LOG_VERBOSE("Starting video processing pipeline");
 - Location: main.cpp:445-448 via `initialize_rtx_processor()`
 - Allows graceful CPU fallback without aborting early
 
+**Utility Functions** (src/utils.cpp/h):
+- Common string utilities consolidated for code reuse
+- `endsWith()`: String suffix checking
+- `lowercase_copy()`: String case conversion
+
 ---
 
 ## Phase 2: Input Configuration
@@ -681,6 +686,11 @@ ffmpeg_utils.cpp:251
     │   ├─ hls_flags (user-specified via -hls_flags, or auto-computed)
     │   ├─ hls_segment_options (user-specified via -hls_segment_options)
     │   │
+    │   HLS fMP4 + copyts + avoid_negative_ts disabled requires special handling:
+    │   ├─ Segment muxers inherit avoid_negative_ts=disabled from main muxer
+    │   ├─ With synchronized A/V timestamps (audio uses copyts), large tfdt values can occur
+    │   └─ Inject avoid_negative_ts=make_zero into segment options for hls.js compatibility
+    │   │
     │   Compute hls_flags based on mode: [lines 332-375]
     │   ├─ If user specified -hls_flags:
     │   │   └─ Use user-provided flags directly (highest priority)
@@ -853,7 +863,7 @@ ts_config.start_at_zero = cfg.startAtZero;            // -start_at_zero flag
 TimestampManager ts_manager(ts_config);
 ```
 
-**Configuration Structure** (src/timestamp_manager.h:32-38):
+**Configuration Structure** (src/timestamp_manager.h:32-40):
 ```cpp
 struct Config {
     Mode mode = Mode::NORMAL;
@@ -862,6 +872,7 @@ struct Config {
     bool start_at_zero = false;        // -start_at_zero flag
     bool vsync_cfr = false;            // CFR mode: generate timestamps at constant frame rate
     AVRational cfr_frame_rate = {0, 1}; // Frame rate for CFR mode
+    bool clamp_negative_copyts = true; // If false, allow negative PTS in COPYTS (avoid_negative_ts=disabled)
 };
 ```
 
@@ -875,7 +886,7 @@ NORMAL mode:
 COPYTS mode:
     ├─ Preserves original input timestamps
     ├─ Optionally shifts with -start_at_zero (subtracts first frame PTS)
-    └─ Clamps negative PTS to zero
+    └─ Clamps negative PTS to zero (unless -avoid_negative_ts disabled)
 
 CFR mode (-vsync cfr):
     ├─ Generates constant frame rate timestamps
@@ -1870,7 +1881,8 @@ cpuProc->setConfig(cpuConfig);
 | **RTX Processing** | src/rtx_processor.cpp | src/processor.h |
 | **Frame Pool** | src/frame_pool.h | - |
 | **Logger** | src/logger.h | - |
-| **Pipeline Types** | src/pipeline_types.h | InputContext, OutputContext, HlsMuxOptions |
+| **Utilities** | src/utils.cpp | src/utils.h |
+| **Pipeline Types** | src/pipeline_types.h | InputContext, OutputContext, HlsMuxOptions, AudioConfig |
 
 ---
 
@@ -1915,6 +1927,14 @@ The timestamp manager tracks minimal statistics. Detailed timestamp validation (
 ---
 
 ## Version History
+
+- **v2.1** (2025-01-23): Code refactoring and A/V sync improvements
+  - **Code organization**: Consolidated common string utilities into src/utils.cpp/h (endsWith, lowercase_copy)
+  - **Audio copyts support**: AudioConfig now preserves original timestamps with `-copyts` for proper A/V synchronization
+  - **HLS tfdt normalization**: Automatic `avoid_negative_ts=make_zero` injection for HLS fMP4 segments when using copyts mode
+  - **Timestamp manager**: Added `clamp_negative_copyts` flag for `-avoid_negative_ts disabled` support
+  - **CPU path optimization**: Conditional frame buffer allocation (only when CUDA path is disabled)
+  - **Audio frame timebase**: Proper source timebase assignment for accurate timestamp rescaling in process_audio_frame()
 
 - **v2.0** (2025-01-21): Architecture documentation update
   - Timestamp manager documentation reflects FFmpeg 8 compatibility model

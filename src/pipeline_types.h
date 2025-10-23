@@ -82,6 +82,7 @@ struct AudioConfig
     int sampleRate = -1;
     std::string filter;
     bool enabled = false;
+    bool copyts = false; // Preserve original timestamps
 };
 
 // Stream mapping decision for each input stream

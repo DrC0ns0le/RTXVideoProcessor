@@ -1,12 +1,11 @@
 #include "config_parser.h"
 #include "logger.h"
+#include "utils.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <algorithm>
-#include <cctype>
 #include <filesystem>
 #include <system_error>
 
@@ -37,22 +36,6 @@ static char *extract_ffmpeg_file_path(char *value)
     }
 
     return value;
-}
-
-// Helper function: check if string ends with suffix
-static bool endsWith(const std::string &str, const std::string &suffix)
-{
-    if (suffix.size() > str.size())
-        return false;
-    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-// Helper function: convert string to lowercase
-static std::string lowercase_copy(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
-                   { return static_cast<char>(std::tolower(c)); });
-    return s;
 }
 
 // Helper function: get environment variable as string
