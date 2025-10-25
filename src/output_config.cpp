@@ -62,10 +62,6 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
         }
     }
 
-    // Output format is HLS
-    if (cfg->outputFormatName.empty())
-        cfg->outputFormatName = "hls";
-
     hlsOpts.enabled = true;
     hlsOpts.overwrite = cfg->overwrite;
     hlsOpts.autoDiscontinuity = !cfg->ffCompatible;
@@ -110,7 +106,7 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     }
     else
     {
-        const std::string segmentExt = useFmp4 ? ".mp4" : ".ts";
+        const std::string segmentExt = useFmp4 ? ".m4s" : ".ts";
         const std::string pattern = playlistStem.empty() ? (std::string("segment_%05d") + segmentExt)
                                                          : (playlistStem + "_%05d" + segmentExt);
         std::filesystem::path segPath = playlistDir.empty() ? std::filesystem::path(pattern) : (playlistDir / pattern);
@@ -154,19 +150,6 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     hlsOpts.customFlags = cfg->hlsFlags;
     hlsOpts.segmentOptions = cfg->hlsSegmentOptions;
 
-    // HLS fMP4 + copyts + avoid_negative_ts disabled requires segment muxer override
-    // Segment muxers inherit avoid_negative_ts=disabled, causing large timestamps in tfdt boxes
-    // With synchronized A/V timestamps (audio now uses copyts too), we still need normalization
-    // to prevent hls.js from rejecting tfdt values
-    if (useFmp4 && cfg->copyts && cfg->avoidNegativeTs == "disabled")
-    {
-        if (!hlsOpts.segmentOptions.empty())
-            hlsOpts.segmentOptions += ":avoid_negative_ts=make_zero";
-        else
-            hlsOpts.segmentOptions = "avoid_negative_ts=make_zero";
-        LOG_INFO("HLS: Injected avoid_negative_ts=make_zero into segment options for tfdt normalization");
-    }
-
     out->hlsOptions = hlsOpts;
 }
 
@@ -181,10 +164,32 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     out.venc->height = dstH;
 
     // Encoder timebase configuration:
-    // - HLS: Use framerate-based timebase (already set in ffmpeg_utils.cpp as 1/fps)
-    //        This matches vanilla FFmpeg behavior and ensures HLS muxer uses 1/24000
-    // - Non-HLS: Use input stream timebase for -copyts compatibility (-enc_time_base -1)
-    if (!hls_enabled)
+    // Priority: If CFR is enabled, use 1/fr so encoder emits timestamps in CFR ticks.
+    // Otherwise: HLS keeps framerate-based TB (set earlier), Non-HLS uses input stream TB for -copyts compat.
+    bool cfr_enabled = (cfg.vsync == "cfr" || cfg.vsync == "0");
+    if (cfr_enabled)
+    {
+        // Prefer input timebase if it produces an integer ticks-per-frame for CFR
+        // Condition: (tb_den * fr.den) % fr.num == 0
+        int tb_den = in.vst->time_base.den;
+        if (tb_den > 0 && ( (int64_t)tb_den * fr.den ) % fr.num == 0)
+        {
+            out.venc->time_base = in.vst->time_base;
+            out.vstream->time_base = out.venc->time_base;
+            int64_t tpf = ((int64_t)tb_den * fr.den) / fr.num;
+            LOG_INFO("CFR: Using input timebase %d/%d with ticks_per_frame=%lld", out.venc->time_base.num, out.venc->time_base.den, (long long)tpf);
+        }
+        else
+        {
+            // Fallback: integer timescale so each frame maps to an exact integer number of ticks
+            // For fr=num/den, choose timescale=num*den and ticks_per_frame=den*den (exact integer)
+            int64_t timescale = (int64_t)fr.num * fr.den;
+            out.venc->time_base = {1, (int)timescale};
+            out.vstream->time_base = out.venc->time_base;
+            LOG_INFO("CFR: Using integer timescale, encoder/stream time_base %d/%d", out.venc->time_base.num, out.venc->time_base.den);
+        }
+    }
+    else if (!hls_enabled)
     {
         // Non-HLS: Override to use input stream timebase
         out.venc->time_base = in.vst->time_base;
@@ -194,8 +199,7 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     }
     else
     {
-        // HLS: Keep the framerate-based timebase that was set in ffmpeg_utils.cpp
-        // This ensures muxer will use 1/24000 (or similar) instead of 1/16000
+        // HLS without CFR: Keep the framerate-based timebase (set earlier)
         LOG_INFO("HLS: Using framerate-based encoder timebase %d/%d",
                  out.venc->time_base.num, out.venc->time_base.den);
     }
@@ -219,10 +223,12 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     {
         gop_duration_sec = out.hlsOptions.hlsTime;
 
-        // Calculate GOP size with proper rounding for fractional framerates
-        // For 23.976fps (24000/1001): 3 * 24000 / 1001 = 71.928 → round to 72
-        gop_size_frames = (int)round((double)gop_duration_sec * fr.num / fr.den);
+        // Calculate GOP size using integer rescaling for precision
+        // For 23.976fps (24000/1001): av_rescale(3, 24000, 1001) = 72
+        // Formula: (duration_sec * framerate.num + framerate.den/2) / framerate.den
+        gop_size_frames = av_rescale(gop_duration_sec, fr.num, fr.den);
 
+        // Calculate FPS for warning message (display only, not used in timestamp calculations)
         double fps = (double)fr.num / fr.den;
         if (fps > 50 && gop_duration_sec > 2)
         {

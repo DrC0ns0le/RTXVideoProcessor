@@ -77,20 +77,27 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
             throw std::runtime_error("Invalid seek time format: " + options->seekTime);
         }
 
+        // Apply -seek_timestamp behavior (FFmpeg compatibility)
+        // When -seek_timestamp is disabled (default), add stream start_time to seek position
+        // When -seek_timestamp is enabled, seek to absolute timestamp without adjustment
+        if (!options->seekTimestamp && in.fmt->start_time != AV_NOPTS_VALUE)
+        {
+            seek_target += in.fmt->start_time;
+            LOG_DEBUG("seek_timestamp disabled: adjusted seek target by start_time (%lld us)", in.fmt->start_time);
+        }
+
         in.seek_offset_us = seek_target;
 
         int seek_flags = AVSEEK_FLAG_BACKWARD;
 
-        // Apply -noaccurate_seek or -seek2any: Allow seeking to non-keyframes
-        // This enables fast seeking by using AVSEEK_FLAG_ANY
-        if (options->noAccurateSeek || options->seek2any)
+        // Apply -seek2any to allow seeking to non-keyframes at demuxer level
+        // AVSEEK_FLAG_ANY allows seeking to any frame type (B/P frames, not just I-frames)
+        // Warning: May produce garbled output until next keyframe is decoded
+        if (options->seek2any)
         {
             seek_flags |= AVSEEK_FLAG_ANY;
-            LOG_DEBUG("Fast/inaccurate seeking enabled: AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY");
+            LOG_DEBUG("seek2any enabled: AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY (can seek to non-keyframes)");
         }
-
-        if (options->seekTimestamp)
-            seek_flags |= AVSEEK_FLAG_FRAME;
 
         ret = avformat_seek_file(in.fmt, -1, INT64_MIN, seek_target, INT64_MAX, seek_flags);
         if (ret < 0)
@@ -246,7 +253,7 @@ void close_input(InputContext &in)
     in.seek_offset_us = 0;
 }
 
-bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps)
+bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps, const std::string &outputFormatName)
 {
     if (!outPath)
         throw std::invalid_argument("open_output: null path");
@@ -265,6 +272,11 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
     if (out.hlsOptions.enabled)
     {
         effectiveFormat = "hls";
+    }
+    else if (!outputFormatName.empty())
+    {
+        // Use explicitly specified format from -f flag
+        effectiveFormat = outputFormatName.c_str();
     }
     else if (isPipe)
     {
@@ -361,18 +373,6 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         {
             av_dict_set(&muxOpts, "hls_flags", hlsFlags.c_str(), 0);
             LOG_DEBUG("Set hls_flags = %s\n", hlsFlags.c_str());
-        }
-
-        // Conditional HLS discontinuity marking (FFmpeg does NOT do this automatically)
-        // Only mark discontinuity if explicitly requested (legacy mode)
-        if (in.seek_offset_us > 0 && out.hlsOptions.autoDiscontinuity)
-        {
-            LOG_DEBUG("Seek offset detected (%lld us), marking HLS discontinuity (non-FFmpeg default)\n", in.seek_offset_us);
-
-            // Add discont_start flag to mark the beginning as a discontinuity
-            // This tells HLS players that this is a new starting point
-            av_dict_set(&muxOpts, "hls_flags", "+discont_start", AV_DICT_APPEND);
-            LOG_DEBUG("Added discont_start to hls_flags for seek\n");
         }
 
         // Apply user-specified segment options (e.g., movflags=+frag_discont for fMP4)
@@ -1258,9 +1258,9 @@ cleanup:
     return false;
 }
 
-bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet)
+bool process_audio_frame(AVFrame *input_frame, OutputContext &out)
 {
-    if (!input_frame || !out.aenc || !output_packet)
+    if (!input_frame || !out.aenc)
     {
         return false;
     }
@@ -1274,17 +1274,44 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
         out.a_start_pts = input_frame->pts;
 
         // COPYTS mode: Initialize next_audio_pts from input timestamps to maintain A/V sync
-        // This ensures audio timestamps match video timeline (e.g., both start at 24s)
-        // Required for proper HLS tfdt calculation: tfdt = cluster[0].dts - start_dts
+        // For HLS mode with output seeking, we must apply the same baseline normalization
+        // that video uses to ensure tfdt values are aligned between audio and video tracks.
         if (out.audioConfig.copyts)
         {
             // Rescale input PTS to output timebase
             int64_t rescaled_pts = av_rescale_q(input_frame->pts,
-                                                 input_frame->time_base,
-                                                 out.aenc->time_base);
+                                                input_frame->time_base,
+                                                out.aenc->time_base);
+
+            // Apply HLS baseline normalization to match video tfdt timeline
+            // Use the shared baseline from video to ensure audio and video tfdt values are aligned
+            if (out.hls_mode && out.output_seek_target_us > 0 && out.copyts_baseline_pts != AV_NOPTS_VALUE)
+            {
+                // Convert the shared baseline (in microseconds) to audio encoder timebase
+                int64_t baseline_audio_tb = av_rescale_q(out.copyts_baseline_pts,
+                                                         {1, AV_TIME_BASE},
+                                                         out.aenc->time_base);
+
+                // Subtract baseline to normalize audio timeline to match video
+                int64_t original_pts = rescaled_pts;
+                rescaled_pts -= baseline_audio_tb;
+
+                LOG_DEBUG("COPYTS+HLS: Normalized audio using shared baseline: first_pts=%lld, baseline=%lld us (%lld in audio tb), normalized_pts=%lld",
+                          original_pts, out.copyts_baseline_pts, baseline_audio_tb, rescaled_pts);
+            }
+
             out.next_audio_pts = rescaled_pts;
-            LOG_DEBUG("COPYTS: Initialized audio PTS from first frame: %lld (input) -> %lld (output timebase)",
+            out.accumulated_audio_samples = rescaled_pts; // Initialize sample counter
+            LOG_DEBUG("COPYTS: Initialized audio PTS: %lld (input) -> %lld (output timebase)",
                       input_frame->pts, rescaled_pts);
+        }
+        else if (out.hlsOptions.enabled && !out.audioConfig.copyts)
+        {
+            // For HLS (especially fMP4), force audio to start at 0 to align with initPTS/baseMediaDecodeTime
+            // Preserving large/negative original PTS here can lead to hls.js warnings about playlist time mismatch
+            out.next_audio_pts = 0;
+            out.accumulated_audio_samples = 0; // Initialize sample counter
+            LOG_DEBUG("HLS: Initialized audio PTS to 0 for first frame to ensure non-negative baseMediaDecodeTime");
         }
     }
 
@@ -1435,16 +1462,18 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
             break;
         }
 
-        // Set proper timestamp for the encoder frame
-        encoder_frame->pts = out.next_audio_pts;
+        // Set proper timestamp for the encoder frame using accumulated sample count
+        // This ensures PTS accurately reflects actual samples, preventing drift from resampling
+        encoder_frame->pts = out.accumulated_audio_samples;
 
-        // CRITICAL: Advance PTS counter immediately after assignment to prevent duplicate timestamps
+        // CRITICAL: Advance sample counter immediately after assignment to prevent duplicate timestamps
         // The encoder may buffer frames (EAGAIN) before producing packets, so if we wait until
         // receiving a packet to increment, multiple encoder frames can end up with the same PTS.
         // This causes duplicate audio timestamps in fMP4 segments, breaking hls.js playback with
         // BUFFER_APPENDING errors showing undefined start/end times.
-        int64_t frame_pts = out.next_audio_pts;
-        out.next_audio_pts += out.aenc->frame_size;
+        int64_t frame_pts = out.accumulated_audio_samples;
+        out.accumulated_audio_samples += out.aenc->frame_size;
+        out.next_audio_pts = out.accumulated_audio_samples; // Keep next_audio_pts in sync
 
         // Encode frame
         ret = avcodec_send_frame(out.aenc, encoder_frame);
@@ -1458,12 +1487,20 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
             return false;
         }
 
-        // Get encoded packets
+        // Get encoded packets and write them immediately
         while (true)
         {
+            AVPacket *output_packet = av_packet_alloc();
+            if (!output_packet)
+            {
+                LOG_WARN("Failed to allocate output packet");
+                return false;
+            }
+
             ret = avcodec_receive_packet(out.aenc, output_packet);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
             {
+                av_packet_free(&output_packet);
                 break;
             }
             if (ret < 0)
@@ -1471,6 +1508,7 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
                 char errbuf[AV_ERROR_MAX_STRING_SIZE];
                 av_make_error_string(errbuf, sizeof(errbuf), ret);
                 LOG_WARN("Failed to receive encoded audio packet: %s", errbuf);
+                av_packet_free(&output_packet);
                 return false;
             }
 
@@ -1482,16 +1520,23 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *out
             {
                 // Generate timestamps if encoder didn't set them (use the frame's PTS that we assigned)
                 output_packet->pts = frame_pts;
-                output_packet->dts = frame_pts;
             }
 
             av_packet_rescale_ts(output_packet, out.aenc->time_base, out.astream->time_base);
 
-            // FFmpeg 8 compatibility: Trust encoder and muxer for DTS handling
-            // - Encoder generates DTS from PTS automatically
-            // - Muxer (av_interleaved_write_frame) validates monotonicity and DTS <= PTS
-            // - No manual intervention needed
-            return true; // Packet ready
+            // Write packet to muxer
+            ret = av_interleaved_write_frame(out.fmt, output_packet);
+            av_packet_free(&output_packet);
+
+            if (ret < 0)
+            {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                av_make_error_string(errbuf, sizeof(errbuf), ret);
+                LOG_WARN("Failed to write audio packet: %s", errbuf);
+                return false;
+            }
+
+            // Continue receiving more packets from encoder (may have buffered multiple)
         }
     }
 
@@ -1512,11 +1557,13 @@ void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64
     {
         // Start from 0 to match video (video: first_frame - baseline, audio: start at 0)
         out.next_audio_pts = 0;
+        out.accumulated_audio_samples = 0;
         LOG_DEBUG("Audio PTS initialized to 0 (baseline at %.3fs)", global_baseline_pts_us / 1000000.0);
     }
     else
     {
         out.next_audio_pts = 0;
+        out.accumulated_audio_samples = 0;
     }
 
     // Reset audio baseline

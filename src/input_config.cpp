@@ -55,16 +55,6 @@ bool configure_input_hdr_detection(PipelineConfig &cfg, InputContext &in)
         inputOpts.seek2any = cfg.seek2any;
         inputOpts.seekTimestamp = cfg.seekTimestamp;
         inputOpts.enableErrorConcealment = !cfg.ffCompatible;
-
-        // COPYTS + noaccurate_seek: Enable error concealment to prevent PTS gaps
-        if (cfg.copyts && !cfg.seekTime.empty() && (cfg.noAccurateSeek || cfg.seek2any))
-        {
-            if (!inputOpts.enableErrorConcealment)
-            {
-                inputOpts.enableErrorConcealment = true;
-            }
-        }
-
         inputOpts.flushOnSeek = false;
         open_input(cfg.inputPath, in, &inputOpts);
         LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
@@ -153,30 +143,32 @@ int64_t setup_progress_tracking(const InputContext &in, const AVRational &fr)
     }
     else
     {
-        double duration_sec = 0.0;
+        int64_t duration_us = 0;
         if (in.vst->duration > 0 && in.vst->duration != AV_NOPTS_VALUE)
         {
-            duration_sec = in.vst->duration * av_q2d(in.vst->time_base);
+            // Use integer rescaling instead of floating-point to avoid precision loss
+            duration_us = av_rescale_q(in.vst->duration, in.vst->time_base, {1, AV_TIME_BASE});
         }
         else if (in.fmt->duration != AV_NOPTS_VALUE)
         {
-            duration_sec = static_cast<double>(in.fmt->duration) / AV_TIME_BASE;
+            duration_us = in.fmt->duration;
         }
 
         // Account for input seeking: subtract seek offset from total duration
         if (in.seek_offset_us > 0)
         {
-            double seek_offset_sec = in.seek_offset_us / 1000000.0;
-            duration_sec -= seek_offset_sec;
-            if (duration_sec < 0.0)
+            duration_us -= in.seek_offset_us;
+            if (duration_us < 0)
             {
-                duration_sec = 0.0;
+                duration_us = 0;
             }
         }
 
-        if (duration_sec > 0.0 && fr.num > 0 && fr.den > 0)
+        if (duration_us > 0 && fr.num > 0 && fr.den > 0)
         {
-            total_frames = static_cast<int64_t>(duration_sec * av_q2d(fr) + 0.5);
+            // Calculate frames using integer rescaling: duration * framerate
+            // av_rescale_q(duration_us, {1, AV_TIME_BASE}, frame_rate) gives frame count
+            total_frames = av_rescale_q(duration_us, {1, AV_TIME_BASE}, av_inv_q(fr));
         }
     }
     return total_frames;

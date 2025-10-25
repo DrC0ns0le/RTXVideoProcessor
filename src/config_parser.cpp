@@ -142,7 +142,7 @@ void print_help(const char *argv0)
 static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
 {
     // Enable verbose logging
-    cfg->verbose = true;
+    cfg->debug = true;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -475,19 +475,21 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-seek2any requires a value\n");
+                fprintf(stderr, "-seek2any requires 0 or 1\n");
                 exit(1);
             }
-            cfg->seek2any = (std::stoi(argv[++i]) != 0);
+            int value = std::atoi(argv[++i]);
+            cfg->seek2any = (value != 0);
         }
         else if (arg == "-seek_timestamp")
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-seek_timestamp requires a value\n");
+                fprintf(stderr, "-seek_timestamp requires 0 or 1\n");
                 exit(1);
             }
-            cfg->seekTimestamp = (std::stoi(argv[++i]) != 0);
+            int value = std::atoi(argv[++i]);
+            cfg->seekTimestamp = (value != 0);
         }
         else if (arg == "-movflags")
         {

@@ -106,6 +106,7 @@ static inline void encode_and_write(AVCodecContext *enc,
         opkt->stream_index = vstream->index;
 
         av_packet_rescale_ts(opkt.get(), enc->time_base, vstream->time_base);
+
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
     }
@@ -232,6 +233,7 @@ static void write_muxer_header(InputContext &in, OutputContext &out, bool hls_en
 {
     out.vstream->time_base = out.venc->time_base;
     out.vstream->avg_frame_rate = fr;
+    out.vstream->r_frame_rate = fr;
 
     AVDictionary *muxopts = out.muxOptions;
 
@@ -317,20 +319,7 @@ int run_pipeline(PipelineConfig cfg)
         // FFmpeg compatibility: Disable non-standard behaviors
         inputOpts.enableErrorConcealment = !cfg.ffCompatible; // FFmpeg doesn't enable error concealment by default
 
-        // COPYTS + noaccurate_seek edge case:
-        // When using COPYTS mode with inaccurate seeking, dropped frames create PTS gaps.
-        // NORMAL mode handles this via baseline adjustment, but COPYTS preserves original PTS.
-        // Enable error concealment to output all frames (even corrupted) and prevent PTS gaps.
-        if (cfg.copyts && !cfg.seekTime.empty() && (cfg.noAccurateSeek || cfg.seek2any))
-        {
-            if (!inputOpts.enableErrorConcealment)
-            {
-                LOG_INFO("Enabling error concealment for COPYTS+noaccurate_seek (prevents PTS gaps from dropped frames)");
-                inputOpts.enableErrorConcealment = true;
-            }
-        }
-
-        inputOpts.flushOnSeek = false;                        // FFmpeg never flushes decoder on seek
+        inputOpts.flushOnSeek = false; // FFmpeg never flushes decoder on seek
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
@@ -353,7 +342,7 @@ int run_pipeline(PipelineConfig cfg)
         }
 
         LOG_DEBUG("Opening output...");
-        open_output(cfg.outputPath, in, out, cfg.streamMaps);
+        open_output(cfg.outputPath, in, out, cfg.streamMaps, cfg.outputFormatName);
         LOG_DEBUG("Output opened successfully");
 
         // Stage 4: Configure audio processing (complete the audio setup)
@@ -363,10 +352,11 @@ int run_pipeline(PipelineConfig cfg)
         const bool hls_enabled = out.hlsOptions.enabled;
         const bool hls_segments_are_fmp4 = hls_enabled && lowercase_copy(out.hlsOptions.segmentType) == "fmp4";
 
-        // Read input bitrate and fps
-        AVRational fr = in.vst->avg_frame_rate.num ? in.vst->avg_frame_rate : in.vst->r_frame_rate;
-        if (fr.num == 0 || fr.den == 0)
-            fr = {in.vst->time_base.den, in.vst->time_base.num};
+        // Read nominal fps (FFmpeg-like priority): guess -> r_frame_rate -> avg_frame_rate -> inverse time_base
+        AVRational fr = av_guess_frame_rate(in.fmt, in.vst, nullptr);
+        if (fr.num == 0 || fr.den == 0) fr = in.vst->r_frame_rate;
+        if (fr.num == 0 || fr.den == 0) fr = in.vst->avg_frame_rate;
+        if (fr.num == 0 || fr.den == 0) fr = AVRational{in.vst->time_base.den, in.vst->time_base.num};
 
         int64_t total_frames = setup_progress_tracking(in, fr);
 
@@ -558,6 +548,14 @@ int run_pipeline(PipelineConfig cfg)
             }
         }
 
+        // Enable HLS mode for proper tfdt (baseMediaDecodeTime) handling
+        // HLS fMP4 segments must preserve timeline position in tfdt for A/V sync
+        ts_config.hls_mode = hls_enabled;
+
+        // Share HLS and output seeking config with audio for A/V sync
+        out.hls_mode = hls_enabled;
+        out.output_seek_target_us = ts_config.output_seek_target_us;
+
         // NOTE: output_ts_offset is applied directly to AVFormatContext->output_ts_offset in
         // write_muxer_header() to match vanilla FFmpeg behavior. The muxer (libavformat/mux.c)
         // handles timestamp offsetting during av_interleaved_write_frame(), ensuring correct
@@ -667,8 +665,8 @@ int run_pipeline(PipelineConfig cfg)
                     // When seeking to a timestamp, avformat_seek_file() seeks to the nearest keyframe BEFORE the target.
                     // The decoder then outputs all frames from that keyframe onwards.
                     // FFmpeg's default behavior (accurate_seek) is to decode but discard frames before the target.
-                    // Respect user's -noaccurate_seek flag - don't discard if they disabled accurate seeking.
-                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && decframe->pts != AV_NOPTS_VALUE)
+                    // Respect user's -noaccurate_seek or -seek2any flags - don't discard if they disabled accurate seeking.
+                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && decframe->pts != AV_NOPTS_VALUE)
                     {
                         int64_t frame_time_us = av_rescale_q(decframe->pts, in.vst->time_base, {1, AV_TIME_BASE});
                         if (frame_time_us < in.seek_offset_us)
@@ -685,13 +683,19 @@ int run_pipeline(PipelineConfig cfg)
                         // Convert frame PTS to microseconds
                         int64_t frame_time_us = av_rescale_q(decframe->pts, in.vst->time_base, {1, 1000000});
 
-                        // Calculate elapsed time from start (accounting for seek offset)
-                        int64_t elapsed_us = frame_time_us - in.seek_offset_us;
+                        // Calculate elapsed time from start
+                        // FFmpeg behavior: With output seeking (-ss after -i), duration is measured from
+                        // the output seek point, not the input seek point. This ensures proper clip duration.
+                        int64_t reference_time_us = ts_config.output_seek_target_us > 0
+                                                     ? ts_config.output_seek_target_us
+                                                     : in.seek_offset_us;
+                        int64_t elapsed_us = frame_time_us - reference_time_us;
 
                         // Stop when we exceed the duration limit
                         if (elapsed_us >= duration_us)
                         {
-                            LOG_INFO("Reached duration limit: %.3fs (elapsed from start)", elapsed_us / 1000000.0);
+                            LOG_INFO("Reached duration limit: %.3fs (elapsed from %.3fs)",
+                                     elapsed_us / 1000000.0, reference_time_us / 1000000.0);
                             goto done_processing;
                         }
                     }
@@ -729,9 +733,106 @@ int run_pipeline(PipelineConfig cfg)
                     processed_frames++;
                     show_progress();
 
-                    // Set frame PTS (encoder generates DTS, muxer applies output_ts_offset)
-                    outFrame->pts = ts_manager.deriveVideoPTS(
-                        decframe, in.vst->time_base, out.venc->time_base);
+                    bool cfr_active = (cfg.vsync == "cfr" || cfg.vsync == "0");
+                    if (cfr_active && ts_manager.cfrActive())
+                    {
+                        // Obtain input PTS
+                        int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
+                        if (in_pts == AV_NOPTS_VALUE)
+                        {
+                            // Fallback to previous behavior when no input PTS is available
+                            outFrame->pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
+                            if (outFrame->pts == AV_NOPTS_VALUE)
+                            {
+                                av_frame_unref(frame.get());
+                                if (swframe)
+                                    av_frame_unref(swframe.get());
+                                continue;
+                            }
+                            // duration in CFR
+                            int64_t tpf = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                            if (tpf <= 0) tpf = 1;
+                            outFrame->duration = (int)tpf;
+
+                            // Encode current frame
+                            if (use_cuda_path) cudaStreamSynchronize(0);
+                            encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+                        }
+                        else
+                        {
+                            // Quantize to CFR grid and duplicate as needed (FFmpeg-like behavior)
+                            ts_manager.ensureCfrBaseline(in_pts);
+                            int64_t last_idx = ts_manager.getLastCfrIndex();
+                            int64_t target_idx = ts_manager.cfrTargetIndexFromInput(in_pts, in.vst->time_base);
+
+                            // ticks-per-frame (encoder tb)
+                            int64_t tpf = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                            if (tpf <= 0) tpf = 1;
+
+                            // Emit duplicates of the current processed frame for any missing indices before target
+                            for (int64_t dup_idx = (last_idx == AV_NOPTS_VALUE ? 0 : last_idx + 1); dup_idx < target_idx; ++dup_idx)
+                            {
+                                int64_t dup_pts = ts_manager.cfrIndexToPts(dup_idx, out.venc->time_base);
+                                outFrame->pts = dup_pts;
+                                outFrame->duration = (int)tpf;
+                                if (use_cuda_path) cudaStreamSynchronize(0);
+                                encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send dup frame to encoder");
+                            }
+
+                            // Encode the current frame at its target index
+                            int64_t cur_pts = ts_manager.cfrIndexToPts(target_idx, out.venc->time_base);
+                            outFrame->pts = cur_pts;
+                            outFrame->duration = (int)tpf;
+                            if (use_cuda_path) cudaStreamSynchronize(0);
+                            encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+
+                            // Update last CFR index
+                            ts_manager.setLastCfrIndex(target_idx);
+                        }
+
+                        // Share the COPYTS baseline with audio (same as generic path)
+                        if (ts_manager.hasCopytsBaseline() && out.copyts_baseline_pts == AV_NOPTS_VALUE)
+                        {
+                            int64_t baseline_ticks = ts_manager.getCopytsBaseline();
+                            out.copyts_baseline_pts = av_rescale_q(baseline_ticks, out.venc->time_base, {1, AV_TIME_BASE});
+                            LOG_DEBUG("Shared COPYTS baseline with audio: %lld ticks (video tb) = %lld us",
+                                      baseline_ticks, out.copyts_baseline_pts);
+                        }
+
+                        // Done with frames (already encoded above)
+                        av_frame_unref(frame.get());
+                        if (swframe)
+                            av_frame_unref(swframe.get());
+                        continue; // Skip the generic encode path below
+                    }
+                    else
+                    {
+                        // Non-CFR: previous behavior
+                        outFrame->pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
+                        if (outFrame->pts == AV_NOPTS_VALUE)
+                        {
+                            av_frame_unref(frame.get());
+                            if (swframe)
+                                av_frame_unref(swframe.get());
+                            continue;
+                        }
+                        if (use_cuda_path) cudaStreamSynchronize(0);
+                        encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+                        av_frame_unref(frame.get());
+                        if (swframe)
+                            av_frame_unref(swframe.get());
+                        continue;
+                    }
+                    // Share the COPYTS baseline with audio for A/V sync in HLS segments
+                    // After the first video frame, the baseline is established and audio must use it
+                    if (ts_manager.hasCopytsBaseline() && out.copyts_baseline_pts == AV_NOPTS_VALUE)
+                    {
+                        // Convert baseline from video timebase to microseconds for audio to use
+                        int64_t baseline_ticks = ts_manager.getCopytsBaseline();
+                        out.copyts_baseline_pts = av_rescale_q(baseline_ticks, out.venc->time_base, {1, AV_TIME_BASE});
+                        LOG_DEBUG("Shared COPYTS baseline with audio: %lld ticks (video tb) = %lld us",
+                                  baseline_ticks, out.copyts_baseline_pts);
+                    }
 
                     // IMPORTANT: Must sync before encoder accesses CUDA frame data
                     // RTX processor syncs internally, but this ensures frame is ready for NVENC
@@ -762,7 +863,7 @@ int run_pipeline(PipelineConfig cfg)
                         ff_check(ret, "receive audio frame");
 
                         // Accurate seeking: Discard audio frames before seek target (only if accurate seek enabled)
-                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && audio_frame->pts != AV_NOPTS_VALUE)
+                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && audio_frame->pts != AV_NOPTS_VALUE)
                         {
                             AVStream *ast = in.fmt->streams[in.astream];
                             int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
@@ -774,20 +875,37 @@ int run_pipeline(PipelineConfig cfg)
                             }
                         }
 
+                        // Output seeking: Discard audio frames before output seek target
+                        // This ensures audio and video segments have the same content range for proper A/V sync
+                        // Like video's TimestampManager, stop checking after first valid frame passes
+                        if (!out.audio_output_seek_complete && ts_config.output_seek_target_us > 0 && audio_frame->pts != AV_NOPTS_VALUE)
+                        {
+                            AVStream *ast = in.fmt->streams[in.astream];
+                            int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
+                            if (frame_time_us < ts_config.output_seek_target_us)
+                            {
+                                // Audio frame is before output seek target - discard it
+                                LOG_DEBUG("Dropping audio frame before output seek target: %.3fs < %.3fs",
+                                          frame_time_us / 1000000.0, ts_config.output_seek_target_us / 1000000.0);
+                                av_frame_unref(audio_frame.get());
+                                continue;
+                            }
+                            // First valid frame passed - stop checking subsequent frames
+                            out.audio_output_seek_complete = true;
+                            LOG_DEBUG("Audio output seeking complete: first frame at %.3fs",
+                                      frame_time_us / 1000000.0);
+                        }
+
                         // Use the helper function to process audio
                         // Ensure frame has correct source time_base for timestamp rescaling in process_audio_frame()
                         if (in.astream >= 0 && in.fmt && in.astream < (int)in.fmt->nb_streams && in.fmt->streams[in.astream])
                         {
                             audio_frame->time_base = in.fmt->streams[in.astream]->time_base;
                         }
-                        if (process_audio_frame(audio_frame.get(), out, opkt.get()))
+                        // process_audio_frame now drains all available FIFO packets and writes them directly
+                        if (!process_audio_frame(audio_frame.get(), out))
                         {
-                            // If we got a packet, write it
-                            if (opkt->data)
-                            {
-                                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet");
-                                av_packet_unref(opkt.get());
-                            }
+                            LOG_WARN("Failed to process audio frame");
                         }
 
                         av_frame_unref(audio_frame.get());
@@ -804,7 +922,7 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ost = out.fmt->streams[out_index];
 
                         // Accurate seeking: Discard audio packets before seek target (only if accurate seek enabled)
-                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && pkt->pts != AV_NOPTS_VALUE)
+                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && pkt->pts != AV_NOPTS_VALUE)
                         {
                             int64_t pkt_time_us = av_rescale_q(pkt->pts, ist->time_base, {1, AV_TIME_BASE});
                             if (pkt_time_us < in.seek_offset_us)
@@ -813,6 +931,26 @@ int run_pipeline(PipelineConfig cfg)
                                 av_packet_unref(pkt.get());
                                 continue;
                             }
+                        }
+
+                        // Output seeking: Discard audio packets before output seek target
+                        // This ensures audio and video segments have the same content range for proper A/V sync
+                        // Like video's TimestampManager, stop checking after first valid packet passes
+                        if (!out.audio_output_seek_complete && ts_config.output_seek_target_us > 0 && pkt->pts != AV_NOPTS_VALUE)
+                        {
+                            int64_t pkt_time_us = av_rescale_q(pkt->pts, ist->time_base, {1, AV_TIME_BASE});
+                            if (pkt_time_us < ts_config.output_seek_target_us)
+                            {
+                                // Audio packet is before output seek target - discard it
+                                LOG_DEBUG("Dropping audio packet before output seek target: %.3fs < %.3fs",
+                                          pkt_time_us / 1000000.0, ts_config.output_seek_target_us / 1000000.0);
+                                av_packet_unref(pkt.get());
+                                continue;
+                            }
+                            // First valid packet passed - stop checking subsequent packets
+                            out.audio_output_seek_complete = true;
+                            LOG_DEBUG("Audio output seeking complete: first packet at %.3fs",
+                                      pkt_time_us / 1000000.0);
                         }
 
                         // Only adjust timestamps in FFmpeg mode without copyts (advanced handling)
@@ -871,6 +1009,79 @@ int run_pipeline(PipelineConfig cfg)
         // Flush audio encoder if enabled
         if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)
         {
+            // Drain any remaining samples from audio FIFO by padding the final frame.
+            // Without this, a tail of < frame_size samples would never be sent, causing missing end audio.
+            if (out.audio_fifo && out.aenc->frame_size > 0)
+            {
+                while (av_audio_fifo_size(out.audio_fifo) > 0)
+                {
+                    int remaining = av_audio_fifo_size(out.audio_fifo);
+                    int frame_sz = out.aenc->frame_size;
+
+                    AVFrame *encoder_frame = av_frame_alloc();
+                    if (!encoder_frame)
+                    {
+                        break;
+                    }
+                    encoder_frame->format = out.aenc->sample_fmt;
+                    av_channel_layout_copy(&encoder_frame->ch_layout, &out.aenc->ch_layout);
+                    encoder_frame->sample_rate = out.aenc->sample_rate;
+                    encoder_frame->nb_samples = frame_sz;
+                    if (av_frame_get_buffer(encoder_frame, 0) < 0)
+                    {
+                        av_frame_free(&encoder_frame);
+                        break;
+                    }
+
+                    // Read as many samples as available; zero-pad the rest
+                    int to_read = remaining < frame_sz ? remaining : frame_sz;
+                    if (to_read > 0)
+                    {
+                        av_audio_fifo_read(out.audio_fifo, (void **)encoder_frame->data, to_read);
+                    }
+                    if (to_read < frame_sz)
+                    {
+                        for (int ch = 0; ch < encoder_frame->ch_layout.nb_channels; ++ch)
+                        {
+                            uint8_t *dst = encoder_frame->data[ch] + to_read * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
+                            int pad_bytes = (frame_sz - to_read) * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
+                            memset(dst, 0, pad_bytes);
+                        }
+                    }
+
+                    // Assign PTS based on accumulated samples (prevents overshoot from padding)
+                    encoder_frame->pts = out.accumulated_audio_samples;
+                    // Only advance by actual content samples, not padded frame size
+                    out.accumulated_audio_samples += to_read;
+                    out.next_audio_pts = out.accumulated_audio_samples;
+
+                    // Send frame to encoder
+                    int ret_send = avcodec_send_frame(out.aenc, encoder_frame);
+                    av_frame_free(&encoder_frame);
+                    if (ret_send < 0)
+                    {
+                        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                        av_make_error_string(errbuf, sizeof(errbuf), ret_send);
+                        LOG_WARN("Failed to send padded frame to audio encoder: %s", errbuf);
+                        break;
+                    }
+
+                    // Receive and write packets
+                    while (true)
+                    {
+                        int ret = avcodec_receive_packet(out.aenc, opkt.get());
+                        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                            break;
+                        ff_check(ret, "receive audio packet (fifo drain)");
+                        opkt->stream_index = out.astream->index;
+                        av_packet_rescale_ts(opkt.get(), out.aenc->time_base, out.astream->time_base);
+
+                        ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet (fifo drain)");
+                        av_packet_unref(opkt.get());
+                    }
+                }
+            }
+
             LOG_DEBUG("Flushing audio encoder...");
             ff_check(avcodec_send_frame(out.aenc, nullptr), "send audio flush");
             while (true)

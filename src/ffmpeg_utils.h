@@ -38,7 +38,7 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
 void close_input(InputContext &in);
 
 // Open output, create video encoder stream and map non-video streams.
-bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps = {});
+bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps = {}, const std::string &outputFormatName = "");
 void close_output(OutputContext &out);
 
 // Audio configuration functions
@@ -46,7 +46,7 @@ void configure_audio_from_params(const AudioParameters &params, OutputContext &o
 bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
 bool setup_audio_encoder(const InputContext &in, OutputContext &out);
 bool setup_audio_filter(const InputContext &in, OutputContext &out);
-bool process_audio_frame(AVFrame *input_frame, OutputContext &out, AVPacket *output_packet);
+bool process_audio_frame(AVFrame *input_frame, OutputContext &out);
 
 // Initialize audio PTS tracking after seeking
 void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us = AV_NOPTS_VALUE);

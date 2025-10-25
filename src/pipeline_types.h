@@ -23,7 +23,7 @@ struct InputOpenOptions
     // Seek behavior flags (FFmpeg compatibility)
     bool noAccurateSeek = false; // Use AVSEEK_FLAG_ANY for fast seeking (-noaccurate_seek)
     bool seek2any = false;       // Allow seeking to non-keyframes (-seek2any)
-    bool seekTimestamp = false;  // Use timestamp-based seeking (-seek_timestamp)
+    bool seekTimestamp = false;  // Enable/disable seeking by timestamp with -ss (when disabled, adds stream start_time to seek position)
 
     // Decoder error handling (FFmpeg compatibility)
     bool enableErrorConcealment = true; // Enable error concealment for incomplete frames (legacy default)
@@ -117,6 +117,18 @@ struct OutputContext
     AVAudioFifo *audio_fifo = nullptr;
     int64_t next_audio_pts = 0;
     int64_t a_start_pts = AV_NOPTS_VALUE; // First audio PTS for baseline
+    // Track last emitted audio DTS (in output stream time_base) to ensure strict monotonicity
+    int64_t last_audio_dts = AV_NOPTS_VALUE;
+    // Track actual accumulated samples for precise PTS calculation (prevents resampling drift)
+    int64_t accumulated_audio_samples = 0;
+
+    // Shared timestamp baseline for HLS A/V sync
+    // When HLS+COPYTS+output seeking is used, video and audio must use the same baseline
+    // to ensure tfdt values are aligned. Set by video TimestampManager, used by audio.
+    int64_t copyts_baseline_pts = AV_NOPTS_VALUE; // In microseconds
+    int64_t output_seek_target_us = 0; // Output seeking target for reference
+    bool hls_mode = false; // HLS fMP4 output mode
+    bool audio_output_seek_complete = false; // Track when audio has passed output seek point
 
     // Stream mapping: final decision for each input stream
     std::vector<StreamMapDecision> stream_decisions;

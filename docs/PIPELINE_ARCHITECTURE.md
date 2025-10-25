@@ -196,7 +196,6 @@ ffmpeg.exe -i input.mp4 -map -0:v output.mp4            # No video → Passthrou
 - ✅ **Simplified syntax**: No need for `-i` or `-o` flags
 - ✅ **RTX Processing**: Video Super Resolution + TrueHDR enabled by default
 - ✅ **Auto-corrections**: Timestamp monotonicity fixes, error concealment
-- ✅ **Enhanced compatibility**: Auto HLS discontinuity marking
 - ✅ **User-friendly**: More forgiving, aims for successful output
 
 **Behavior Differences from FFmpeg**:
@@ -205,7 +204,6 @@ ffmpeg.exe -i input.mp4 -map -0:v output.mp4            # No video → Passthrou
 | Syntax | `input output [opts]` | `-i input [opts] output` |
 | Timestamp violations | Auto-fix | Report error |
 | Decoder errors | Show corrupt frames | May drop frames |
-| HLS discontinuity | Auto-mark on seek | Manual only |
 | Processing | RTX enhancements | Standard |
 
 **Use case**: Quick video upscaling and enhancement without FFmpeg complexity
@@ -237,7 +235,6 @@ RTXVideoProcessor.exe 1080p.mp4 4k.mp4  # Simple upscale with RTX
 | RTX Processing | ✅ YES | ✅ YES |
 | Timestamp violations | Report only (like FFmpeg) | Auto-fix |
 | Error concealment | Disabled (like FFmpeg) | Enabled |
-| HLS discontinuity | Manual (like FFmpeg) | Auto-mark |
 | Monotonicity | Detect (like FFmpeg) | Enforce |
 
 **Key insight**: This mode lets you use RTXVideoProcessor as a drop-in ffmpeg replacement while getting RTX acceleration benefits AND maintaining strict FFmpeg compatibility!
@@ -337,8 +334,7 @@ parse_arguments() → cfg.ffCompatible = false (default)
   ↓
 [Standard pipeline with legacy enhancements]
   ├─ ts_config.enforce_monotonicity = true
-  ├─ inputOpts.enableErrorConcealment = true
-  └─ hlsOpts.autoDiscontinuity = true
+  └─ inputOpts.enableErrorConcealment = true
 ```
 
 #### FFmpeg-Compatible Mode
@@ -349,8 +345,7 @@ parse_arguments() → cfg.ffCompatible = true
   ↓
 [Standard pipeline with strict FFmpeg behavior]
   ├─ ts_config.enforce_monotonicity = false
-  ├─ inputOpts.enableErrorConcealment = false
-  └─ hlsOpts.autoDiscontinuity = false
+  └─ inputOpts.enableErrorConcealment = false
 ```
 
 ---
@@ -364,7 +359,6 @@ parse_arguments() → cfg.ffCompatible = true
 | **Custom Processing** | ❌ NO | ✅ YES | ✅ YES |
 | **Auto-fix timestamps** | - | ✅ YES | ❌ NO |
 | **Error concealment** | - | ✅ YES | ❌ NO |
-| **HLS auto-discontinuity** | - | ✅ YES | ❌ NO |
 | **Stream mapping** | - | ✅ FFmpeg-compatible | ✅ FFmpeg-compatible |
 | **Use Case** | Unsupported ops | Video enhancement | FFmpeg replacement |
 
@@ -462,7 +456,7 @@ config_parser.cpp:
     ├─ Basic flags: -i, -o, -format
     ├─ Processing: -cpu, --no-vsr, --no-thdr
     ├─ Stream mapping: -map, -codec:a
-    ├─ Seeking: -ss, -seek2any, -seek_timestamp
+    ├─ Seeking: -ss, -seek2any <0|1>, -seek_timestamp <0|1>
     ├─ Timestamp: -copyts, -start_at_zero, -avoid_negative_ts
     └─ HLS: -hls_time, -hls_segment_type, etc.
 ```
@@ -541,12 +535,14 @@ ffmpeg_utils.cpp:28
     │   av_parse_time(&seek_target, options->seekTime) [line 74]
     │   in.seek_offset_us = seek_target [line 81]
     │
-    │   Compose seek flags: [line 84-98]
+    │   Apply -seek_timestamp behavior: [line 80-87]
+    │   └─ If -seek_timestamp disabled (default): add stream start_time to seek target
+    │       └─ FFmpeg compatibility: adjusts for streams with non-zero start times
+    │
+    │   Compose seek flags: [line 91-100]
     │   ├─ Base: AVSEEK_FLAG_BACKWARD
-    │   ├─ If -noaccurate_seek OR -seek2any: add AVSEEK_FLAG_ANY
-    │   │   └─ Enables fast seeking to non-keyframes (inaccurate)
-    │   └─ If -seek_timestamp: add AVSEEK_FLAG_FRAME
-    │       └─ Prefer timestamp-based seeking over byte-based
+    │   └─ If -seek2any: add AVSEEK_FLAG_ANY
+    │       └─ Enables seeking to non-keyframes at demuxer level (may cause artifacts)
     │
     │   avformat_seek_file(in.fmt, ..., seek_flags) [line 100]
     │
@@ -686,10 +682,10 @@ ffmpeg_utils.cpp:251
     │   ├─ hls_flags (user-specified via -hls_flags, or auto-computed)
     │   ├─ hls_segment_options (user-specified via -hls_segment_options)
     │   │
-    │   HLS fMP4 + copyts + avoid_negative_ts disabled requires special handling:
-    │   ├─ Segment muxers inherit avoid_negative_ts=disabled from main muxer
-    │   ├─ With synchronized A/V timestamps (audio uses copyts), large tfdt values can occur
-    │   └─ Inject avoid_negative_ts=make_zero into segment options for hls.js compatibility
+    │   HLS fMP4 + copyts guidance:
+    │   ├─ Segment muxers inherit avoid_negative_ts from the main muxer
+    │   ├─ If large baseMediaDecodeTime is undesirable for your player, provide segment options explicitly via -hls_segment_options (e.g., avoid_negative_ts=make_zero)
+    │   └─ Note: The tool no longer injects avoid_negative_ts automatically; user-specified options are passed through unchanged
     │   │
     │   Compute hls_flags based on mode: [lines 332-375]
     │   ├─ If user specified -hls_flags:
@@ -699,9 +695,6 @@ ffmpeg_utils.cpp:251
     │   └─ Else (Simple mode):
     │       ├─ fmp4: "+append_list"
     │       └─ mpegts: "split_by_time+append_list"
-    │   │
-    │   If seeking + autoDiscontinuity: [lines 369-375]
-    │   └─ Add "+discont_start" flag
     │   │
     │   Apply user hls_segment_options (if specified): [lines 379-383]
     │   └─ Pass options to segment muxer (e.g., movflags=+frag_discont for fMP4+hls.js)
@@ -780,6 +773,19 @@ ffmpeg_utils.cpp:251
         ├─ Set AVIO flags (write, truncate for HLS)
         ├─ Handle pipe output (set binary mode on Windows)
         └─ avio_open2(&out.fmt->pb, outPath, ...)
+
+Additional muxer behaviors:
+
+- **ISO BMFF movflags**
+  - For MP4/fMP4 outputs (including HLS with fMP4), the muxer defaults include `+delay_moov` in addition to existing flags (e.g., `+faststart`, `+frag_keyframe`, `+default_base_moof`, `+write_colr`). Delaying the moov atom improves compatibility with codecs like EAC3 that require packet analysis before header writing.
+
+- **HLS output timestamp offset**
+  - `-output_ts_offset` is intentionally not applied to the HLS muxer. HLS segments start near zero to ensure reasonable `baseMediaDecodeTime` and better hls.js compatibility. Provide per-segment adjustments via `-hls_segment_options` if needed.
+
+- **Audio timestamping and muxing**
+  - PTS is derived from an internal `accumulated_audio_samples` counter to ensure sample-accurate timing and eliminate drift from resampling.
+  - When draining the FIFO at end-of-stream, the final frame is zero-padded to encoder frame size, but PTS advances only by the actual content samples to avoid overshoot.
+  - The output context tracks `last_audio_dts` for strict DTS monotonicity enforcement required by MP4/fMP4 muxers.
 ```
 
 ### Step 3.3: Configure Audio Processing
@@ -821,8 +827,12 @@ input_config.cpp:65
         │   ├─ Configure encoder context [lines 134-174]
         │   │   ├─ Sample rate (use config or input)
         │   │   ├─ Channel layout (use config or copy from input)
-        │   │   ├─ Bit rate (use config or default 128k)
-        │   │   └─ Sample format (from encoder or FLTP)
+        │   │   └─ Frame size / sample format
+        │
+        Audio timestamping and muxing details:
+        - PTS is derived from an internal `accumulated_audio_samples` counter to ensure sample-accurate timing and eliminate drift from resampling.
+        - When draining the FIFO at end-of-stream, the final frame is zero-padded to encoder frame size, but PTS advances only by the actual content samples to avoid overshoot.
+        - The output context tracks `last_audio_dts` for strict DTS monotonicity enforcement required by MP4/fMP4 muxers.
         │   ├─ Create output stream if needed [lines 177-183]
         │   ├─ Open encoder [line 186]
         │   ├─ Copy parameters to stream [lines 195-199]
@@ -976,7 +986,7 @@ while (true) {
 avcodec_receive_frame()
     ↓
 Accurate seeking: Discard frames before seek target [main.cpp:657-671]
-    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek AND !cfg.seek2any:
         └─ If frame_time_us < in.seek_offset_us: drop frame
             ↓
 Check for output seeking [lines 573-577]
@@ -1171,41 +1181,56 @@ ret = avcodec_send_packet(in.adec, pkt.get());
 while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
 
     // Accurate seeking: Discard audio frames before seek target [main.cpp:755-767]
-    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+    └─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek AND !cfg.seek2any:
         └─ If frame_time_us < in.seek_offset_us: drop frame
 
     // Process through filter and encoder
-    process_audio_frame(aframe.get(), out, opkt.get())
+    process_audio_frame(aframe.get(), out)
         ↓
-    ffmpeg_utils.cpp:345
-        ├─ Apply audio filter (if configured) [lines 363-399]
+    ffmpeg_utils.cpp:1265
+        ├─ Apply audio filter (if configured) [lines 1306-1351]
         │   ├─ av_buffersrc_add_frame()
         │   └─ av_buffersink_get_frame()
         │
-        ├─ Resample to encoder format [lines 402-446]
+        ├─ Resample to encoder format [lines 1354-1404]
         │   └─ swr_convert() using SwrContext
         │
-        ├─ Buffer in audio FIFO [lines 449-456]
+        ├─ Buffer in audio FIFO [lines 1407-1417]
         │   └─ av_audio_fifo_write()
         │
-        └─ Encode fixed-size frames [lines 462-545]
+        └─ Drain ALL available packets from FIFO [lines 1424-1540]
             └─ While FIFO has enough samples:
-                ├─ Read encoder->frame_size samples
-                ├─ Set PTS = next_audio_pts
-                ├─ Advance next_audio_pts immediately
+                ├─ Read encoder->frame_size samples from FIFO
+                ├─ Set PTS = accumulated_audio_samples
+                ├─ Advance accumulated_audio_samples immediately
                 │   └─ Prevents duplicate PTS when encoder buffers (EAGAIN)
                 ├─ avcodec_send_frame()
-                ├─ avcodec_receive_packet()
-                ├─ Rescale timestamps
-                ├─ Encoder generates DTS automatically
-                └─ Return packet for writing
+                │
+                └─ For each packet encoder produces:
+                    ├─ avcodec_receive_packet()
+                    ├─ Rescale timestamps to stream timebase
+                    ├─ Write packet directly: av_interleaved_write_frame()
+                    └─ Continue loop to encode next FIFO frame
+                      └─ CRITICAL: Drains ALL packets before returning
+                          └─ Ensures correct audio sample counts per HLS segment
 
-    // Write audio packet
-    if (process_audio_frame returned packet) {
-        av_interleaved_write_frame(out.fmt, opkt.get());
-    }
+    // All audio packets written internally by process_audio_frame()
 }
 ```
+
+**Audio FIFO Draining Strategy**:
+
+The `process_audio_frame()` function implements complete FIFO draining to ensure proper HLS segment boundaries:
+
+**Problem**: Input audio frames (1536 samples) don't match encoder frame size (1024 samples for AAC). Without complete draining, samples accumulate in the FIFO buffer and get written to the wrong HLS segments.
+
+**Solution**: The function now drains ALL available packets in a single call (ffmpeg_utils.cpp:1424-1540):
+1. Outer loop continues while FIFO has ≥1024 samples
+2. Inner loop retrieves all packets from encoder (handles EAGAIN buffering)
+3. Each packet is written immediately to the muxer
+4. Function only returns after FIFO is fully drained
+
+**Result**: Audio packets are written to the correct segments, matching FFmpeg behavior (~141 frames per 3-second segment instead of ~97).
 
 #### Path B: Audio Copy (COPY)
 
@@ -1215,7 +1240,7 @@ while (avcodec_receive_frame(in.adec, aframe.get()) == 0) {
 
 ```cpp
 // Accurate seeking: Discard audio packets before seek target [main.cpp:792-804]
-└─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek:
+└─ If in.seek_offset_us > 0 AND !cfg.noAccurateSeek AND !cfg.seek2any:
     └─ If pkt_time_us < in.seek_offset_us: drop packet
 
 // Rescale timestamps from input to output timebase
@@ -1454,10 +1479,20 @@ close_input(in);    // Frees decoder, demuxer
     │ (buffering)     │              │
     └────────┬────────┘              │
              │                        │
+             │ FIFO Draining Loop     │
+             │ (encodes ALL packets)  │
              ▼                        │
     ┌─────────────────┐              │
     │ Audio Encoder   │              │
     │ (AAC/etc)       │              │
+    └────────┬────────┘              │
+             │                        │
+             ▼                        │
+    ┌─────────────────┐              │
+    │ Multiple        │              │
+    │ AVPackets       │              │
+    │ (written        │              │
+    │  internally)    │              │
     └────────┬────────┘              │
              │                        │
              └────────────┬───────────┘
@@ -1558,11 +1593,7 @@ if (options && options->enableErrorConcealment) {
 **Behavior**:
 - **Simple mode** (enableErrorConcealment=true): Shows frames with artifacts instead of dropping
 - **FFmpeg-Compatible mode** (enableErrorConcealment=false): Strict FFmpeg behavior - decoder drops corrupted frames automatically
-- **Special case** (COPYTS + noaccurate_seek): Error concealment is force-enabled to prevent PTS gaps
-  - Location: main.cpp:315-325, input_config.cpp:58-67
-  - Reason: Inaccurate seeking with COPYTS preserves original PTS values, but dropped frames create gaps
-  - Solution: Output all frames (even corrupted) to maintain continuous PTS sequence
-- **Use case**: Seeking to non-keyframes (`-seek2any 1`) where reference frames may be missing
+- **Use case**: Seeking to non-keyframes (`-seek2any`) where reference frames may be missing
 - **Trade-off**: May show green/corrupted frames briefly vs. potential frame drops
 
 ### Decoder Error Handling (main.cpp:517-527)
@@ -1928,10 +1959,44 @@ The timestamp manager tracks minimal statistics. Detailed timestamp validation (
 
 ## Version History
 
+- **v2.4** (2025-01-25): Audio FIFO draining fix for HLS segment boundaries
+  - **BREAKING FIX**: Corrected audio packet distribution across HLS segments
+    - Previously: `process_audio_frame()` returned only ONE packet per call, causing samples to accumulate in FIFO buffer
+    - Issue: ~45 audio packets worth of samples remained buffered at segment boundaries, resulting in segments with only ~97 frames instead of ~141
+    - Fix: Modified `process_audio_frame()` to drain ALL available FIFO packets in a single call
+    - Result: Audio packets now written to correct segments, matching FFmpeg behavior
+  - **API Change**: Removed `AVPacket *output_packet` parameter from `process_audio_frame()`
+    - Function now writes packets directly to muxer internally
+    - Simplified calling code in main.cpp
+  - **Performance**: Eliminated redundant packet handling overhead
+  - **Compatibility**: Fixes hls.js playback issues with segment looping
+
+- **v2.3** (2025-01-23): Seeking behavior fix
+  - **BREAKING**: Fixed `-seek_timestamp` implementation to match FFmpeg behavior
+    - Previously incorrectly set `AVSEEK_FLAG_FRAME` (frame-number seeking)
+    - Now correctly controls timestamp adjustment: when disabled (default), adds stream `start_time` to seek position
+    - When enabled (`-seek_timestamp 1`), seeks to absolute timestamp without adjustment
+  - **Documentation**: Updated all documentation to reflect correct `-seek_timestamp` behavior
+
+- **v2.2** (2025-01-23): Seeking and audio improvements
+  - **Seeking flags**: `-seek2any <0|1>` and `-seek_timestamp <0|1>` now require explicit 0/1 values (FFmpeg-compatible syntax)
+  - **Seeking behavior**: Removed `-noaccurate_seek` from demuxer seek flags logic, now only `-seek2any 1` affects AVSEEK_FLAG_ANY
+  - **Frame discarding**: Both `-noaccurate_seek` and `-seek2any` now prevent frame discarding before seek target
+  - **HLS discontinuity**: Removed automatic HLS discontinuity marking on seek (was non-standard FFmpeg behavior)
+  - **Audio initialization**: Added HLS-specific audio PTS initialization to 0 for proper baseMediaDecodeTime alignment
+  - **Audio FIFO draining**: Added logic to drain remaining audio samples from FIFO at end of processing (prevents missing end audio)
+  - **Error concealment**: Removed COPYTS+noaccurate_seek special case for error concealment
+  - **Pipeline types**: Added `last_audio_dts` field for potential future DTS monotonicity tracking
+
+- **v2.2** (2025-01-24): HLS timestamp handling fix (FFmpeg-compatible)
+  - **HLS avoid_negative_ts**: Fixed to match vanilla FFmpeg behavior - skip setting on main HLS muxer
+  - **Segment muxer defaults**: HLS segment muxers now use default `auto` behavior for timestamp normalization
+  - **ISO/IEC 14496-12 compliance**: Ensures non-negative tfdt (baseMediaDecodeTime) values in fMP4 segments
+  - **hls.js compatibility**: Prevents playback loops caused by negative timestamps in segment muxers
+
 - **v2.1** (2025-01-23): Code refactoring and A/V sync improvements
   - **Code organization**: Consolidated common string utilities into src/utils.cpp/h (endsWith, lowercase_copy)
   - **Audio copyts support**: AudioConfig now preserves original timestamps with `-copyts` for proper A/V synchronization
-  - **HLS tfdt normalization**: Automatic `avoid_negative_ts=make_zero` injection for HLS fMP4 segments when using copyts mode
   - **Timestamp manager**: Added `clamp_negative_copyts` flag for `-avoid_negative_ts disabled` support
   - **CPU path optimization**: Conditional frame buffer allocation (only when CUDA path is disabled)
   - **Audio frame timebase**: Proper source timebase assignment for accurate timestamp rescaling in process_audio_frame()

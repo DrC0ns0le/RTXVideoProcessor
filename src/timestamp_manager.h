@@ -38,6 +38,7 @@ public:
         bool vsync_cfr = false;            // CFR mode: generate timestamps at constant frame rate
         AVRational cfr_frame_rate = {0, 1}; // Frame rate for CFR mode
         bool clamp_negative_copyts = true; // If false, allow negative PTS in COPYTS (avoid_negative_ts=disabled)
+        bool hls_mode = false;             // HLS fMP4 mode: preserve tfdt baseMediaDecodeTime for A/V sync
     };
 
     explicit TimestampManager(const Config &config) : cfg_(config)
@@ -46,6 +47,26 @@ public:
                   config.mode == Mode::COPYTS ? "COPYTS" : "NORMAL",
                   config.input_seek_us,
                   config.start_at_zero ? "enabled" : "disabled");
+    }
+
+    // CFR helper utilities (no side effects on last index)
+    bool cfrActive() const { return cfg_.vsync_cfr; }
+    void ensureCfrBaseline(int64_t in_pts)
+    {
+        if (cfr_baseline_in_pts_ == AV_NOPTS_VALUE)
+            cfr_baseline_in_pts_ = in_pts;
+    }
+    int64_t getLastCfrIndex() const { return cfr_last_index_; }
+    void setLastCfrIndex(int64_t idx) { cfr_last_index_ = idx; }
+    int64_t cfrTargetIndexFromInput(int64_t in_pts, AVRational in_tb) const
+    {
+        if (cfr_baseline_in_pts_ == AV_NOPTS_VALUE) return 0;
+        int64_t delta_in = in_pts - cfr_baseline_in_pts_;
+        return av_rescale_q_rnd(delta_in, in_tb, cfg_.cfr_frame_rate, AV_ROUND_NEAR_INF);
+    }
+    int64_t cfrIndexToPts(int64_t index, AVRational out_tb) const
+    {
+        return av_rescale_q_rnd(index, av_inv_q(cfg_.cfr_frame_rate), out_tb, AV_ROUND_NEAR_INF);
     }
 
     // ========== Video Frame PTS Derivation ==========
@@ -58,18 +79,38 @@ public:
                            AVRational in_time_base,
                            AVRational out_time_base)
     {
-        // CFR mode: generate constant frame rate timestamps
+        // CFR mode: quantize input PTS to CFR ticks and drop frames mapping to the same CFR index
         if (cfg_.vsync_cfr)
         {
-            // Calculate PTS directly from frame counter to avoid rounding error accumulation
-            // Convert frame_counter (in frame units) to output timebase
-            // This ensures perfect timing: frame N has PTS = N * (1/fps) in output timebase
-            //
-            // Example: 24fps, frame 24 should be at exactly 1 second
-            //   av_rescale_q(24, {1, 24}, {1, 16000}) = 16000 (exact)
-            //   vs. 24 * 666 = 15984 (accumulated error from integer division)
-            int64_t cfr_pts = av_rescale_q(frame_counter_, av_inv_q(cfg_.cfr_frame_rate), out_time_base);
-            frame_counter_++;
+            int64_t in_pts = (frame->pts != AV_NOPTS_VALUE)
+                                 ? frame->pts
+                                 : frame->best_effort_timestamp;
+            if (in_pts == AV_NOPTS_VALUE)
+            {
+                // If no input PTS, fall back to frame counter-based CFR
+                int64_t cfr_pts_fc = av_rescale_q_rnd(frame_counter_, av_inv_q(cfg_.cfr_frame_rate), out_time_base, AV_ROUND_NEAR_INF);
+                frame_counter_++;
+                return cfr_pts_fc;
+            }
+
+            // Establish CFR baseline on first frame
+            if (cfr_baseline_in_pts_ == AV_NOPTS_VALUE)
+                cfr_baseline_in_pts_ = in_pts;
+
+            // Compute target CFR frame index from input PTS relative to baseline
+            int64_t delta_in = in_pts - cfr_baseline_in_pts_;
+            int64_t target_index = av_rescale_q_rnd(delta_in, in_time_base, cfg_.cfr_frame_rate, AV_ROUND_NEAR_INF);
+
+            // Drop if this frame maps to the same CFR index as last emitted
+            if (cfr_last_index_ != AV_NOPTS_VALUE && target_index <= cfr_last_index_)
+            {
+                return AV_NOPTS_VALUE; // signal drop
+            }
+
+            cfr_last_index_ = target_index;
+
+            // Quantized CFR PTS in output timebase
+            int64_t cfr_pts = av_rescale_q_rnd(target_index, av_inv_q(cfg_.cfr_frame_rate), out_time_base, AV_ROUND_NEAR_INF);
             return cfr_pts;
         }
 
@@ -105,6 +146,12 @@ public:
     /**
      * Check if frame should be dropped during output seeking
      * Used for -ss output seeking (frame-level seeking after decode)
+     *
+     * FFmpeg's behavior: With double -ss (e.g., -ss 60 -i input -ss 60), frames
+     * before the output seek target are decoded but NOT muxed. This ensures:
+     * - Content starts at the output seek position (60s), not the keyframe (50s)
+     * - Duration is measured from output seek target (60+12=72s), not keyframe (50+12=62s)
+     * - HLS tfdt values reflect the correct playback timeline position
      */
     bool shouldDropFrameForOutputSeek(const AVFrame *frame, AVRational time_base)
     {
@@ -129,7 +176,7 @@ public:
         // Convert to microseconds
         int64_t frame_pts_us = av_rescale_q(frame_pts, time_base, {1, AV_TIME_BASE});
 
-        // Drop frames before target
+        // Drop frames before target (FFmpeg behavior for output seeking)
         if (frame_pts_us < cfg_.output_seek_target_us)
         {
             dropped_frame_count_++;
@@ -161,6 +208,12 @@ public:
     int64_t getFrameCount() const { return frame_counter_; }
     int getDroppedFrames() const { return dropped_frame_count_; }
 
+    // Get the copyts baseline for audio synchronization
+    // Returns the baseline PTS that was subtracted from timestamps (in input timebase ticks)
+    // Audio can use this to apply the same normalization for A/V sync
+    int64_t getCopytsBaseline() const { return copyts_baseline_pts_; }
+    bool hasCopytsBaseline() const { return copyts_baseline_pts_ != AV_NOPTS_VALUE; }
+
 private:
     Config cfg_;
 
@@ -173,11 +226,15 @@ private:
     int64_t frame_counter_ = 0;
     int dropped_frame_count_ = 0;
 
+    // CFR quantization state
+    int64_t cfr_baseline_in_pts_ = AV_NOPTS_VALUE; // input-pts baseline for CFR quantization
+    int64_t cfr_last_index_ = AV_NOPTS_VALUE;      // last emitted CFR frame index
+
     // ========== Internal Implementation ==========
 
     /**
      * COPYTS mode: Preserve original timestamps
-     * Optionally apply -start_at_zero offset
+     * Optionally apply -start_at_zero offset or output seeking normalization
      */
     int64_t deriveCopytsPTS(int64_t in_pts, AVRational in_tb, AVRational out_tb)
     {
@@ -191,13 +248,37 @@ private:
             return 0;
         }
 
-        // Apply -start_at_zero offset (subtract first frame PTS)
-        if (cfg_.start_at_zero)
+        // FFmpeg behavior with output seeking and COPYTS:
+        // - Non-HLS: Normalize to zero (avoid_negative_ts=auto)
+        // - HLS: Normalize to output seek target for correct tfdt (baseMediaDecodeTime)
+        //
+        // HLS players like Stremio rely on tfdt to sync A/V tracks. The tfdt must reflect
+        // the playback timeline position (e.g., 60s seek = tfdt starts at ~60s equivalent),
+        // not the decode timeline (which may start earlier due to keyframe seeking).
+        bool should_normalize = cfg_.start_at_zero || (cfg_.output_seek_target_us > 0);
+
+        if (should_normalize)
         {
             if (copyts_baseline_pts_ == AV_NOPTS_VALUE)
             {
-                copyts_baseline_pts_ = out_pts;
-                LOG_DEBUG("COPYTS baseline established at %lld for -start_at_zero", copyts_baseline_pts_);
+                // For HLS mode with output seeking, baseline relative to output seek target
+                // This ensures tfdt reflects the playback position, not decode position
+                if (cfg_.hls_mode && cfg_.output_seek_target_us > 0)
+                {
+                    // Set baseline to (first_frame_pts - output_seek_target)
+                    // This makes timestamps start near output_seek_target in the timeline
+                    int64_t seek_target_pts = av_rescale_q(cfg_.output_seek_target_us, {1, AV_TIME_BASE}, out_tb);
+                    copyts_baseline_pts_ = out_pts - seek_target_pts;
+                    LOG_DEBUG("COPYTS baseline for HLS: first_pts=%lld, seek_target=%lld, baseline=%lld",
+                              out_pts, seek_target_pts, copyts_baseline_pts_);
+                }
+                else
+                {
+                    // Non-HLS or start_at_zero: normalize to zero
+                    copyts_baseline_pts_ = out_pts;
+                    const char* reason = cfg_.start_at_zero ? "-start_at_zero" : "output seeking";
+                    LOG_DEBUG("COPYTS baseline established at %lld for %s", copyts_baseline_pts_, reason);
+                }
             }
             out_pts -= copyts_baseline_pts_;
         }

@@ -676,8 +676,10 @@ int64_t out_pts = av_rescale_q(in_pts, in_timebase, out_timebase);
 - Buffering and interleaving require predictable order
 
 **RTXVideoProcessor Handling**:
-- Encoder ensures PTS/DTS monotonicity internally
-- Muxer (`av_interleaved_write_frame`) validates and may reject violations
+- Encoder ensures PTS/DTS monotonicity internally, and the pipeline additionally enforces strict DTS monotonicity for audio when muxing MP4/fMP4.
+- Audio PTS is derived from a cumulative `accumulated_audio_samples` counter to maintain sample-accurate timing and avoid drift from resampling.
+- When draining the final audio FIFO frame, any zero-padding does not advance the PTS beyond the actual number of content samples, preventing end-of-stream overshoot.
+- Muxer (`av_interleaved_write_frame`) validates and may reject violations; the pipeline tracks `last_audio_dts` to ensure strictly increasing DTS for audio.
 - Simple Mode: Would auto-fix violations (legacy behavior)
 - FFmpeg-Compatible Mode: Reports violations without auto-fix
 
@@ -837,6 +839,7 @@ I B B P B B P B B I
 - Supports both MPEG-TS and fMP4 segments
 - Configurable segment duration (default: 4 seconds)
 - GOP aligned to segment boundaries
+ - Output timestamp offset (`-output_ts_offset`) is intentionally not applied to HLS segments; segments start near zero to keep `baseMediaDecodeTime` reasonable for players.
 
 ### fMP4 (Fragmented MP4)
 
@@ -1015,7 +1018,7 @@ Muxer → Output File
 
 **AVSEEK_FLAG_ANY**
 - Allow seeking to non-keyframes (faster but less accurate)
-- Enabled by `-seek2any` or `-noaccurate_seek`
+- Enabled by `-seek2any` flag at demuxer level
 
 **av_rescale_q()**
 - FFmpeg function to convert timestamps between timebases

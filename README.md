@@ -98,7 +98,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--nvenc-tune <string>`**: NVENC tune (default `hq`)
 - **`--nvenc-preset <string>`**: NVENC preset (default `p7`)
 - **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`)
-- **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 1)
+- **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 3)
 - **`--nvenc-bframes <int>`**: Maximum B-frame count (default 2)
 - **`--nvenc-qp <int>`**: Constant QP (default 21 when `constqp` is active)
 - **`--nvenc-bitrate-multiplier <int>`**: Bitrate multiplier (default 5×, fallback 25 Mbps)
@@ -138,11 +138,15 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-start_at_zero`**: Force output timestamps to start at zero
 - **`-avoid_negative_ts <mode>`**: Handle negative timestamps (`auto`/`make_zero`/`make_non_negative`/`disabled`)
 - **`-output_ts_offset <time>`**: Add offset to output timestamps
-- **`-noaccurate_seek`**: Fast seek to nearest keyframe
-- **`-seek2any <0|1>`**: Allow seeking to non-keyframes (may cause artifacts)
-- **`-seek_timestamp <0|1>`**: Use timestamp-based seeking (AVSEEK_FLAG_FRAME)
-  - When enabled (1), seeks by frame timestamps instead of byte positions
-  - Works in combination with `-ss` seeking option
+  - Note: For HLS output, this offset is intentionally not applied to the segment muxer; HLS segments start near zero for better `baseMediaDecodeTime` and player compatibility.
+- **`-noaccurate_seek`**: Discard frames before seek target (default behavior when seeking with `-ss`)
+- **`-seek2any <0|1>`**: Allow seeking to non-keyframes at demuxer level (may cause artifacts until next keyframe)
+  - Enables `AVSEEK_FLAG_ANY` for faster but less accurate seeking
+  - Can produce garbled output until the next keyframe is decoded
+- **`-seek_timestamp <0|1>`**: Enable/disable seeking by timestamp with `-ss`
+  - When disabled (default, `0`): adds stream `start_time` to seek position (FFmpeg default behavior)
+  - When enabled (`1`): seeks to absolute timestamp without adjustment
+  - FFmpeg compatibility option for streams with non-zero start times
 - **`-vsync <mode>`**: Video synchronization mode
   - `cfr`: Constant frame rate - generates evenly spaced timestamps
   - Useful for fixing variable frame rate issues or ensuring consistent playback timing
@@ -152,13 +156,14 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-hls_time <seconds>`**: Segment duration in seconds (default 2)
 - **`-hls_segment_type <type>`**: Segment type (`mpegts` or `fmp4`)
 - **`-hls_fmp4_init_filename <file>`**: fMP4 initialization file name
-- **`-hls_segment_filename <pattern>`**: Segment filename pattern (e.g., `segment_%03d.m4s`)
+- **`-hls_segment_filename <pattern>`**: Segment filename pattern (default: auto-generated with `.m4s` for fMP4, `.ts` for MPEGTS)
 - **`-hls_playlist_type <type>`**: Playlist type (`event` or `vod`)
 - **`-hls_list_size <count>`**: Maximum number of playlist entries (0 = all)
 - **`-start_number <num>`**: Start segment numbering from this value
 
 **Muxer Options**
 - **`-movflags <flags>`**: MP4 muxer flags (e.g., `+faststart`, `+frag_keyframe`)
+  - Default behavior: For ISO BMFF outputs (MP4/fMP4, including HLS with fMP4), the tool enables `+delay_moov` by default alongside other flags (e.g., `+faststart`, `+default_base_moof`, `+write_colr`). Delaying the moov atom improves compatibility with codecs like EAC3 that require packet analysis before header writing.
 - **`-frag_duration <microseconds>`**: Fragment duration for fragmented MP4
 - **`-fragment_index <num>`**: Fragment index
 - **`-use_editlist <0|1>`**: Use MP4 edit lists
