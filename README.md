@@ -102,6 +102,9 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--nvenc-bframes <int>`**: Maximum B-frame count (default 2)
 - **`--nvenc-qp <int>`**: Constant QP (default 21 when `constqp` is active)
 - **`--nvenc-bitrate-multiplier <int>`**: Bitrate multiplier (default 5×, fallback 25 Mbps)
+ - **`-r <fps>`, `-r:v <fps>`**: Override output framerate
+   - Works with `-vsync cfr` to produce a constant frame rate timeline
+   - Encoder timebase is chosen to yield exact ticks-per-frame for CFR when possible; otherwise an integer timescale is used
 
 ### FFmpeg-Compatible Mode Only
 

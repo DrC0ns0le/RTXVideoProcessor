@@ -781,6 +781,7 @@ Additional muxer behaviors:
 
 - **HLS output timestamp offset**
   - `-output_ts_offset` is intentionally not applied to the HLS muxer. HLS segments start near zero to ensure reasonable `baseMediaDecodeTime` and better hls.js compatibility. Provide per-segment adjustments via `-hls_segment_options` if needed.
+  - In HLS, any overall timestamp offset is applied during TimestampManager normalization (not by the muxer) so that fMP4 tfdt (baseMediaDecodeTime) reflects the playback timeline while segment-local times remain near zero.
 
 - **Audio timestamping and muxing**
   - PTS is derived from an internal `accumulated_audio_samples` counter to ensure sample-accurate timing and eliminate drift from resampling.
@@ -886,6 +887,8 @@ struct Config {
 };
 ```
 
+Note: CFR synchronization is implemented in main.cpp via `cfrSync()`. `TimestampManager::deriveVideoPTS()` is used for non-CFR paths; it no longer generates CFR timestamps directly.
+
 **Timestamp Modes**:
 ```
 NORMAL mode:
@@ -901,7 +904,7 @@ COPYTS mode:
 CFR mode (-vsync cfr):
     ├─ Generates constant frame rate timestamps
     ├─ PTS = frame_counter * (1/fps) in output timebase
-    └─ Useful for fixing variable frame rate issues
+    └─ Useful for fixing variable frame rate issues (implementation in main.cpp via `cfrSync()`)
 ```
 
 ---
