@@ -212,7 +212,7 @@ static void apply_movflags(AVDictionary **muxopts, bool is_pipe, bool hls_enable
     if (!cfg.movflags.empty())
     {
         av_dict_set(muxopts, "movflags", cfg.movflags.c_str(), 0);
-        LOG_DEBUG("Applied user movflags: %s\n", cfg.movflags.c_str());
+        LOG_DEBUG("Applied user movflags: %s", cfg.movflags.c_str());
         return;
     }
 

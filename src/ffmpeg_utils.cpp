@@ -294,51 +294,51 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
 
     if (out.hlsOptions.enabled)
     {
-        LOG_DEBUG("HLS muxer enabled, setting up options\n");
+        LOG_DEBUG("HLS muxer enabled, setting up options");
         AVDictionary *muxOpts = nullptr;
         if (out.hlsOptions.hlsTime > 0)
         {
             std::string value = std::to_string(out.hlsOptions.hlsTime);
             av_dict_set(&muxOpts, "hls_time", value.c_str(), 0);
-            LOG_DEBUG("Set hls_time = %s\n", value.c_str());
+            LOG_DEBUG("Set hls_time = %s", value.c_str());
         }
         if (!out.hlsOptions.segmentFilename.empty())
         {
             av_dict_set(&muxOpts, "hls_segment_filename", out.hlsOptions.segmentFilename.c_str(), 0);
-            LOG_DEBUG("Set hls_segment_filename = %s\n", out.hlsOptions.segmentFilename.c_str());
+            LOG_DEBUG("Set hls_segment_filename = %s", out.hlsOptions.segmentFilename.c_str());
         }
         if (!out.hlsOptions.segmentType.empty())
         {
             av_dict_set(&muxOpts, "hls_segment_type", out.hlsOptions.segmentType.c_str(), 0);
-            LOG_DEBUG("Set hls_segment_type = %s\n", out.hlsOptions.segmentType.c_str());
+            LOG_DEBUG("Set hls_segment_type = %s", out.hlsOptions.segmentType.c_str());
         }
         if (!out.hlsOptions.initFilename.empty())
         {
             av_dict_set(&muxOpts, "hls_fmp4_init_filename", out.hlsOptions.initFilename.c_str(), 0);
-            LOG_DEBUG("Set hls_fmp4_init_filename = %s\n", out.hlsOptions.initFilename.c_str());
+            LOG_DEBUG("Set hls_fmp4_init_filename = %s", out.hlsOptions.initFilename.c_str());
         }
         if (out.hlsOptions.startNumber >= 0)
         {
             std::string value = std::to_string(out.hlsOptions.startNumber);
             av_dict_set(&muxOpts, "start_number", value.c_str(), 0);
-            LOG_DEBUG("Set start_number = %s\n", value.c_str());
+            LOG_DEBUG("Set start_number = %s", value.c_str());
         }
         if (!out.hlsOptions.playlistType.empty())
         {
             av_dict_set(&muxOpts, "hls_playlist_type", out.hlsOptions.playlistType.c_str(), 0);
-            LOG_DEBUG("Set hls_playlist_type = %s\n", out.hlsOptions.playlistType.c_str());
+            LOG_DEBUG("Set hls_playlist_type = %s", out.hlsOptions.playlistType.c_str());
         }
         if (out.hlsOptions.listSize >= 0)
         {
             std::string value = std::to_string(out.hlsOptions.listSize);
             av_dict_set(&muxOpts, "hls_list_size", value.c_str(), 0);
-            LOG_DEBUG("Set hls_list_size = %s\n", value.c_str());
+            LOG_DEBUG("Set hls_list_size = %s", value.c_str());
         }
         if (out.hlsOptions.maxDelay >= 0)
         {
             std::string value = std::to_string(out.hlsOptions.maxDelay);
             av_dict_set(&muxOpts, "max_delay", value.c_str(), 0);
-            LOG_DEBUG("Set max_delay = %s\n", value.c_str());
+            LOG_DEBUG("Set max_delay = %s", value.c_str());
         }
 
         // Set hls_flags: user-specified flags take precedence over automatic flags
@@ -347,7 +347,7 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         {
             // User explicitly specified hls_flags via -hls_flags option
             hlsFlags = out.hlsOptions.customFlags;
-            LOG_DEBUG("Using user-specified hls_flags = %s\n", hlsFlags.c_str());
+            LOG_DEBUG("Using user-specified hls_flags = %s", hlsFlags.c_str());
         }
         else if (!out.hlsOptions.autoDiscontinuity) // autoDiscontinuity = !ffCompatible
         {
@@ -372,7 +372,7 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         if (!hlsFlags.empty())
         {
             av_dict_set(&muxOpts, "hls_flags", hlsFlags.c_str(), 0);
-            LOG_DEBUG("Set hls_flags = %s\n", hlsFlags.c_str());
+            LOG_DEBUG("Set hls_flags = %s", hlsFlags.c_str());
         }
 
         // Apply user-specified segment options (e.g., movflags=+frag_discont for fMP4)
@@ -380,19 +380,19 @@ bool open_output(const char *outPath, const InputContext &in, OutputContext &out
         if (!out.hlsOptions.segmentOptions.empty())
         {
             av_dict_set(&muxOpts, "hls_segment_options", out.hlsOptions.segmentOptions.c_str(), 0);
-            LOG_INFO("HLS: Applied segment options: %s (passed to individual segment muxers)\n", out.hlsOptions.segmentOptions.c_str());
+            LOG_INFO("HLS: Applied segment options: %s (passed to individual segment muxers)", out.hlsOptions.segmentOptions.c_str());
         }
         else if (out.hlsOptions.segmentType == "fmp4")
         {
-            LOG_INFO("HLS: No custom segment options specified. Using default movflags (+frag_discont+frag_keyframe) from main muxer.\n");
+            LOG_INFO("HLS: No custom segment options specified. Using default movflags (+frag_discont+frag_keyframe) from main muxer.");
         }
 
         // Debug: Print all HLS options that will be passed to the muxer
-        LOG_DEBUG("Final HLS muxer options:\n");
+        LOG_DEBUG("Final HLS muxer options:");
         AVDictionaryEntry *entry = nullptr;
         while ((entry = av_dict_get(muxOpts, "", entry, AV_DICT_IGNORE_SUFFIX)))
         {
-            LOG_DEBUG("  %s = %s\n", entry->key, entry->value);
+            LOG_DEBUG("  %s = %s", entry->key, entry->value);
         }
 
         out.muxOptions = muxOpts;

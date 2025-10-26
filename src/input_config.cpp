@@ -84,7 +84,7 @@ void configure_audio_processing(PipelineConfig &cfg, InputContext &in, OutputCon
 {
     if (cfg.ffCompatible)
     {
-        LOG_DEBUG("Compatibility mode enabled, configuring audio...\n");
+        LOG_DEBUG("Compatibility mode enabled, configuring audio...");
 
         AudioParameters audioParams;
         audioParams.codec = cfg.audioCodec;
@@ -95,7 +95,7 @@ void configure_audio_processing(PipelineConfig &cfg, InputContext &in, OutputCon
         audioParams.streamMaps = cfg.streamMaps;
 
         configure_audio_from_params(audioParams, out);
-        LOG_DEBUG("Audio config completed, enabled=%s\n", out.audioConfig.enabled ? "true" : "false");
+        LOG_DEBUG("Audio config completed, enabled=%s", out.audioConfig.enabled ? "true" : "false");
 
         if (out.audioConfig.enabled)
         {
@@ -104,11 +104,11 @@ void configure_audio_processing(PipelineConfig &cfg, InputContext &in, OutputCon
             // Skip encoder setup for copy mode (audio will be copied directly)
             if (out.audioConfig.codec == "copy")
             {
-                LOG_DEBUG("Audio copy mode enabled, skipping encoder setup\n");
+                LOG_DEBUG("Audio copy mode enabled, skipping encoder setup");
             }
             else
             {
-                LOG_DEBUG("Setting up audio encoder...\n");
+                LOG_DEBUG("Setting up audio encoder...");
                 if (!setup_audio_encoder(in, out))
                 {
                     LOG_WARN("Failed to setup audio encoder, disabling audio processing");
@@ -116,21 +116,21 @@ void configure_audio_processing(PipelineConfig &cfg, InputContext &in, OutputCon
                 }
                 else
                 {
-                    LOG_DEBUG("Audio encoder setup complete\n");
-                    LOG_DEBUG("Setting up audio filter...\n");
+                    LOG_DEBUG("Audio encoder setup complete");
+                    LOG_DEBUG("Setting up audio filter...");
                     if (!setup_audio_filter(in, out))
                     {
                         LOG_WARN("Failed to setup audio filter, continuing without filtering");
                     }
                     else
                     {
-                        LOG_DEBUG("Audio filter setup complete\n");
+                        LOG_DEBUG("Audio filter setup complete");
                     }
                 }
             }
         }
     }
-    LOG_DEBUG("Audio configuration complete, proceeding...\n");
+    LOG_DEBUG("Audio configuration complete, proceeding...");
 }
 
 // Setup progress tracking
