@@ -1283,9 +1283,10 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out)
                                                 input_frame->time_base,
                                                 out.aenc->time_base);
 
-            // Apply HLS baseline normalization to match video tfdt timeline
-            // Use the shared baseline from video to ensure audio and video tfdt values are aligned
-            if (out.hls_mode && out.output_seek_target_us > 0 && out.copyts_baseline_pts != AV_NOPTS_VALUE)
+            // Apply baseline normalization to match video tfdt timeline
+            // Use the shared baseline from video (which includes output_ts_offset if set)
+            // This ensures audio and video tfdt values are aligned for proper A/V sync
+            if (out.copyts_baseline_pts != AV_NOPTS_VALUE)
             {
                 // Convert the shared baseline (in microseconds) to audio encoder timebase
                 int64_t baseline_audio_tb = av_rescale_q(out.copyts_baseline_pts,
@@ -1296,7 +1297,7 @@ bool process_audio_frame(AVFrame *input_frame, OutputContext &out)
                 int64_t original_pts = rescaled_pts;
                 rescaled_pts -= baseline_audio_tb;
 
-                LOG_DEBUG("COPYTS+HLS: Normalized audio using shared baseline: first_pts=%lld, baseline=%lld us (%lld in audio tb), normalized_pts=%lld",
+                LOG_DEBUG("COPYTS: Normalized audio using shared baseline: first_pts=%lld, baseline=%lld us (%lld in audio tb), normalized_pts=%lld",
                           original_pts, out.copyts_baseline_pts, baseline_audio_tb, rescaled_pts);
             }
 

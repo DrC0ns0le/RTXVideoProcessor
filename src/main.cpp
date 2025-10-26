@@ -107,6 +107,28 @@ static inline void encode_and_write(AVCodecContext *enc,
 
         av_packet_rescale_ts(opkt.get(), enc->time_base, vstream->time_base);
 
+        // DTS monotonicity fix (mirrors fftools/ffmpeg_mux.c:mux_fixup_ts)
+        // NVENC generates duplicate DTS at GOP boundaries with forced-idr + strict_gop (HLS alignment).
+        // This is standard FFmpeg behavior - the CLI tool applies the same correction before muxing.
+        // Without this, HLS muxer fails with "non monotonically increasing dts" errors.
+        static int64_t last_dts = AV_NOPTS_VALUE;
+        if (last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
+        {
+            int64_t max_dts = last_dts + 1; // Minimum acceptable DTS
+            if (opkt->dts < max_dts)
+            {
+                LOG_DEBUG("DTS monotonicity: adjusting packet DTS from %lld to %lld", opkt->dts, max_dts);
+                opkt->dts = max_dts;
+
+                // Ensure PTS >= DTS after adjustment (FFmpeg requirement)
+                if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
+                {
+                    opkt->pts = opkt->dts;
+                }
+            }
+        }
+        last_dts = opkt->dts;
+
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
     }
@@ -249,9 +271,9 @@ static void write_muxer_header(InputContext &in, OutputContext &out, bool hls_en
 
     // Apply output_ts_offset to muxer (FFmpeg-compatible behavior)
     // libavformat/mux.c applies this offset to ALL packet timestamps during av_interleaved_write_frame()
-    // Works in BOTH copyts and non-copyts modes (verified from FFmpeg source & Jellyfin HLS):
-    // - Non-copyts mode: Adds offset to zero-based timestamps (e.g., 0s → 24s)
-    // - Copyts mode: Adds offset to preserved timestamps (e.g., 24s seek → 24s+24s offset = 48s final)
+    // Works in BOTH copyts and non-copyts modes:
+    // - Non-copyts mode: Adds offset to zero-based timestamps (e.g., 0s → 24s output)
+    // - Copyts mode: Adds offset to normalized timestamps (e.g., normalized to 0s → 0s+1076s offset = 1076s output)
     //
     // CRITICAL: Do NOT apply output_ts_offset for HLS muxer!
     // HLS segments require timestamps starting near zero for proper playback in hls.js and other players.
@@ -279,7 +301,7 @@ static void write_muxer_header(InputContext &in, OutputContext &out, bool hls_en
     }
     else if (!cfg.outputTsOffset.empty() && hls_enabled)
     {
-        LOG_DEBUG("Skipping output_ts_offset for HLS muxer (HLS requires timestamps near zero for playback compatibility)");
+        LOG_DEBUG("HLS mode: output_ts_offset handled by TimestampManager, not muxer (Stremio compatibility)");
     }
 
     if (cfg.maxMuxingQueueSize > 0)
@@ -357,6 +379,22 @@ int run_pipeline(PipelineConfig cfg)
         if (fr.num == 0 || fr.den == 0) fr = in.vst->r_frame_rate;
         if (fr.num == 0 || fr.den == 0) fr = in.vst->avg_frame_rate;
         if (fr.num == 0 || fr.den == 0) fr = AVRational{in.vst->time_base.den, in.vst->time_base.num};
+
+        // Override framerate if -r or -r:v flag was specified (FFmpeg compatibility)
+        if (!cfg.outputFrameRate.empty())
+        {
+            AVRational override_fr;
+            int ret = av_parse_video_rate(&override_fr, cfg.outputFrameRate.c_str());
+            if (ret < 0)
+            {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                throw std::runtime_error("Invalid framerate format for -r: " + cfg.outputFrameRate + " (" + std::string(errbuf) + ")");
+            }
+            LOG_INFO("Output framerate override: %d/%d (%.3f fps) via -r flag",
+                     override_fr.num, override_fr.den, av_q2d(override_fr));
+            fr = override_fr;
+        }
 
         int64_t total_frames = setup_progress_tracking(in, fr);
 
@@ -546,6 +584,18 @@ int run_pipeline(PipelineConfig cfg)
                 LOG_WARN("Output seek target (%.3fs) < input seek (%.3fs) - may cause unexpected behavior",
                          ts_config.output_seek_target_us / 1000000.0, in.seek_offset_us / 1000000.0);
             }
+        }
+
+        // Parse output timestamp offset (Stremio compatibility - sets first frame PTS to offset value)
+        // Used with HLS/DASH for maintaining timeline position during seeking
+        if (!cfg.outputTsOffset.empty())
+        {
+            int ret = av_parse_time(&ts_config.output_ts_offset_us, cfg.outputTsOffset.c_str(), 1);
+            if (ret < 0)
+            {
+                throw std::runtime_error("Invalid output timestamp offset format: " + cfg.outputTsOffset);
+            }
+            LOG_DEBUG("Output timestamp offset enabled: offset = %.3fs", ts_config.output_ts_offset_us / 1000000.0);
         }
 
         // Enable HLS mode for proper tfdt (baseMediaDecodeTime) handling
@@ -760,34 +810,59 @@ int run_pipeline(PipelineConfig cfg)
                         }
                         else
                         {
-                            // Quantize to CFR grid and duplicate as needed (FFmpeg-like behavior)
-                            ts_manager.ensureCfrBaseline(in_pts);
-                            int64_t last_idx = ts_manager.getLastCfrIndex();
-                            int64_t target_idx = ts_manager.cfrTargetIndexFromInput(in_pts, in.vst->time_base);
+                            // CFR synchronization (FFmpeg-compliant delta-based approach)
+                            // IMPORTANT: Apply COPYTS baseline normalization BEFORE CFR sync
+                            // FFmpeg's CFR works with normalized timestamps (starting at 0), not raw input timestamps
 
-                            // ticks-per-frame (encoder tb)
-                            int64_t tpf = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
-                            if (tpf <= 0) tpf = 1;
-
-                            // Emit duplicates of the current processed frame for any missing indices before target
-                            for (int64_t dup_idx = (last_idx == AV_NOPTS_VALUE ? 0 : last_idx + 1); dup_idx < target_idx; ++dup_idx)
+                            // First, get baseline-normalized PTS using deriveVideoPTS
+                            // This handles COPYTS baseline, output seeking, etc.
+                            int64_t normalized_pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
+                            if (normalized_pts == AV_NOPTS_VALUE)
                             {
-                                int64_t dup_pts = ts_manager.cfrIndexToPts(dup_idx, out.venc->time_base);
-                                outFrame->pts = dup_pts;
-                                outFrame->duration = (int)tpf;
-                                if (use_cuda_path) cudaStreamSynchronize(0);
-                                encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send dup frame to encoder");
+                                av_frame_unref(frame.get());
+                                if (swframe)
+                                    av_frame_unref(swframe.get());
+                                continue;
                             }
 
-                            // Encode the current frame at its target index
-                            int64_t cur_pts = ts_manager.cfrIndexToPts(target_idx, out.venc->time_base);
-                            outFrame->pts = cur_pts;
-                            outFrame->duration = (int)tpf;
-                            if (use_cuda_path) cudaStreamSynchronize(0);
-                            encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+                            // Create a temporary frame with normalized PTS for CFR sync
+                            // CFR sync needs to see timestamps starting at ~0, not raw input timeline
+                            AVFrame temp_frame = *decframe;
+                            temp_frame.pts = normalized_pts;
+                            temp_frame.time_base = out.venc->time_base;
 
-                            // Update last CFR index
-                            ts_manager.setLastCfrIndex(target_idx);
+                            int64_t cfr_pts;  // PTS in CFR timebase (av_inv_q(framerate))
+                            double cfr_duration;
+                            int64_t nb_frames = ts_manager.cfrSync(&temp_frame, out.venc->time_base, out.venc->time_base, &cfr_pts, &cfr_duration);
+
+                            if (nb_frames == 0)
+                            {
+                                // Drop frame (delta < -1.1 or below threshold)
+                                av_frame_unref(frame.get());
+                                if (swframe)
+                                    av_frame_unref(swframe.get());
+                                continue;
+                            }
+
+                            // Calculate duration in encoder timebase ticks
+                            int64_t duration_ticks = (int64_t)llrint(cfr_duration);
+                            if (duration_ticks <= 0) duration_ticks = 1;
+
+                            // CFR timebase: 1 tick = 1 frame (e.g., 21/500 for 500/21 fps)
+                            AVRational cfr_tb = av_inv_q(fr);
+
+                            // Output nb_frames times (1 for normal, >1 for duplication)
+                            for (int64_t i = 0; i < nb_frames; i++)
+                            {
+                                // Convert from CFR timebase to encoder timebase
+                                // FFmpeg equivalently uses filter output tb = av_inv_q(framerate)
+                                int64_t encoder_pts = av_rescale_q(cfr_pts + i, cfr_tb, out.venc->time_base);
+                                outFrame->pts = encoder_pts;
+                                outFrame->duration = duration_ticks;
+
+                                if (use_cuda_path) cudaStreamSynchronize(0);
+                                encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send CFR frame to encoder");
+                            }
                         }
 
                         // Share the COPYTS baseline with audio (same as generic path)
@@ -816,6 +891,13 @@ int run_pipeline(PipelineConfig cfg)
                                 av_frame_unref(swframe.get());
                             continue;
                         }
+
+                        // Set frame duration from framerate (FFmpeg-compliant behavior)
+                        // This helps the encoder generate proper frame timing
+                        int64_t frame_duration = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                        if (frame_duration <= 0) frame_duration = 1;  // Safety clamp
+                        outFrame->duration = frame_duration;
+
                         if (use_cuda_path) cudaStreamSynchronize(0);
                         encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                         av_frame_unref(frame.get());
@@ -991,20 +1073,9 @@ int run_pipeline(PipelineConfig cfg)
         }
 
     done_processing:
-        // Flush encoder
+        // Flush encoder (uses encode_and_write to ensure DTS monotonicity fix is applied)
         LOG_DEBUG("Finished processing all frames, flushing encoder...");
-        ff_check(avcodec_send_frame(out.venc, nullptr), "send flush");
-        while (true)
-        {
-            int ret = avcodec_receive_packet(out.venc, opkt.get());
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                break;
-            ff_check(ret, "receive packet flush");
-            opkt->stream_index = out.vstream->index;
-            av_packet_rescale_ts(opkt.get(), out.venc->time_base, out.vstream->time_base);
-            ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write packet flush");
-            av_packet_unref(opkt.get());
-        }
+        encode_and_write(out.venc, out.vstream, out.fmt, out, nullptr, opkt, "flush encoder");
 
         // Flush audio encoder if enabled
         if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)

@@ -441,6 +441,15 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->avoidNegativeTs = argv[++i];
         }
+        else if (arg == "-output_ts_offset")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-output_ts_offset requires a time value\n");
+                exit(1);
+            }
+            cfg->outputTsOffset = argv[++i];
+        }
         else if (arg == "-vsync")
         {
             if (i + 1 >= argc)
@@ -457,6 +466,15 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 fprintf(stderr, "Only 'cfr' is currently supported\n");
                 exit(1);
             }
+        }
+        else if (arg == "-r" || arg == "-r:v")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "%s requires a framerate value\n", arg.c_str());
+                exit(1);
+            }
+            cfg->outputFrameRate = argv[++i];
         }
         else if (arg == "-output_ts_offset")
         {
