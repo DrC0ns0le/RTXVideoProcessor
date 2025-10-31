@@ -111,10 +111,9 @@ static inline void encode_and_write(AVCodecContext *enc,
         // NVENC generates duplicate DTS at GOP boundaries with forced-idr + strict_gop (HLS alignment).
         // This is standard FFmpeg behavior - the CLI tool applies the same correction before muxing.
         // Without this, HLS muxer fails with "non monotonically increasing dts" errors.
-        static int64_t last_dts = AV_NOPTS_VALUE;
-        if (last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
+        if (out.last_video_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
         {
-            int64_t max_dts = last_dts + 1; // Minimum acceptable DTS
+            int64_t max_dts = out.last_video_dts + 1; // Minimum acceptable DTS
             if (opkt->dts < max_dts)
             {
                 LOG_DEBUG("DTS monotonicity: adjusting packet DTS from %lld to %lld", opkt->dts, max_dts);
@@ -127,7 +126,7 @@ static inline void encode_and_write(AVCodecContext *enc,
                 }
             }
         }
-        last_dts = opkt->dts;
+        out.last_video_dts = opkt->dts;
 
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
@@ -320,6 +319,21 @@ int run_pipeline(PipelineConfig cfg)
     Logger::instance().setVerbose(cfg.verbose || cfg.debug);
     Logger::instance().setDebug(cfg.debug);
 
+    // Set FFmpeg log level to match application log level
+    // This allows us to see internal FFmpeg messages (e.g., HLS muxer temp_file operations)
+    if (cfg.debug)
+    {
+        av_log_set_level(AV_LOG_VERBOSE);  // Show detailed FFmpeg internal logs
+    }
+    else if (cfg.verbose)
+    {
+        av_log_set_level(AV_LOG_INFO);     // Show FFmpeg info messages
+    }
+    else
+    {
+        av_log_set_level(AV_LOG_WARNING);  // Default: only warnings and errors
+    }
+
     LOG_VERBOSE("Starting video processing pipeline");
     LOG_DEBUG("Input: %s", cfg.inputPath);
     LOG_DEBUG("Output: %s", cfg.outputPath);
@@ -360,12 +374,16 @@ int run_pipeline(PipelineConfig cfg)
         {
             out.audioConfig.enabled = true;
             out.audioConfig.codec = cfg.audioCodec.empty() ? "aac" : cfg.audioCodec;
+            out.audioConfig.applyToAllAudioStreams = cfg.audioCodecApplyToAll;
             out.audioConfig.copyts = cfg.copyts; // Pass copyts mode to audio encoder
         }
 
         LOG_DEBUG("Opening output...");
         open_output(cfg.outputPath, in, out, cfg.streamMaps, cfg.outputFormatName);
         LOG_DEBUG("Output opened successfully");
+
+        // Apply metadata and chapter settings (Jellyfin compatibility)
+        apply_metadata_chapter_settings(out, cfg, in);
 
         // Stage 4: Configure audio processing (complete the audio setup)
         configure_audio_processing(cfg, in, out);
@@ -642,7 +660,7 @@ int run_pipeline(PipelineConfig cfg)
 
         // Read packets
         LOG_DEBUG("Starting frame processing loop with async demuxing...");
-        LOG_DEBUG("Video stream index: %d, Audio stream index: %d", in.vstream, in.astream);
+        LOG_DEBUG("Video stream index: %d, Primary audio stream index: %d", in.vstream, in.primary_audio_stream);
         LOG_DEBUG("Audio config enabled: %s", out.audioConfig.enabled ? "true" : "false");
         LOG_DEBUG("Copyts mode: %s", cfg.copyts ? "enabled" : "disabled");
         LOG_DEBUG("FFmpeg compatibility: avoid_negative_ts=%s, start_at_zero=%s",
@@ -927,27 +945,45 @@ int run_pipeline(PipelineConfig cfg)
                     if (swframe)
                         av_frame_unref(swframe.get());
                 }
+                // Video packet fully processed, continue to next packet
+                continue;
             }
-            else if (cfg.ffCompatible && out.audioConfig.enabled && in.astream >= 0 && pkt->stream_index == in.astream)
+            else if (cfg.ffCompatible && out.audioConfig.enabled && pkt->stream_index < (int)out.stream_decisions.size() &&
+                     out.stream_decisions[pkt->stream_index] == StreamMapDecision::PROCESS_AUDIO)
             {
-                // Process audio packets when audio encoding is enabled
-                if (in.adec && out.aenc)
+                // Capture stream index BEFORE unref (critical: packet data is invalid after unref)
+                int audio_stream_idx = pkt->stream_index;
+
+                // Find decoder for this stream
+                auto decoder_it = in.audio_decoders.find(audio_stream_idx);
+                if (decoder_it == in.audio_decoders.end())
                 {
-                    ff_check(avcodec_send_packet(in.adec, pkt.get()), "send audio packet");
+                    LOG_WARN("No decoder for audio stream %d", audio_stream_idx);
+                    av_packet_unref(pkt.get());
+                    continue;
+                }
+
+                AVCodecContext *decoder = decoder_it->second;
+
+                if (decoder)
+                {
+                    ff_check(avcodec_send_packet(decoder, pkt.get()), "send audio packet");
                     av_packet_unref(pkt.get());
 
                     FramePtr audio_frame(av_frame_alloc(), &av_frame_free_single);
                     while (true)
                     {
-                        int ret = avcodec_receive_frame(in.adec, audio_frame.get());
+                        int ret = avcodec_receive_frame(decoder, audio_frame.get());
                         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                             break;
                         ff_check(ret, "receive audio frame");
 
+                        // Get the audio stream for this packet
+                        AVStream *ast = in.fmt->streams[audio_stream_idx];
+
                         // Accurate seeking: Discard audio frames before seek target (only if accurate seek enabled)
                         if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && audio_frame->pts != AV_NOPTS_VALUE)
                         {
-                            AVStream *ast = in.fmt->streams[in.astream];
                             int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
                             if (frame_time_us < in.seek_offset_us)
                             {
@@ -962,7 +998,6 @@ int run_pipeline(PipelineConfig cfg)
                         // Like video's TimestampManager, stop checking after first valid frame passes
                         if (!out.audio_output_seek_complete && ts_config.output_seek_target_us > 0 && audio_frame->pts != AV_NOPTS_VALUE)
                         {
-                            AVStream *ast = in.fmt->streams[in.astream];
                             int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
                             if (frame_time_us < ts_config.output_seek_target_us)
                             {
@@ -978,16 +1013,13 @@ int run_pipeline(PipelineConfig cfg)
                                       frame_time_us / 1000000.0);
                         }
 
-                        // Use the helper function to process audio
-                        // Ensure frame has correct source time_base for timestamp rescaling in process_audio_frame()
-                        if (in.astream >= 0 && in.fmt && in.astream < (int)in.fmt->nb_streams && in.fmt->streams[in.astream])
+                        // Set correct source time_base for timestamp rescaling
+                        audio_frame->time_base = ast->time_base;
+
+                        // Process frame using multi-stream encoder
+                        if (!process_audio_frame_multi(audio_frame.get(), audio_stream_idx, out))
                         {
-                            audio_frame->time_base = in.fmt->streams[in.astream]->time_base;
-                        }
-                        // process_audio_frame now drains all available FIFO packets and writes them directly
-                        if (!process_audio_frame(audio_frame.get(), out))
-                        {
-                            LOG_WARN("Failed to process audio frame");
+                            LOG_WARN("Failed to process audio frame for stream %d", audio_stream_idx);
                         }
 
                         av_frame_unref(audio_frame.get());
@@ -996,11 +1028,11 @@ int run_pipeline(PipelineConfig cfg)
                 else
                 {
                     // Fallback: copy audio packet without re-encoding
-                    int out_index = out.input_to_output_map[pkt->stream_index];
+                    int out_index = out.input_to_output_map[audio_stream_idx];
 
                     if (out_index >= 0)
                     {
-                        AVStream *ist = in.fmt->streams[pkt->stream_index];
+                        AVStream *ist = in.fmt->streams[audio_stream_idx];
                         AVStream *ost = out.fmt->streams[out_index];
 
                         // Accurate seeking: Discard audio packets before seek target (only if accurate seek enabled)
@@ -1077,96 +1109,97 @@ int run_pipeline(PipelineConfig cfg)
         LOG_DEBUG("Finished processing all frames, flushing encoder...");
         encode_and_write(out.venc, out.vstream, out.fmt, out, nullptr, opkt, "flush encoder");
 
-        // Flush audio encoder if enabled
-        if (cfg.ffCompatible && out.audioConfig.enabled && out.aenc)
+        // Flush audio encoders if enabled
+        if (cfg.ffCompatible && out.audioConfig.enabled && !out.audio_encoders.empty())
         {
-            // Drain any remaining samples from audio FIFO by padding the final frame.
-            // Without this, a tail of < frame_size samples would never be sent, causing missing end audio.
-            if (out.audio_fifo && out.aenc->frame_size > 0)
+            // Multi-stream flushing
+            LOG_DEBUG("Flushing %zu multi-stream audio encoders...", out.audio_encoders.size());
+            for (auto &pair : out.audio_encoders)
             {
-                while (av_audio_fifo_size(out.audio_fifo) > 0)
-                {
-                    int remaining = av_audio_fifo_size(out.audio_fifo);
-                    int frame_sz = out.aenc->frame_size;
+                int stream_idx = pair.first;
+                AudioEncoderContext &enc_ctx = pair.second;
 
-                    AVFrame *encoder_frame = av_frame_alloc();
-                    if (!encoder_frame)
-                    {
-                        break;
-                    }
-                    encoder_frame->format = out.aenc->sample_fmt;
-                    av_channel_layout_copy(&encoder_frame->ch_layout, &out.aenc->ch_layout);
-                    encoder_frame->sample_rate = out.aenc->sample_rate;
-                    encoder_frame->nb_samples = frame_sz;
-                    if (av_frame_get_buffer(encoder_frame, 0) < 0)
-                    {
-                        av_frame_free(&encoder_frame);
-                        break;
-                    }
+                    if (!enc_ctx.encoder || !enc_ctx.output_stream)
+                        continue;
 
-                    // Read as many samples as available; zero-pad the rest
-                    int to_read = remaining < frame_sz ? remaining : frame_sz;
-                    if (to_read > 0)
+                    LOG_DEBUG("Flushing audio encoder for stream %d...", stream_idx);
+
+                    // Flush any remaining samples in FIFO (loop until empty)
+                    while (enc_ctx.fifo && av_audio_fifo_size(enc_ctx.fifo) > 0)
                     {
-                        av_audio_fifo_read(out.audio_fifo, (void **)encoder_frame->data, to_read);
-                    }
-                    if (to_read < frame_sz)
-                    {
-                        for (int ch = 0; ch < encoder_frame->ch_layout.nb_channels; ++ch)
+                        int remaining = av_audio_fifo_size(enc_ctx.fifo);
+                        int frame_sz = enc_ctx.encoder->frame_size;
+
+                        AVFrame *encoder_frame = av_frame_alloc();
+                        if (!encoder_frame)
+                            break;
+
+                        encoder_frame->nb_samples = frame_sz;
+                        encoder_frame->format = enc_ctx.encoder->sample_fmt;
+                        av_channel_layout_copy(&encoder_frame->ch_layout, &enc_ctx.encoder->ch_layout);
+                        encoder_frame->sample_rate = enc_ctx.encoder->sample_rate;
+
+                        if (av_frame_get_buffer(encoder_frame, 0) < 0)
                         {
-                            uint8_t *dst = encoder_frame->data[ch] + to_read * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
-                            int pad_bytes = (frame_sz - to_read) * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
-                            memset(dst, 0, pad_bytes);
+                            av_frame_free(&encoder_frame);
+                            break;
+                        }
+
+                        int to_read = remaining < frame_sz ? remaining : frame_sz;
+                        if (to_read > 0)
+                        {
+                            av_audio_fifo_read(enc_ctx.fifo, (void **)encoder_frame->data, to_read);
+                        }
+                        if (to_read < frame_sz)
+                        {
+                            // Zero-pad the rest
+                            for (int ch = 0; ch < encoder_frame->ch_layout.nb_channels; ++ch)
+                            {
+                                uint8_t *dst = encoder_frame->data[ch] + to_read * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
+                                int pad_bytes = (frame_sz - to_read) * av_get_bytes_per_sample((AVSampleFormat)encoder_frame->format);
+                                memset(dst, 0, pad_bytes);
+                            }
+                        }
+
+                        encoder_frame->pts = enc_ctx.accumulated_samples;
+                        enc_ctx.accumulated_samples += to_read;
+
+                        avcodec_send_frame(enc_ctx.encoder, encoder_frame);
+                        av_frame_free(&encoder_frame);
+
+                        // Receive and write packets
+                        while (true)
+                        {
+                            int ret = avcodec_receive_packet(enc_ctx.encoder, opkt.get());
+                            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                                break;
+                            if (ret < 0)
+                                break;
+
+                            opkt->stream_index = enc_ctx.output_stream->index;
+                            av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
+                            av_interleaved_write_frame(out.fmt, opkt.get());
+                            av_packet_unref(opkt.get());
                         }
                     }
 
-                    // Assign PTS based on accumulated samples (prevents overshoot from padding)
-                    encoder_frame->pts = out.accumulated_audio_samples;
-                    // Only advance by actual content samples, not padded frame size
-                    out.accumulated_audio_samples += to_read;
-                    out.next_audio_pts = out.accumulated_audio_samples;
-
-                    // Send frame to encoder
-                    int ret_send = avcodec_send_frame(out.aenc, encoder_frame);
-                    av_frame_free(&encoder_frame);
-                    if (ret_send < 0)
-                    {
-                        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                        av_make_error_string(errbuf, sizeof(errbuf), ret_send);
-                        LOG_WARN("Failed to send padded frame to audio encoder: %s", errbuf);
-                        break;
-                    }
-
-                    // Receive and write packets
+                    // Flush encoder
+                    avcodec_send_frame(enc_ctx.encoder, nullptr);
                     while (true)
                     {
-                        int ret = avcodec_receive_packet(out.aenc, opkt.get());
+                        int ret = avcodec_receive_packet(enc_ctx.encoder, opkt.get());
                         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                             break;
-                        ff_check(ret, "receive audio packet (fifo drain)");
-                        opkt->stream_index = out.astream->index;
-                        av_packet_rescale_ts(opkt.get(), out.aenc->time_base, out.astream->time_base);
+                        if (ret < 0)
+                            break;
 
-                        ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet (fifo drain)");
+                        opkt->stream_index = enc_ctx.output_stream->index;
+                        av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
+                        av_interleaved_write_frame(out.fmt, opkt.get());
                         av_packet_unref(opkt.get());
                     }
                 }
             }
-
-            LOG_DEBUG("Flushing audio encoder...");
-            ff_check(avcodec_send_frame(out.aenc, nullptr), "send audio flush");
-            while (true)
-            {
-                int ret = avcodec_receive_packet(out.aenc, opkt.get());
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                    break;
-                ff_check(ret, "receive audio packet flush");
-                opkt->stream_index = out.astream->index;
-                av_packet_rescale_ts(opkt.get(), out.aenc->time_base, out.astream->time_base);
-                ff_check(av_interleaved_write_frame(out.fmt, opkt.get()), "write audio packet flush");
-                av_packet_unref(opkt.get());
-            }
-        }
 
         ff_check(av_write_trailer(out.fmt), "write trailer");
 
@@ -1252,8 +1285,7 @@ int main(int argc, char **argv)
 
     parse_arguments(argc, argv, &cfg);
 
-    // Set log level
-    av_log_set_level(AV_LOG_WARNING);
+    // FFmpeg log level is now set dynamically in run_pipeline() based on cfg.verbose/debug
 
     int ret = run_pipeline(cfg);
 }

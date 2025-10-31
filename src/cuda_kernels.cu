@@ -7,7 +7,7 @@ static __device__ inline int clampi(int x, int a, int b) { return x < a ? a : (x
 
 // Convert ABGR10 (X2BGR10LE) 32bpp to P010 (Y:16bpp, UV:16bpp interleaved), BT.709 or BT.2020 limited range
 // Assumptions:
-// - inABGR points to pitched rows of 32-bit pixels, with bpp=4. Layout LE: bits 0..9 R, 10..19 G, 20..29 B, 30..31 A/unused.
+// - inABGR points to pitched rows of 32-bit pixels, with bpp=4. X2BGR10LE layout (RTX SDK): bits 0..9 R, 10..19 G, 20..29 B, 30..31 unused.
 // - outY pitch in bytes; outUV pitch in bytes. outUV height = h/2 and width = w (16-bit pairs per pixel).
 
 __global__ void k_abgr10_to_p010(const uint8_t *__restrict__ inABGR, int inPitch,
@@ -31,7 +31,7 @@ __global__ void k_abgr10_to_p010(const uint8_t *__restrict__ inABGR, int inPitch
         for (int dx = 0; dx < 2; ++dx)
         {
             uint32_t p = row[x + dx];
-            // X2BGR10LE (FFmpeg AV_PIX_FMT_X2BGR10LE): bits 0..9 B, 10..19 G, 20..29 R, 30..31 unused
+            // X2BGR10LE layout (as used by RTX Video SDK): bits 0..9 R, 10..19 G, 20..29 B, 30..31 unused
             int r10 = (int)((p >> 0) & 0x3FF);  // Red in bits 0-9
             int g10 = (int)((p >> 10) & 0x3FF); // Green in bits 10-19
             int b10 = (int)((p >> 20) & 0x3FF); // Blue in bits 20-29
@@ -365,7 +365,7 @@ __global__ void k_p010_to_x2bgr10(const uint8_t *__restrict__ d_y, int pitchY,
     uint32_t g10 = (uint32_t)(G * 1023.0f + 0.5f);
     uint32_t b10 = (uint32_t)(B * 1023.0f + 0.5f);
 
-    // Pack into X2BGR10LE format: bits 0-9 R, 10-19 G, 20-29 B, 30-31 unused
+    // Pack into X2BGR10LE format (RTX SDK): bits 0-9 R, 10-19 G, 20-29 B, 30-31 unused
     uint32_t packed = (r10 & 0x3FF) | ((g10 & 0x3FF) << 10) | ((b10 & 0x3FF) << 20);
 
     uint32_t *dst = (uint32_t *)(outX2BGR10 + y * outPitch + x * 4);

@@ -9,11 +9,12 @@ A high-performance CLI tool that applies **NVIDIA RTX Video Super Resolution (VS
 - 📺 **HLS Streaming**: Native HLS output with fMP4 or MPEGTS segments
 - 🌐 **Network Streaming**: Supports HTTP/HTTPS/RTMP/RTSP/TCP/UDP input streams
 - 🔄 **Zero-copy Pipeline**: GPU processing without CPU roundtrips for maximum performance
-- 🎬 **Stream Mapping**: Full FFmpeg `-map` syntax for precise stream control
+- 🎬 **Stream Mapping**: FFmpeg-style `-map` subset for stream control (common cases)
 - 🎵 **Audio Passthrough**: All audio/subtitle streams copied verbatim or transcoded as needed
 - ⚡ **Fast Processing**: ~2-5× real-time speed on RTX 4070 (preset-dependent)
 - 🎨 **HDR Metadata**: Automatic BT.2020/PQ mastering data injection for TrueHDR output
 - 📦 **Flexible Formats**: MP4, MKV, HLS input/output with pipe and fragmented MP4 support
+- **Multi-Audio**: Per-stream audio processing; initial multi-input plumbing present (experimental)
 
 For detailed information about RTX Video SDK capabilities, see [NVIDIA RTX Video SDK Documentation](https://developer.nvidia.com/rtx-video-sdk).
 
@@ -46,13 +47,15 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **Use case**: Quick video enhancement with RTX processing
 - **Auto-detected**: When no `-i` flag is present (positional input/output arguments)
 - **Features**: RTX VSR + TrueHDR enabled by default, simplified syntax
+ - **Limitation**: Seeking (`-ss`) is not supported in Simple Mode. Use FFmpeg-compatible mode for seeking.
 
 ### 2. FFmpeg-Compatible Mode
 - **Syntax**: `RTXVideoProcessor.exe -i input.mp4 [options] output.mp4`
 - **Use case**: Drop-in FFmpeg replacement with RTX processing
 - **Auto-detected**: When `-i` flag is present in arguments
-- **Features**: FFmpeg syntax support (`-i`, `-map`, `-codec`, `-ss`, etc.) + RTX processing
+- **Features**: FFmpeg-style syntax support for common flags (`-i`, `-map`, `-codec`, `-ss`, etc.) + RTX processing
 - **Behavior**: Strict FFmpeg compliance (no auto-corrections, reports timestamp violations)
+ - **Limitations**: Not a full FFmpeg replacement; some flags/specifiers/edge-cases are not implemented.
 
 ### 3. FFmpeg Passthrough Mode
 - **Trigger**: Binary renamed to `ffmpeg.exe` AND (unsupported format OR `-map -0:v?` video exclusion)
@@ -113,6 +116,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - Supports local files (`.mp4`, `.mkv`)
   - Supports network streams (`http://`, `https://`, `rtmp://`, `rtsp://`, `tcp://`, `udp://`)
   - Supports pipe input (`pipe:0` or `-`)
+  - Note: Repeating `-i` for multi-input is experimental and not fully wired through the main pipeline; current pipeline opens a single input.
 - **Output**: Specify output file or destination
   - Local files (`.mp4`, `.mkv`, `.m3u8`)
   - Pipe output (`pipe:1`, `pipe:`, or `-`)
@@ -120,14 +124,19 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-y`**: Overwrite output files without asking
 
 **Stream Mapping**
-- **`-map <stream_spec>`**: Select streams to include (e.g., `-map 0:0 -map 0:1`)
+- **`-map <stream_spec>`**: Select streams to include (e.g., `-map 0:0 -map 0:1`, `-map 1:a:0`) [subset]
   - Explicit mapping only includes specified streams
   - Use `-map -0:s` to exclude subtitle streams
+- **`-vn` / `-an` / `-sn` / `-dn`**: Disable video / audio / subtitle / data streams
+- **`-map_metadata <index|-1>`**: Map container metadata from input index, or `-1` to disable
+- **`-map_chapters <index|-1>`**: Map chapters from input index, or `-1` to disable
 - **`-codec:a <codec>`** or **`-c:a <codec>`**: Audio codec (use `copy` for passthrough)
+  - `-codec:a` applies to all audio streams; `-codec:a:0` applies only to the first audio stream
 - **`-ac <channels>`**: Audio channels
 - **`-ab <bitrate>`**: Audio bitrate
 - **`-ar <rate>`**: Audio sample rate
 - **`-af <filter>`**: Audio filter chain
+  - Note: Only a subset of FFmpeg's `-map` selectors and behaviors are supported. Some advanced forms (e.g., complex metadata selectors, program mappings) may not be recognized.
 
 **Input/Demuxer Options**
 - **`-fflags <flags>`**: Format flags for input demuxer (e.g., `+genpts` to generate missing PTS)
@@ -163,6 +172,9 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-hls_playlist_type <type>`**: Playlist type (`event` or `vod`)
 - **`-hls_list_size <count>`**: Maximum number of playlist entries (0 = all)
 - **`-start_number <num>`**: Start segment numbering from this value
+  - Subtitle behavior:
+    - For HLS, only WebVTT subtitles are supported. Non-WebVTT subtitle streams are dropped automatically.
+    - For pipe outputs (e.g., `-f mp4 pipe:1`), subtitle streams are omitted.
 
 **Muxer Options**
 - **`-movflags <flags>`**: MP4 muxer flags (e.g., `+faststart`, `+frag_keyframe`)
@@ -172,6 +184,17 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-use_editlist <0|1>`**: Use MP4 edit lists
 - **`-max_muxing_queue_size <packets>`**: Maximum muxing queue size
 - **`-max_delay <microseconds>`**: Maximum muxing delay
+
+**Advanced GOP/Keyframe Control**
+
+- **`-g <frames>`**: Set GOP size in frames (takes precedence over `--nvenc-gop` seconds)
+- **`-sc_threshold <int>`**: Scene change threshold (primarily for x264/x265; NVENC may ignore)
+- **`-keyint_min <frames>`**: Minimum GOP length in frames
+- **`-no-scenecut`**: Disable adaptive I-frame insertion
+- **`-forced-idr`**: Force IDR frames at GOP boundaries
+
+Notes:
+- For HLS, `strict_gop=1`, `forced-idr=1`, and `no-scenecut=1` are applied to align segments to GOP boundaries. If `-g` is not provided, GOP size defaults to `--nvenc-gop` converted to frames and may align to `-hls_time`.
 
 ## Notes on Default Configuration
 
@@ -255,6 +278,10 @@ RTXVideoProcessor.exe -i input.mp4 -codec:a copy output.mp4
 # Audio transcoding with specific codec
 RTXVideoProcessor.exe -i input.mp4 -codec:a aac -ab 192000 -ac 2 output.mp4
 
+# Apply codec to all vs first audio only
+RTXVideoProcessor.exe -i input.mkv -map 0:v -map 0:a -codec:a aac -ab 128k output.mp4   # applies to all audio
+RTXVideoProcessor.exe -i input.mkv -map 0:v -map 0:a -codec:a:0 aac -ab 128k output.mp4 # applies to first audio only
+
 # Seeking: Extract 30 seconds starting from 1 minute
 RTXVideoProcessor.exe -i input.mp4 -ss 00:01:00 -t 30 output.mp4
 
@@ -271,6 +298,13 @@ RTXVideoProcessor.exe -i input.mp4 -format hls -hls_time 6 \
 # HLS with stream mapping and audio copy
 RTXVideoProcessor.exe -i input.mkv -map 0:0 -map 0:1 -codec:a copy \
   -format hls -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 output.m3u8
+
+# Multi-input with external audio (experimental)
+# Current pipeline opens a single input; this usage is not fully supported end-to-end yet
+RTXVideoProcessor.exe -i video.mp4 -i audio.ac3 -map 0:v -map 1:a -map_metadata 0 -map_chapters 0 output.mp4
+
+# Advanced GOP control for HLS (force segment-aligned IDR)
+RTXVideoProcessor.exe -i input.mp4 -format hls -hls_time 2 -g 48 -no-scenecut -forced-idr output.m3u8
 
 # Network stream input to local file
 RTXVideoProcessor.exe -i http://example.com/stream.m3u8 output.mp4

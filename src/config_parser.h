@@ -13,17 +13,27 @@ struct PipelineConfig
     bool cpuOnly = false;
     bool ffCompatible = false;
 
-    char *inputPath = nullptr;
+    char *inputPath = nullptr; // DEPRECATED: Use inputPaths for multi-input support
     char *outputPath = nullptr;
+
+    // Multi-input support
+    std::vector<std::string> inputPaths;  // Multiple input files (-i flag can be repeated)
 
     // NVENC settings
     std::string tune;
     std::string preset;
     std::string rc; // cbr, vbr, constqp
 
-    int gop; // keyframe interval, multiple of seconds
+    int gop; // keyframe interval, multiple of seconds (--nvenc-gop)
+    int gopFrames = -1; // GOP size in frames (-g), takes precedence over gop if set
     int bframes;
     int qp;
+
+    // Advanced GOP/keyframe control
+    int scThreshold = -1;     // Scene change threshold (-sc_threshold)
+    int keyintMin = -1;       // Minimum GOP length (-keyint_min)
+    bool noScenecut = false;  // Disable scene detection (-no-scenecut)
+    bool forcedIdr = false;   // Force IDR frames (-forced-idr)
 
     int targetBitrateMultiplier;
 
@@ -48,10 +58,23 @@ struct PipelineConfig
     std::string hlsSegmentOptions; // Options to pass to segment muxer (e.g., "movflags=+frag_discont")
 
     // Stream mapping options
-    std::vector<std::string> streamMaps;
+    std::vector<std::string> streamMaps;  // Raw -map arguments (e.g., "0:0", "1:a", "-0:v")
+
+    // Stream disable flags (FFmpeg -vn, -an, -sn, -dn)
+    bool disableVideo = false;    // -vn: Disable video streams
+    bool disableAudio = false;    // -an: Disable audio streams
+    bool disableSubtitle = false; // -sn: Disable subtitle streams
+    bool disableData = false;     // -dn: Disable data streams
+
+    // Metadata and chapter mapping (Jellyfin compatibility)
+    int mapMetadata = 0;          // -map_metadata: -1 = disable, 0+ = input index
+    bool hasMapMetadata = false;  // Track if explicitly set (vs default)
+    int mapChapters = 0;          // -map_chapters: -1 = disable, 0+ = input index
+    bool hasMapChapters = false;  // Track if explicitly set (vs default)
 
     // Audio codec options
     std::string audioCodec;
+    bool audioCodecApplyToAll = false; // true for -codec:a, false for -codec:a:0
     int audioChannels = -1;
     int audioBitrate = -1;
     int audioSampleRate = -1;

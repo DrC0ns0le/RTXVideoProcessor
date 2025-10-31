@@ -77,17 +77,6 @@ static bool get_env_bool(const char *name, bool default_value)
     return default_value;
 }
 
-// Helper function: check if output is a pipe/stdout
-static bool is_pipe_output(const char *path)
-{
-    if (!path)
-        return false;
-    return (std::strcmp(path, "-") == 0) ||
-           (std::strcmp(path, "pipe:") == 0) ||
-           (std::strcmp(path, "pipe:1") == 0) ||
-           (std::strncmp(path, "pipe:", 5) == 0);
-}
-
 void print_help(const char *argv0)
 {
     fprintf(stderr, "RTXVideoProcessor build %s\n", BUILD_VERSION);
@@ -116,10 +105,16 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
     fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7 (env: RTX_NVENC_PRESET)\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp (env: RTX_NVENC_RC)\n");
+    fprintf(stderr, "  -g <frames>         Set GOP size in frames (FFmpeg compatible)\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3 (env: RTX_NVENC_GOP)\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2 (env: RTX_NVENC_BFRAMES)\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21 (env: RTX_NVENC_QP)\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2 (env: RTX_NVENC_BITRATE_MULTIPLIER)\n");
+    fprintf(stderr, "\nAdvanced keyframe control:\n");
+    fprintf(stderr, "  -sc_threshold <int> Scene change threshold 0-100 (x264/x265 only, not NVENC)\n");
+    fprintf(stderr, "  -keyint_min <int>   Minimum GOP length in frames\n");
+    fprintf(stderr, "  -no-scenecut        Disable scene detection (NVENC: prevents adaptive I-frames)\n");
+    fprintf(stderr, "  -forced-idr         Force IDR frames at GOP boundaries (NVENC)\n");
     fprintf(stderr, "\nEnvironment variables can be used to set defaults. Command-line flags override environment variables.\n");
     fprintf(stderr, "\nInput/Demuxer options:\n");
     fprintf(stderr, "  -fflags <flags>                 Format flags (e.g., +genpts to generate PTS, +igndts to ignore DTS)\n");
@@ -184,7 +179,14 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 fprintf(stderr, "-i requires an input path\n");
                 exit(1);
             }
-            cfg->inputPath = extract_ffmpeg_file_path(argv[++i]);
+            char *path = extract_ffmpeg_file_path(argv[++i]);
+            // Support multiple -i flags for multi-input
+            cfg->inputPaths.push_back(path);
+            // Keep first input in inputPath for backward compatibility
+            if (!cfg->inputPath)
+            {
+                cfg->inputPath = path;
+            }
         }
         else if (arg == "-max_delay")
         {
@@ -321,6 +323,60 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->streamMaps.push_back(argv[++i]);
         }
+        else if (arg == "-vn")
+        {
+            cfg->disableVideo = true;
+        }
+        else if (arg == "-an")
+        {
+            cfg->disableAudio = true;
+        }
+        else if (arg == "-sn")
+        {
+            cfg->disableSubtitle = true;
+        }
+        else if (arg == "-dn")
+        {
+            cfg->disableData = true;
+        }
+        else if (arg == "-map_metadata")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-map_metadata requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->mapMetadata = std::stoi(value);
+                cfg->hasMapMetadata = true;
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -map_metadata: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-map_chapters")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-map_chapters requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->mapChapters = std::stoi(value);
+                cfg->hasMapChapters = true;
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -map_chapters: %s\n", value);
+                exit(1);
+            }
+        }
         else if (arg.substr(0, 7) == "-codec:" || arg.substr(0, 3) == "-c:")
         {
             if (i + 1 >= argc)
@@ -331,6 +387,8 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             if (arg == "-codec:a:0" || arg == "-c:a:0" || arg == "-codec:a" || arg == "-c:a")
             {
                 cfg->audioCodec = argv[++i];
+                // Distinguish between -codec:a (all audio) and -codec:a:0 (first audio)
+                cfg->audioCodecApplyToAll = (arg == "-codec:a" || arg == "-c:a");
             }
         }
         else if (arg == "-ac")
@@ -395,6 +453,68 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
             cfg->audioFilter = argv[++i];
+        }
+        else if (arg == "-g")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-g requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->gopFrames = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -g: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-sc_threshold")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-sc_threshold requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->scThreshold = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -sc_threshold: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-keyint_min")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-keyint_min requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->keyintMin = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -keyint_min: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-no-scenecut")
+        {
+            cfg->noScenecut = true;
+        }
+        else if (arg == "-forced-idr")
+        {
+            cfg->forcedIdr = true;
         }
         else if (arg == "-ss")
         {
@@ -927,6 +1047,53 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
                 print_help(argv[0]);
                 exit(1);
             }
+        }
+        else if (arg == "-g")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->gopFrames = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -g\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-sc_threshold")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->scThreshold = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -sc_threshold\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-keyint_min")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->keyintMin = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -keyint_min\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-no-scenecut")
+        {
+            cfg->noScenecut = true;
+        }
+        else if (arg == "-forced-idr")
+        {
+            cfg->forcedIdr = true;
         }
         else if (arg == "--nvenc-gop")
         {

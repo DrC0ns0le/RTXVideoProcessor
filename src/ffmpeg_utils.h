@@ -13,6 +13,9 @@ extern "C"
 #include "pipeline_types.h"
 #include "audio_config.h"
 
+// Forward declarations
+struct PipelineConfig;
+
 inline void ff_check(int err, const char *what)
 {
     if (err < 0)
@@ -37,16 +40,23 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits);
 bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *options = nullptr);
 void close_input(InputContext &in);
 
+// Open multiple inputs (for multi-input support)
+bool open_inputs(const std::vector<std::string> &inPaths, std::vector<InputContext> &inputs, const InputOpenOptions *options = nullptr);
+void close_inputs(std::vector<InputContext> &inputs);
+
 // Open output, create video encoder stream and map non-video streams.
 bool open_output(const char *outPath, const InputContext &in, OutputContext &out, const std::vector<std::string> &streamMaps = {}, const std::string &outputFormatName = "");
 void close_output(OutputContext &out);
 
+// Apply metadata and chapter mapping settings (Jellyfin compatibility)
+void apply_metadata_chapter_settings(OutputContext &out, const PipelineConfig &cfg, const InputContext &in);
+
 // Audio configuration functions
 void configure_audio_from_params(const AudioParameters &params, OutputContext &out);
 bool apply_stream_mappings(const std::vector<std::string> &mappings, const InputContext &in, OutputContext &out);
-bool setup_audio_encoder(const InputContext &in, OutputContext &out);
-bool setup_audio_filter(const InputContext &in, OutputContext &out);
-bool process_audio_frame(AVFrame *input_frame, OutputContext &out);
+bool setup_audio_encoders(const InputContext &in, OutputContext &out); // Multi-stream encoder setup
+bool setup_audio_decoders(InputContext &in, const OutputContext &out); // Multi-stream decoder setup
+bool process_audio_frame_multi(AVFrame *input_frame, int input_stream_index, OutputContext &out); // Multi-stream processing
 
 // Initialize audio PTS tracking after seeking
 void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us = AV_NOPTS_VALUE);

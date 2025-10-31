@@ -108,23 +108,27 @@ void configure_audio_processing(PipelineConfig &cfg, InputContext &in, OutputCon
             }
             else
             {
-                LOG_DEBUG("Setting up audio encoder...");
-                if (!setup_audio_encoder(in, out))
+                // Setup encoders for all streams that need re-encoding
+                LOG_DEBUG("Setting up multi-stream audio encoders...");
+                if (!setup_audio_encoders(in, out))
                 {
-                    LOG_WARN("Failed to setup audio encoder, disabling audio processing");
+                    LOG_WARN("Failed to setup audio encoders, disabling audio processing");
                     out.audioConfig.enabled = false;
                 }
                 else
                 {
-                    LOG_DEBUG("Audio encoder setup complete");
-                    LOG_DEBUG("Setting up audio filter...");
-                    if (!setup_audio_filter(in, out))
+                    LOG_DEBUG("Multi-stream audio encoder setup complete");
+
+                    // Setup decoders for all streams marked PROCESS_AUDIO
+                    LOG_DEBUG("Setting up audio decoders...");
+                    if (!setup_audio_decoders(in, out))
                     {
-                        LOG_WARN("Failed to setup audio filter, continuing without filtering");
+                        LOG_WARN("Failed to setup audio decoders, disabling audio processing");
+                        out.audioConfig.enabled = false;
                     }
                     else
                     {
-                        LOG_DEBUG("Audio filter setup complete");
+                        LOG_DEBUG("Audio decoder setup complete");
                     }
                 }
             }

@@ -13,6 +13,7 @@ extern "C"
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 
 struct InputOpenOptions
 {
@@ -63,10 +64,9 @@ struct InputContext
     AVStream *vst = nullptr;
     AVCodecContext *vdec = nullptr;
 
-    // Audio input
-    int astream = -1;
-    AVStream *ast = nullptr;
-    AVCodecContext *adec = nullptr;
+    // Audio input - multi-stream support
+    std::map<int, AVCodecContext*> audio_decoders;  // stream_index -> decoder context
+    int primary_audio_stream = -1;  // "Best" audio stream for info/logging
 
     AVBufferRef *hw_device_ctx = nullptr; // CUDA device
 
@@ -83,6 +83,22 @@ struct AudioConfig
     std::string filter;
     bool enabled = false;
     bool copyts = false; // Preserve original timestamps
+    bool applyToAllAudioStreams = false; // true for -codec:a, false for -codec:a:0
+};
+
+// Per-stream audio encoder context
+struct AudioEncoderContext
+{
+    int input_stream_index = -1;           // Which input stream this encodes
+    AVStream *output_stream = nullptr;     // Output stream
+    AVCodecContext *encoder = nullptr;     // Encoder context
+    SwrContext *resampler = nullptr;       // Resampler for format conversion
+    AVAudioFifo *fifo = nullptr;           // Sample buffering for fixed frame sizes
+    AVFilterGraph *filter_graph = nullptr; // Audio filter graph
+    AVFilterContext *buffersrc = nullptr;  // Filter input
+    AVFilterContext *buffersink = nullptr; // Filter output
+    int64_t accumulated_samples = 0;       // Sample counter for PTS calculation
+    int64_t start_pts = AV_NOPTS_VALUE;    // First audio PTS for baseline
 };
 
 // Stream mapping decision for each input stream
@@ -94,33 +110,43 @@ enum class StreamMapDecision
     PROCESS_AUDIO  // Audio stream to be processed (re-encoded)
 };
 
+// Stream mapping specification (parsed from -map arguments)
+struct StreamMapSpec
+{
+    int input_file_index = -1;     // Input file index (e.g., 0 from "-map 0:1")
+    int stream_index = -1;         // Stream index within file (e.g., 1 from "-map 0:1", -1 for "any")
+    AVMediaType stream_type = AVMEDIA_TYPE_UNKNOWN; // Stream type filter (e.g., VIDEO from "-map 0:v")
+    int stream_type_index = -1;    // Index within stream type (e.g., 0 from "-map 0:v:0", -1 for "all")
+    bool is_negative = false;      // true for "-map -0:1" (exclude stream)
+    bool is_optional = false;      // true for "-map 0:v?" (don't error if missing)
+
+    // Metadata filtering (e.g., "0:m:language:eng")
+    bool has_metadata_filter = false;
+    std::string metadata_key;      // e.g., "language" from "0:m:language:eng"
+    std::string metadata_value;    // e.g., "eng" from "0:m:language:eng"
+
+    std::string raw_specifier;     // Original stream specifier string for debugging
+};
+
+// Resolved mapping for a specific output stream
+struct MappedStream
+{
+    int input_index = -1;          // Which input file (index into input contexts vector)
+    int input_stream_index = -1;   // Which stream in that input file
+    AVMediaType type = AVMEDIA_TYPE_UNKNOWN; // Stream media type
+    bool requires_processing = false; // true if stream needs encoding/processing
+    bool copy_stream = false;      // true for pass-through copy (subtitles, data, etc.)
+};
+
 struct OutputContext
 {
     AVFormatContext *fmt = nullptr;
     AVStream *vstream = nullptr;
     AVCodecContext *venc = nullptr;
 
-    // Audio processing
-    AVStream *astream = nullptr;
-    AVCodecContext *aenc = nullptr;
+    // Audio processing - multi-stream only
     AudioConfig audioConfig;
-
-    // Audio filtering
-    AVFilterGraph *filter_graph = nullptr;
-    AVFilterContext *buffersrc_ctx = nullptr;
-    AVFilterContext *buffersink_ctx = nullptr;
-
-    // Audio resampling
-    SwrContext *swr_ctx = nullptr;
-
-    // Audio buffering for fixed frame sizes
-    AVAudioFifo *audio_fifo = nullptr;
-    int64_t next_audio_pts = 0;
-    int64_t a_start_pts = AV_NOPTS_VALUE; // First audio PTS for baseline
-    // Track last emitted audio DTS (in output stream time_base) to ensure strict monotonicity
-    int64_t last_audio_dts = AV_NOPTS_VALUE;
-    // Track actual accumulated samples for precise PTS calculation (prevents resampling drift)
-    int64_t accumulated_audio_samples = 0;
+    std::map<int, AudioEncoderContext> audio_encoders;  // input_stream_index -> encoder context
 
     // Shared timestamp baseline for HLS A/V sync
     // When HLS+COPYTS+output seeking is used, video and audio must use the same baseline
@@ -134,6 +160,15 @@ struct OutputContext
     std::vector<StreamMapDecision> stream_decisions;
     // Mapping from input stream index to output stream index (-1 if not mapped)
     std::vector<int> input_to_output_map;
+
+    // Multi-input stream mapping
+    std::vector<MappedStream> mapped_streams;        // All output streams (video/audio/subtitle/data)
+    std::vector<AVStream*> all_output_streams;       // Corresponding AVStream* for each mapped stream
+    std::vector<AVCodecContext*> passthrough_codecs; // Decoder contexts for copy streams (subtitles, etc.)
+
     HlsMuxOptions hlsOptions;
     AVDictionary *muxOptions = nullptr;
+
+    // DTS monotonicity tracking for video packets
+    int64_t last_video_dts = AV_NOPTS_VALUE;
 };

@@ -14,17 +14,6 @@ extern "C"
 #include <libavutil/mastering_display_metadata.h>
 }
 
-// Check if output is a pipe/stdout
-bool is_pipe_output(const char *path)
-{
-    if (!path)
-        return false;
-    return (std::strcmp(path, "-") == 0) ||
-           (std::strcmp(path, "pipe:") == 0) ||
-           (std::strcmp(path, "pipe:1") == 0) ||
-           (std::strncmp(path, "pipe:", 5) == 0);
-}
-
 // Check if HLS output will be used
 bool will_use_hls_output(const PipelineConfig &cfg)
 {
@@ -216,10 +205,23 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     }
 
     // For HLS, align GOP with segment duration
+    // If -g was used (gopFrames >= 0), use frames directly; otherwise convert seconds to frames
     int gop_duration_sec = cfg.gop;
-    int gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
+    int gop_size_frames;
 
-    if (hls_enabled && out.hlsOptions.hlsTime > 0)
+    if (cfg.gopFrames >= 0)
+    {
+        // FFmpeg-compatible -g flag was used (GOP in frames)
+        gop_size_frames = cfg.gopFrames;
+        gop_duration_sec = (int)((double)gop_size_frames * fr.den / fr.num);
+    }
+    else
+    {
+        // --nvenc-gop was used (GOP in seconds)
+        gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
+    }
+
+    if (hls_enabled && out.hlsOptions.hlsTime > 0 && cfg.gopFrames < 0)
     {
         gop_duration_sec = out.hlsOptions.hlsTime;
 
@@ -245,13 +247,10 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     out.venc->max_b_frames = cfg.bframes;
     out.venc->color_range = AVCOL_RANGE_MPEG;
 
-    // For HLS: Set minimum keyframe interval equal to GOP size
-    // This matches FFmpeg's -keyint_min behavior and ensures strict GOP alignment
-    if (hls_enabled)
-    {
-        av_opt_set_int(out.venc->priv_data, "g", gop_size_frames, 0);
-        // Note: NVENC doesn't have keyint_min, but strict_gop below achieves the same
-    }
+    // For NVENC: gop_size set above is sufficient
+    // Setting both AVCodecContext->gop_size and the "g" private option can cause conflicts
+    // The NVENC encoder will use the gop_size field directly
+    // Note: forced-idr and strict_gop below ensure HLS segment alignment
 
     // HDR color settings
     if (outputHDR)
@@ -283,8 +282,16 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
 
     int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
     LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
-    LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
-                cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
+    if (cfg.gopFrames >= 0)
+    {
+        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d frames (via -g), bframes: %d",
+                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, gop_size_frames, cfg.bframes);
+    }
+    else
+    {
+        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d sec (%d frames), bframes: %d",
+                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, gop_size_frames, cfg.bframes);
+    }
 
     av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
     av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
@@ -292,11 +299,42 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
     av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
 
-    if (hls_enabled)
+    // Apply advanced keyframe control options
+    if (cfg.scThreshold >= 0)
+    {
+        // Note: sc_threshold is primarily for x264/x265, NVENC may ignore it
+        av_opt_set_int(out.venc->priv_data, "sc_threshold", cfg.scThreshold, 0);
+        LOG_VERBOSE("Set sc_threshold=%d (x264/x265 only, NVENC may ignore)", cfg.scThreshold);
+    }
+
+    if (cfg.keyintMin >= 0)
+    {
+        av_opt_set_int(out.venc->priv_data, "keyint_min", cfg.keyintMin, 0);
+        LOG_VERBOSE("Set keyint_min=%d frames", cfg.keyintMin);
+    }
+
+    // Apply no-scenecut if explicitly requested OR for HLS mode
+    if (cfg.noScenecut || hls_enabled)
+    {
+        av_opt_set(out.venc->priv_data, "no-scenecut", "1", 0);
+        LOG_VERBOSE("Set no-scenecut=1 (disables adaptive I-frame insertion)");
+    }
+
+    // Apply forced-idr if explicitly requested OR for HLS mode
+    if (cfg.forcedIdr || hls_enabled)
     {
         av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
+        LOG_VERBOSE("Set forced-idr=1 (forces IDR frames at GOP boundaries)");
+    }
+
+    // HLS-specific: always enable strict_gop for segment alignment
+    if (hls_enabled)
+    {
         av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
-        LOG_INFO("Enabled forced-idr + strict_gop for HLS segment alignment (ensures I-frame at every segment boundary)");
+        LOG_INFO("HLS: GOP size=%d frames (%.2f sec), forced-idr=1, strict_gop=1, no-scenecut=1",
+                 gop_size_frames, (double)gop_size_frames * fr.den / fr.num);
+        LOG_INFO("Expected: I-frame every %d frames, P/B-frames in between (max_b_frames=%d)",
+                 gop_size_frames, cfg.bframes);
     }
 
     if (outputHDR)

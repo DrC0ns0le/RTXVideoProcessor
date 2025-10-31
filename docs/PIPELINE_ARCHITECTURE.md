@@ -32,8 +32,9 @@ RTXVideoProcessor operates in **three distinct modes**:
 - **Hardware decoding**: NVDEC (CUDA)
 - **GPU processing**: RTX Video Super Resolution, TrueHDR (Default & FFmpeg-Compatible modes)
 - **Hardware encoding**: NVENC (HEVC)
-- **Audio processing**: Re-encoding or passthrough
-- **Stream mapping**: Full FFmpeg `-map` syntax support
+- **Audio processing**: Re-encoding or passthrough (now multi-audio, per-stream)
+- **Stream mapping**: FFmpeg-style `-map` subset (multi-input aware)
+- **Multi-input**: Initial plumbing present (experimental). The main pipeline (`run_pipeline`) opens a single input; multi-input is not wired end-to-end yet.
 - **HLS output**: Segmented streaming with fMP4 or MPEGTS
 
 ### Architecture Philosophy
@@ -151,7 +152,7 @@ RTX processing is **independent of operating mode** and controlled by command-li
 
 RTXVideoProcessor intelligently selects one of three modes based on how it's invoked and what operations are requested:
 
-#### Mode 1: FFmpeg Passthrough Mode 🔄
+#### Mode 1: FFmpeg Passthrough Mode 
 
 **When activated**: Automatically when operation isn't supported or binary is named `ffmpeg.exe`
 
@@ -186,17 +187,18 @@ ffmpeg.exe -i input.mp4 -map -0:v output.mp4            # No video → Passthrou
 
 ---
 
-#### Mode 2: Simple Mode (Default) ⚙️
+#### Mode 2: Simple Mode (Default) 
 
 **When activated**: No `-i` flag present (expects positional arguments)
 
 **Syntax**: `RTXVideoProcessor.exe input.mp4 output.mp4 [options]`
 
 **Characteristics**:
-- ✅ **Simplified syntax**: No need for `-i` or `-o` flags
-- ✅ **RTX Processing**: Video Super Resolution + TrueHDR enabled by default
-- ✅ **Auto-corrections**: Timestamp monotonicity fixes, error concealment
-- ✅ **User-friendly**: More forgiving, aims for successful output
+- **Simplified syntax**: No need for `-i` or `-o` flags
+- **RTX Processing**: Video Super Resolution + TrueHDR enabled by default
+- **Auto-corrections**: Timestamp monotonicity fixes, error concealment
+- **User-friendly**: More forgiving, aims for successful output
+ - **Limitation**: Seeking with `-ss` is not supported in Simple Mode; use FFmpeg-Compatible Mode for seeking.
 
 **Behavior Differences from FFmpeg**:
 | Feature | Simple Mode | FFmpeg |
@@ -213,7 +215,7 @@ RTXVideoProcessor.exe 1080p.mp4 4k.mp4  # Simple upscale with RTX
 
 ---
 
-#### Mode 3: FFmpeg-Compatible Mode 🎯
+#### Mode 3: FFmpeg-Compatible Mode 
 
 **When activated**: `-i` flag present in arguments (auto-detected)
 
@@ -222,22 +224,22 @@ RTXVideoProcessor.exe 1080p.mp4 4k.mp4  # Simple upscale with RTX
 **Purpose**: **Drop-in FFmpeg replacement WITH RTX processing**
 
 **Characteristics**:
-- ✅ **FFmpeg syntax**: Uses `-i`, `-map`, `-codec`, etc.
-- ✅ **RTX Processing**: Still applies VSR + TrueHDR (NOT passthrough!)
-- ✅ **Strict FFmpeg behavior**: No auto-corrections, strict error handling
-- ✅ **Full `-map` support**: Identical stream mapping behavior
-- ✅ **Compatible flags**: All FFmpeg timestamp/seeking flags work
+- **FFmpeg syntax**: Uses `-i`, `-map`, `-codec`, etc.
+- **RTX Processing**: Still applies VSR + TrueHDR (NOT passthrough!)
+- **Strict FFmpeg behavior**: No auto-corrections, strict error handling
+- **`-map` support (subset)**: Common stream mapping cases supported
+- **Compatible flags (subset)**: Common FFmpeg timestamp/seeking flags supported
 
 **Behavior Differences**:
 | Feature | FFmpeg-Compatible Mode | Simple Mode |
 |---------|------------------------|-------------|
 | Syntax | `-i input [opts] output` | `input output [opts]` |
-| RTX Processing | ✅ YES | ✅ YES |
+| RTX Processing | **YES** | **YES** |
 | Timestamp violations | Report only (like FFmpeg) | Auto-fix |
 | Error concealment | Disabled (like FFmpeg) | Enabled |
 | Monotonicity | Detect (like FFmpeg) | Enforce |
 
-**Key insight**: This mode lets you use RTXVideoProcessor as a drop-in ffmpeg replacement while getting RTX acceleration benefits AND maintaining strict FFmpeg compatibility!
+**Key insight**: This mode lets you use RTXVideoProcessor as an FFmpeg-style tool with RTX acceleration while maintaining strict behavior where supported.
 
 **Use case**: Replace FFmpeg in existing scripts while adding RTX processing
 ```bash
@@ -354,12 +356,12 @@ parse_arguments() → cfg.ffCompatible = true
 
 | Aspect | Passthrough | Default Mode | FFmpeg-Compatible |
 |--------|-------------|------------------|-------------------|
-| **Delegates to FFmpeg** | ✅ YES | ❌ NO | ❌ NO |
-| **RTX Processing** | ❌ NO | ✅ YES | ✅ YES |
-| **Custom Processing** | ❌ NO | ✅ YES | ✅ YES |
-| **Auto-fix timestamps** | - | ✅ YES | ❌ NO |
-| **Error concealment** | - | ✅ YES | ❌ NO |
-| **Stream mapping** | - | ✅ FFmpeg-compatible | ✅ FFmpeg-compatible |
+| **Delegates to FFmpeg** | **YES** | **NO** | **NO** |
+| **RTX Processing** | **NO** | **YES** | **YES** |
+| **Custom Processing** | **NO** | **YES** | **YES** |
+| **Auto-fix timestamps** | - | **YES** | **NO** |
+| **Error concealment** | - | **YES** | **NO** |
+| **Stream mapping** | - | **FFmpeg-compatible** | **FFmpeg-compatible** |
 | **Use Case** | Unsupported ops | Video enhancement | FFmpeg replacement |
 
 ---
@@ -411,7 +413,8 @@ The configuration system supports three levels of precedence (highest to lowest)
 ```cpp
 struct Config {
     // Input/Output
-    const char* inputPath;
+    const char* inputPath; // DEPRECATED in favor of inputPaths
+    std::vector<std::string> inputPaths; // Multiple -i inputs
     const char* outputPath;
 
     // Processing modes
@@ -421,6 +424,11 @@ struct Config {
 
     // Stream mapping
     std::vector<std::string> streamMaps;  // -map arguments
+    // Disable flags (FFmpeg parity)
+    bool disableVideo, disableAudio, disableSubtitle, disableData; // -vn/-an/-sn/-dn
+    // Metadata/chapters mapping
+    int mapMetadata; bool hasMapMetadata;
+    int mapChapters; bool hasMapChapters;
 
     // Audio
     std::string audioCodec;
@@ -448,6 +456,7 @@ struct Config {
 - If `cpuOnly`: Disable GPU processing paths
 - If `defaultMode`: Use passthrough mode (FFmpeg-only, no RTX processing)
 - If `ffCompatible`: Disable all legacy enhancements
+- If multiple `-i`: open all inputs and allow cross-input mapping via `-map`
 
 **Code Path**:
 ```
@@ -515,6 +524,7 @@ LOG_VERBOSE("Starting video processing pipeline");
 ### Step 2.1: Open Input File
 
 **Function**: `open_input()` (src/ffmpeg_utils.cpp:28-216)
+and `open_inputs()` for multi-input
 
 ```cpp
 bool open_input(const char *inPath, InputContext &in,
@@ -584,9 +594,9 @@ struct InputContext {
     int vstream;                 // Video stream index
     AVStream *vst;               // Video stream
     AVCodecContext *vdec;        // Video decoder
-    int astream;                 // Audio stream index
-    AVStream *ast;               // Audio stream
-    AVCodecContext *adec;        // Audio decoder
+    // Multi-audio support
+    std::map<int, AVCodecContext*> audio_decoders; // stream_index -> decoder
+    int primary_audio_stream;    // best audio stream index (for info)
     AVBufferRef *hw_device_ctx;  // CUDA device
     int64_t seek_offset_us;      // Seek offset for sync
 };
@@ -705,19 +715,18 @@ ffmpeg_utils.cpp:251
     │   ├─ out.venc = avcodec_alloc_context3(encoder)
     │   ├─ Set codec_id, codec_type, time_base
     │   └─ Encoder params configured later in main loop setup
-    │
-    ├─ Step 3.2.4: Decide Stream Mappings ⭐ CRITICAL
+    │   ├─ Step 3.2.4: Decide Stream Mappings 
     │   [lines 407-422]
     │
     │   If streamMaps provided:
     │       apply_stream_mappings(streamMaps, in, out)
     │           ↓
-    │       decide_stream_mappings() [SINGLE SOURCE OF TRUTH]
+    │   decide_stream_mappings() [SINGLE SOURCE OF TRUTH]
     │           │
     │           ├─ Initialize all as EXCLUDE [line 811]
     │           │
     │           ├─ Determine audio processing mode [lines 804-806]
-    │           │   audio_needs_processing = enabled && codec != "copy"
+    │           │   audio_needs_processing = enabled && codec != "copy" (per-stream)
     │           │
     │           ├─ Check for explicit inclusions [lines 809-816]
     │           │   has_explicit_inclusions = any non-exclusion -map
@@ -727,11 +736,11 @@ ffmpeg_utils.cpp:251
     │           │
     │           └─ Process each -map directive [lines 826-859]
     │               For each mapping:
-    │               ├─ parse_stream_mapping() → {exclude, stream_index, media_type}
-    │               ├─ Match against input streams
-    │               └─ Set decision:
+    │               ├─ parse_stream_mapping() → `StreamMapSpec` (supports input index, type, optional metadata filter, negative/optional)
+    │               ├─ Match against input streams (across multiple inputs)
+    │               └─ Set decision per stream:
     │                   ├─ If exclude: EXCLUDE
-    │                   ├─ If audio + needs_processing: PROCESS_AUDIO
+    │                   ├─ If audio + needs_processing: PROCESS_AUDIO (will allocate encoder later)
     │                   └─ Else: COPY
     │
     │   Else (no -map):
@@ -758,13 +767,13 @@ ffmpeg_utils.cpp:251
     │   │   └─ Drop unsupported codecs [lines 473-480]
     │   │
     │   ├─ If PROCESS_AUDIO: [lines 483-490]
-    │   │   └─ Skip (stream created later in setup_audio_encoder)
+    │   │   └─ Skip (streams created later per-stream in `setup_audio_encoders`)
     │   │
     │   └─ If COPY: [lines 492-513]
     │       ├─ ost = avformat_new_stream(out.fmt, nullptr)
     │       ├─ avcodec_parameters_copy(ost->codecpar, ist->codecpar)
     │       ├─ Set time_base (audio: {1, sample_rate}, else: input time_base)
-    │       ├─ Track first audio stream: out.astream = ost
+    │       ├─ Track first audio stream: out.astream = ost (legacy; multi-audio uses encoder contexts)
     │       └─ out.input_to_output_map[i] = ost->index
     │
     └─ Step 3.2.6: Open Output File
@@ -777,16 +786,20 @@ ffmpeg_utils.cpp:251
 Additional muxer behaviors:
 
 - **ISO BMFF movflags**
-  - For MP4/fMP4 outputs (including HLS with fMP4), the muxer defaults include `+delay_moov` in addition to existing flags (e.g., `+faststart`, `+frag_keyframe`, `+default_base_moof`, `+write_colr`). Delaying the moov atom improves compatibility with codecs like EAC3 that require packet analysis before header writing.
+  - Behavior in code (`apply_movflags` in main.cpp):
+    - Pipe/ISOBMFF: `+empty_moov+default_base_moof+delay_moov+dash+write_colr`
+    - HLS (fMP4 segments): `+frag_keyframe+delay_moov+faststart+write_colr`
+    - Regular MP4 (non-HLS, non-pipe): `+faststart+write_colr` (no `+delay_moov` by default)
+  - Rationale: `+delay_moov` is applied where fragmenting/streaming requires packet analysis (pipe/HLS). Regular file MP4 defaults to faststart without delay unless the user specifies movflags.
 
 - **HLS output timestamp offset**
   - `-output_ts_offset` is intentionally not applied to the HLS muxer. HLS segments start near zero to ensure reasonable `baseMediaDecodeTime` and better hls.js compatibility. Provide per-segment adjustments via `-hls_segment_options` if needed.
   - In HLS, any overall timestamp offset is applied during TimestampManager normalization (not by the muxer) so that fMP4 tfdt (baseMediaDecodeTime) reflects the playback timeline while segment-local times remain near zero.
 
-- **Audio timestamping and muxing**
-  - PTS is derived from an internal `accumulated_audio_samples` counter to ensure sample-accurate timing and eliminate drift from resampling.
-  - When draining the FIFO at end-of-stream, the final frame is zero-padded to encoder frame size, but PTS advances only by the actual content samples to avoid overshoot.
-  - The output context tracks `last_audio_dts` for strict DTS monotonicity enforcement required by MP4/fMP4 muxers.
+- **Audio timestamping and muxing (multi-stream)**
+  - Each audio stream has an `AudioEncoderContext` with its own FIFO, resampler, filter graph, and `accumulated_samples` counter for precise PTS.
+  - PTS is assigned from each encoder context’s `accumulated_samples`, then incremented by encoder frame size to avoid duplicate timestamps when the encoder buffers frames.
+  - MP4/fMP4 muxers require strictly increasing DTS; for audio, FFmpeg sets `dts=pts` on packet receive. Video `last_video_dts` is tracked separately.
 ```
 
 ### Step 3.3: Configure Audio Processing
