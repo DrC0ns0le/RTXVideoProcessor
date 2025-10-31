@@ -24,9 +24,11 @@ Based on RTX 4070 testing:
 - **p7 preset**: ~2× real-time for 1080p input
 - **p4 preset**: ~3-5× real-time for 1080p input *(note: occasional stutters reported)*
 
-**Project Status**: ⚠️ **Alpha - Not Production Ready**
+**Project Status**: **Beta - Limited Production Use**
 
-This tool is currently in **alpha stage** and provided **as-is without warranty**. While functional as an MVP, further refinement is needed for production use.
+This tool is currently in **beta stage** and provided **as-is without warranty**. While functional as an MVP, further refinement is needed for production use.
+
+I've been test driving the tool for a while now and it has generally been working well so far. Also, as I've been working on this tool, I am considering forking ffmpeg directly and adding the RTX features to it. It's getting a bit too complex for me to handle, and reinventing the wheel is not ideal either. I am open to suggestions and feedback.
 
 **FFmpeg Compatibility**: This is **not a full FFmpeg replacement**. Only a subset of FFmpeg features have been implemented. Tested primarily with Jellyfin and Stremio; other use cases may require additional features.
 
