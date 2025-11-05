@@ -67,6 +67,10 @@ public:
         if (m_frames.empty())
             throw std::runtime_error("CudaFramePool not initialized");
 
+        // Sync default stream before reuse to ensure encoder finished with previous frame
+        // Conservative: prevents race when pool wraps around (encoder async_depth)
+        cudaStreamSynchronize(0);
+
         FramePtr &slot = m_frames[m_index];
         m_index = (m_index + 1) % m_frames.size();
         av_frame_unref(slot.get());

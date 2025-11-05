@@ -57,6 +57,3 @@ bool apply_stream_mappings(const std::vector<std::string> &mappings, const Input
 bool setup_audio_encoders(const InputContext &in, OutputContext &out); // Multi-stream encoder setup
 bool setup_audio_decoders(InputContext &in, const OutputContext &out); // Multi-stream decoder setup
 bool process_audio_frame_multi(AVFrame *input_frame, int input_stream_index, OutputContext &out); // Multi-stream processing
-
-// Initialize audio PTS tracking after seeking
-void init_audio_pts_after_seek(const InputContext &in, OutputContext &out, int64_t global_baseline_pts_us = AV_NOPTS_VALUE);

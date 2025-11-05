@@ -124,6 +124,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                              /*bt2020=*/bt2020,
                              m_stream);
 
+        cudaStreamSynchronize(m_stream);
         return true;
     }
 
@@ -139,8 +140,8 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when THDR enabled)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -203,6 +204,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     }
 
 
+    cudaStreamSynchronize(m_stream);
     return true;
 }
 
@@ -261,8 +263,8 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when processing HDR content)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -311,6 +313,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
                           m_stream);
 
 
+    cudaStreamSynchronize(m_stream);
     return true;
 }
 
@@ -348,6 +351,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                             (int)m_srcW, (int)m_srcH,
                             m_stream);
 
+        cudaStreamSynchronize(m_stream);
         return true;
     }
 
@@ -400,8 +404,8 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // Step 4: RTX evaluate: m_srcTex -> m_dstSurf (BGRA8 for SDR output)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     // THDR should be disabled for SDR content
@@ -434,6 +438,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                          m_stream);
 
 
+    cudaStreamSynchronize(m_stream);
     return true;
 }
 
@@ -526,6 +531,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                              /*bt2020=*/bt2020,
                              m_stream);
 
+        cudaStreamSynchronize(m_stream);
         return true;
     }
 
@@ -541,8 +547,8 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // RTX evaluate (BGRA8 in, BGRA8 or ABGR10 out depending on THDR)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -589,6 +595,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                          m_stream);
 
 
+    cudaStreamSynchronize(m_stream);
     return true;
 }
 
@@ -657,8 +664,8 @@ bool RTXProcessor::process(const uint8_t *inBGRA, size_t inPitchBytes,
     copyIn.Height = m_srcH;
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
 
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality; // 1..4

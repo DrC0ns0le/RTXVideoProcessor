@@ -1343,28 +1343,16 @@ bool process_audio_frame_multi(AVFrame *input_frame, int input_stream_index, Out
     {
         enc_ctx.start_pts = input_frame->pts;
 
-        // COPYTS mode: Initialize accumulated_samples from input timestamps
+        // COPYTS mode: Preserve input timestamps (per-stream independence)
         if (out.audioConfig.copyts)
         {
-            // Rescale input PTS to encoder timebase
+            // Rescale input PTS to encoder timebase while preserving original value
             int64_t rescaled_pts = av_rescale_q(input_frame->pts,
                                                 input_frame->time_base,
                                                 enc_ctx.encoder->time_base);
 
-            // Apply baseline normalization to match video tfdt timeline
-            if (out.copyts_baseline_pts != AV_NOPTS_VALUE)
-            {
-                int64_t baseline_audio_tb = av_rescale_q(out.copyts_baseline_pts,
-                                                         {1, AV_TIME_BASE},
-                                                         enc_ctx.encoder->time_base);
-                rescaled_pts -= baseline_audio_tb;
-
-                LOG_DEBUG("COPYTS: Normalized audio stream %d using shared baseline: baseline=%lld us, normalized_pts=%lld",
-                          input_stream_index, out.copyts_baseline_pts, rescaled_pts);
-            }
-
             enc_ctx.accumulated_samples = rescaled_pts;
-            LOG_DEBUG("COPYTS: Initialized audio stream %d PTS: %lld (input) -> %lld (output timebase)",
+            LOG_DEBUG("COPYTS: Initialized audio stream %d PTS: %lld (input) -> %lld (output timebase), preserving original timestamps",
                       input_stream_index, input_frame->pts, rescaled_pts);
         }
         else if (out.hlsOptions.enabled && !out.audioConfig.copyts)

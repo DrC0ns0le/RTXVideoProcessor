@@ -222,9 +222,8 @@ public:
     int64_t getFrameCount() const { return frame_counter_; }
     int getDroppedFrames() const { return dropped_frame_count_; }
 
-    // Get the copyts baseline for audio synchronization
-    // Returns the baseline PTS that was subtracted from timestamps (in input timebase ticks)
-    // Audio can use this to apply the same normalization for A/V sync
+    // Get the copyts baseline for this stream
+    // Returns the baseline PTS that was subtracted from timestamps (in timebase ticks)
     int64_t getCopytsBaseline() const { return copyts_baseline_pts_; }
     bool hasCopytsBaseline() const { return copyts_baseline_pts_ != AV_NOPTS_VALUE; }
 
@@ -262,12 +261,10 @@ private:
         }
 
         // FFmpeg behavior with output seeking and COPYTS:
-        // 1. HLS mode: Normalize to output seek target for correct tfdt (baseMediaDecodeTime)
-        //    - HLS requires tfdt to match playback timeline (e.g., 60s seek → tfdt ~60s)
+        // 1. HLS mode: Normalize timestamps for HLS segment compatibility
         //    - output_ts_offset is handled HERE (not by muxer) for HLS compatibility
         // 2. Non-HLS with output seeking or start_at_zero: Normalize to zero
         //    - Muxer will apply output_ts_offset (if set) to normalized timestamps
-        //    - This prevents double application of offset
         //
         // Priority: hls_mode (with offset) > start_at_zero/output_seek_target (normalize to zero)
         bool should_normalize = cfg_.start_at_zero || (cfg_.output_seek_target_us > 0) || (cfg_.hls_mode && cfg_.output_ts_offset_us > 0);
@@ -278,7 +275,6 @@ private:
             {
                 // HLS mode with output_ts_offset: Apply offset in TimestampManager
                 // (Muxer offset is disabled for HLS mode - see main.cpp line 282)
-                // This ensures tfdt reflects timeline position for A/V sync
                 if (cfg_.hls_mode && cfg_.output_ts_offset_us > 0)
                 {
                     int64_t offset_pts = av_rescale_q(cfg_.output_ts_offset_us, {1, AV_TIME_BASE}, out_tb);
@@ -287,7 +283,6 @@ private:
                               out_pts, cfg_.output_ts_offset_us, offset_pts, copyts_baseline_pts_);
                 }
                 // HLS mode with output seeking (no explicit offset): baseline relative to output seek target
-                // This ensures tfdt reflects the playback position, not decode position
                 else if (cfg_.hls_mode && cfg_.output_seek_target_us > 0)
                 {
                     // Set baseline to (first_frame_pts - output_seek_target)

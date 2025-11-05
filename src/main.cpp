@@ -523,7 +523,9 @@ int run_pipeline(PipelineConfig cfg)
 
             // Format progress line
             std::ostringstream oss;
-            oss << "\r" << bar;
+            if (!cfg.ffCompatible)
+                oss << "\r";
+            oss << bar;
             oss << std::setw(5) << std::fixed << std::setprecision(1) << (progress * 100.0) << "% ";
             oss << "[" << processed_frames << "/" << total_frames << "] ";
             oss << std::setw(5) << std::fixed << std::setprecision(1) << fps << " fps ";
@@ -531,8 +533,17 @@ int run_pipeline(PipelineConfig cfg)
                 << std::setw(2) << std::setfill('0') << remaining_secs;
 
             // Clear the line and print
-            fprintf(stderr, "\r\033[2K"); // Clear the entire line and move cursor to start
-            fprintf(stderr, "%s", oss.str().c_str());
+            if (!cfg.ffCompatible)
+            {
+                fprintf(stderr, "\r\033[2K"); // Clear the entire line and move cursor to start
+                fprintf(stderr, "%s", oss.str().c_str());
+            }
+            else
+            {
+                // In FFmpeg-compatible mode, avoid backspacing/clearing; print each update on a new line
+                std::string line = oss.str();
+                fprintf(stderr, "%s\n", line.c_str());
+            }
             fflush(stderr);
         };
 
@@ -541,8 +552,7 @@ int run_pipeline(PipelineConfig cfg)
         bool rtx_init = false;
         initialize_rtx_processor(rtx, rtx_init, use_cuda_path, cfg, in);
 
-        // Note: Audio PTS will be aligned with video baseline after first video packet
-        // This ensures proper A/V sync during seek operations
+        // Note: In COPYTS mode, each stream preserves its own timeline independently
 
         // Calculate whether output should be HDR
         bool outputHDR = cfg.rtxCfg.enableTHDR || inputIsHDR;
@@ -887,14 +897,8 @@ int run_pipeline(PipelineConfig cfg)
                             }
                         }
 
-                        // Share the COPYTS baseline with audio (same as generic path)
-                        if (ts_manager.hasCopytsBaseline() && out.copyts_baseline_pts == AV_NOPTS_VALUE)
-                        {
-                            int64_t baseline_ticks = ts_manager.getCopytsBaseline();
-                            out.copyts_baseline_pts = av_rescale_q(baseline_ticks, out.venc->time_base, {1, AV_TIME_BASE});
-                            LOG_DEBUG("Shared COPYTS baseline with audio: %lld ticks (video tb) = %lld us",
-                                      baseline_ticks, out.copyts_baseline_pts);
-                        }
+                        // COPYTS: Each stream preserves its own timeline independently
+                        // No shared baseline needed - tfdt is per-stream in fMP4
 
                         // Done with frames (already encoded above)
                         av_frame_unref(frame.get());
@@ -935,16 +939,8 @@ int run_pipeline(PipelineConfig cfg)
                             av_frame_unref(swframe.get());
                         continue;
                     }
-                    // Share the COPYTS baseline with audio for A/V sync in HLS segments
-                    // After the first video frame, the baseline is established and audio must use it
-                    if (ts_manager.hasCopytsBaseline() && out.copyts_baseline_pts == AV_NOPTS_VALUE)
-                    {
-                        // Convert baseline from video timebase to microseconds for audio to use
-                        int64_t baseline_ticks = ts_manager.getCopytsBaseline();
-                        out.copyts_baseline_pts = av_rescale_q(baseline_ticks, out.venc->time_base, {1, AV_TIME_BASE});
-                        LOG_DEBUG("Shared COPYTS baseline with audio: %lld ticks (video tb) = %lld us",
-                                  baseline_ticks, out.copyts_baseline_pts);
-                    }
+                    // COPYTS: Each stream preserves its own timeline independently
+                    // No shared baseline needed - tfdt is per-stream in fMP4
 
                     if (use_cuda_path)
                         rtx.syncStream();
