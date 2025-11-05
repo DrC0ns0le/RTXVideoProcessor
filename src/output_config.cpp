@@ -298,6 +298,8 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
     av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+    av_opt_set_int(out.venc->priv_data, "async_depth", 4, 0);
+    av_opt_set_int(out.venc->priv_data, "rc-lookahead", 8, 0);
 
     // Apply advanced keyframe control options
     if (cfg.scThreshold >= 0)
@@ -357,7 +359,9 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
         fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         fctx->width = dstW;
         fctx->height = dstH;
-        fctx->initial_pool_size = 64;
+        // Increased from 64 to 96 to handle high-throughput processing
+        // This provides more surfaces for the encoder during burst encoding
+        fctx->initial_pool_size = 96;
         ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
         out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
     }

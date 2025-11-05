@@ -66,6 +66,7 @@ public:
     {
         if (m_frames.empty())
             throw std::runtime_error("CudaFramePool not initialized");
+
         FramePtr &slot = m_frames[m_index];
         m_index = (m_index + 1) % m_frames.size();
         av_frame_unref(slot.get());

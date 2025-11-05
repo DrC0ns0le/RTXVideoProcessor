@@ -110,6 +110,15 @@ public:
 
     void shutdown();
 
+    // Synchronize the RTX processor's CUDA stream
+    // Call this to ensure all RTX processing operations have completed before
+    // accessing the output frames from other CUDA streams or the encoder
+    void syncStream() const {
+        if (m_stream) {
+            cudaStreamSynchronize(m_stream);
+        }
+    }
+
     // Returns a human-readable description of the last error (if any initialize/process failed)
     const std::string &lastError() const { return m_lastError; }
 

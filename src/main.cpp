@@ -142,7 +142,9 @@ static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, 
     if (use_cuda_path)
     {
         // Initialize CUDA frame pool for GPU path
-        const int POOL_SIZE = 8; // Adjust based on your needs
+        // Increased from 8 to 16 to prevent pool exhaustion during high-throughput processing (90+ fps)
+        // This provides more working buffers for the RTX processor and encoder pipeline
+        const int POOL_SIZE = 16;
         cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
     }
     else
@@ -823,7 +825,8 @@ int run_pipeline(PipelineConfig cfg)
                             outFrame->duration = (int)tpf;
 
                             // Encode current frame
-                            if (use_cuda_path) cudaStreamSynchronize(0);
+                            if (use_cuda_path)
+                                rtx.syncStream();
                             encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                         }
                         else
@@ -878,7 +881,8 @@ int run_pipeline(PipelineConfig cfg)
                                 outFrame->pts = encoder_pts;
                                 outFrame->duration = duration_ticks;
 
-                                if (use_cuda_path) cudaStreamSynchronize(0);
+                                if (use_cuda_path)
+                                    rtx.syncStream();
                                 encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send CFR frame to encoder");
                             }
                         }
@@ -911,12 +915,20 @@ int run_pipeline(PipelineConfig cfg)
                         }
 
                         // Set frame duration from framerate (FFmpeg-compliant behavior)
-                        // This helps the encoder generate proper frame timing
-                        int64_t frame_duration = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                        // Prefer per-frame duration from decoder for VFR content, fallback to fixed duration
+                        int64_t frame_duration;
+                        if (decframe->duration > 0) {
+                            // Use decoder's per-frame duration (handles VFR correctly)
+                            frame_duration = av_rescale_q(decframe->duration, in.vst->time_base, out.venc->time_base);
+                        } else {
+                            // Fallback to fixed duration calculated from framerate
+                            frame_duration = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                        }
                         if (frame_duration <= 0) frame_duration = 1;  // Safety clamp
                         outFrame->duration = frame_duration;
 
-                        if (use_cuda_path) cudaStreamSynchronize(0);
+                        if (use_cuda_path)
+                            rtx.syncStream();
                         encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                         av_frame_unref(frame.get());
                         if (swframe)
@@ -934,12 +946,8 @@ int run_pipeline(PipelineConfig cfg)
                                   baseline_ticks, out.copyts_baseline_pts);
                     }
 
-                    // IMPORTANT: Must sync before encoder accesses CUDA frame data
-                    // RTX processor syncs internally, but this ensures frame is ready for NVENC
                     if (use_cuda_path)
-                        cudaStreamSynchronize(0);
-
-                    // Encode frame
+                        rtx.syncStream();
                     encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
                     av_frame_unref(frame.get());
                     if (swframe)
